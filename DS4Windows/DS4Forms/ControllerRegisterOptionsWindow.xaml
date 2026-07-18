@@ -118,6 +118,11 @@
                         <TextBlock Text="{Binding Options.BTAudioVolume}" Margin="8,4,0,0" VerticalAlignment="Center" MinWidth="32" />
                     </StackPanel>
 
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <Label Content="Buffering:" ToolTip="Smooth = most stable, ~0.3-0.4 s behind. Low latency = ~0.1 s behind, but needs a clean Bluetooth link (interference causes dropouts). Applies to both audio and audio-based haptics." />
+                        <ComboBox ItemsSource="{Binding Path=DsAudioLatencies}" DisplayMemberPath="DisplayName" SelectedValuePath="ChoiceValue" SelectedValue="{Binding Options.BTAudioLatency}" Margin="8,0,0,0" MinWidth="220" />
+                    </StackPanel>
+
                     <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,6,0,0"
                                Text="Bluetooth connections only. Applies immediately. While streaming is active, standard rumble emulation is disabled (the controller cannot do both at once) — use a haptics mode that includes Rumble to keep feeling game rumble. Pick the audio source your game actually plays through. Protocol research credit: egormanga/SAxense and awalol/DS5Dongle." />
                 </StackPanel>

@@ -307,6 +307,15 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         };
         public List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>> DsAudioRoutes { get => dsAudioRoutes; }
 
+        private List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>> dsAudioLatencies =
+            new List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>>()
+        {
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>("Smooth (most buffering)", DualSenseControllerOptions.AudioLatencyMode.Smooth),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>("Balanced", DualSenseControllerOptions.AudioLatencyMode.Balanced),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>("Low latency (clean link needed)", DualSenseControllerOptions.AudioLatencyMode.LowLatency),
+        };
+        public List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>> DsAudioLatencies { get => dsAudioLatencies; }
+
         public DualSenseControllerOptionsWrapper(DualSenseControllerOptions options,
             DualSenseDeviceOptions parentOpts)
         {

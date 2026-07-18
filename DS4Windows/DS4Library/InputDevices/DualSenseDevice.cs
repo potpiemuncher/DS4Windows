@@ -502,7 +502,8 @@ namespace DS4Windows.InputDevices
                 nativeOptionsStore.BTHapticsAudioDeviceId,
                 nativeOptionsStore.BTAudioEnabled,
                 nativeOptionsStore.BTAudioRoute,
-                nativeOptionsStore.BTAudioVolume);
+                nativeOptionsStore.BTAudioVolume,
+                nativeOptionsStore.BTAudioLatency);
 
             // Push a fresh 0x31 report so the rumble-emulation flags reflect the
             // new streaming state right away.

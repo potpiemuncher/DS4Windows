@@ -82,6 +82,12 @@ namespace DS4WinWPF.DS4Control.DTOXml
             get; set;
         } = 85;
 
+        [XmlElement("BTAudioLatency")]
+        public AudioLatencyMode BTAudioLatency
+        {
+            get; set;
+        } = AudioLatencyMode.Smooth;
+
         public void MapFrom(DualSenseControllerOptions source)
         {
             LEDMode = source.LedMode;
@@ -93,6 +99,7 @@ namespace DS4WinWPF.DS4Control.DTOXml
             BTAudioEnabled = source.BTAudioEnabled;
             BTAudioRoute = source.BTAudioRoute;
             BTAudioVolume = source.BTAudioVolume;
+            BTAudioLatency = source.BTAudioLatency;
         }
 
         public void MapTo(DualSenseControllerOptions destination)
@@ -106,6 +113,7 @@ namespace DS4WinWPF.DS4Control.DTOXml
             destination.BTAudioEnabled = BTAudioEnabled;
             destination.BTAudioRoute = BTAudioRoute;
             destination.BTAudioVolume = BTAudioVolume;
+            destination.BTAudioLatency = BTAudioLatency;
         }
     }
 }

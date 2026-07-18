@@ -59,16 +59,54 @@ namespace DS4Windows.InputDevices
         // and drops frames audibly. Same reason DS5Dongle resamples 512->480.
         private const int AUDIO_DELIVERY_RATE = 45000;
 
-        private const byte CONTROLLER_AUDIO_BUFFER = 120; // controller-side dejitter buffer [16,127]
-        private const int OPUS_QUEUE_DEPTH = 10;          // ~213 ms of local frame backlog
-        private const int OPUS_PREBUFFER_FRAMES = 4;      // frames banked before playback starts
-        private const double MAX_CATCHUP_MS = 250.0;      // burst catch-up window before resync
+        /// <summary>
+        /// One coherent set of buffer sizes for the whole pipeline. Bigger
+        /// buffers survive congested links (2.4 GHz Wi-Fi, wireless headset
+        /// dongles); smaller buffers cut end-to-end delay for game audio.
+        /// </summary>
+        private readonly struct LatencyProfile
+        {
+            public readonly byte ControllerBuffer;   // controller-side dejitter buffer [16,127]
+            public readonly int OpusQueueDepth;      // local frame backlog (frames of ~21.3 ms/2)
+            public readonly int OpusPrebufferFrames; // frames banked before playback starts
+            public readonly double MaxCatchupMs;     // burst catch-up window before resync
+            public readonly int AudioRingSamples;    // capture ring feeding the encoder
+            public readonly int HapticsRingBytes;    // capture ring feeding the actuators
+            public readonly int HapticsPrebufferBytes;
+
+            public LatencyProfile(byte controllerBuffer, int queueDepth, int prebufferFrames,
+                double maxCatchupMs, int audioRingSamples, int hapticsRingBytes, int hapticsPrebufferBytes)
+            {
+                ControllerBuffer = controllerBuffer;
+                OpusQueueDepth = queueDepth;
+                OpusPrebufferFrames = prebufferFrames;
+                MaxCatchupMs = maxCatchupMs;
+                AudioRingSamples = audioRingSamples;
+                HapticsRingBytes = hapticsRingBytes;
+                HapticsPrebufferBytes = hapticsPrebufferBytes;
+            }
+        }
+
+        private static LatencyProfile GetLatencyProfile(DualSenseControllerOptions.AudioLatencyMode latencyMode)
+        {
+            switch (latencyMode)
+            {
+                case DualSenseControllerOptions.AudioLatencyMode.LowLatency:
+                    // ~80-120 ms end to end; needs a clean link
+                    return new LatencyProfile(32, 4, 2, 100.0, AUDIO_DELIVERY_RATE * 2 / 10, 960, 192);
+                case DualSenseControllerOptions.AudioLatencyMode.Balanced:
+                    // ~150-250 ms
+                    return new LatencyProfile(64, 6, 3, 150.0, AUDIO_DELIVERY_RATE * 2 * 3 / 20, 1440, 384);
+                case DualSenseControllerOptions.AudioLatencyMode.Smooth:
+                default:
+                    // ~300-400 ms; proven on congested 2.4 GHz environments
+                    return new LatencyProfile(120, 10, 4, 250.0, AUDIO_DELIVERY_RATE * 2 / 5, 1920, 576);
+            }
+        }
 
         private const int SAMPLE_RATE = 3000;          // haptic PCM rate per channel
         private const int HAPTIC_CHUNK_BYTES = 64;     // 32 stereo frames
         private const double TICK_MS = 32 * 1000.0 / SAMPLE_RATE; // ~10.667 ms
-        private const int RING_CAPACITY = 1920;
-        private const int PREBUFFER_BYTES = 576;
         private const int MAX_CONSECUTIVE_WRITE_FAILURES = 50;
 
         private const double HEAVY_FREQ_HZ = 62.0;
@@ -93,6 +131,9 @@ namespace DS4Windows.InputDevices
         private DualSenseControllerOptions.AudioOutputRoute audioRoute =
             DualSenseControllerOptions.AudioOutputRoute.Auto;
         private int audioVolume = 85;
+        private DualSenseControllerOptions.AudioLatencyMode latencyMode =
+            DualSenseControllerOptions.AudioLatencyMode.Smooth;
+        private LatencyProfile profile = GetLatencyProfile(DualSenseControllerOptions.AudioLatencyMode.Smooth);
 
         // Rumble-to-haptics synth state
         private double heavyEnv, lightEnv, heavyPhase, lightPhase;
@@ -111,7 +152,7 @@ namespace DS4Windows.InputDevices
         public void Configure(DualSenseControllerOptions.HapticsMode newMode,
             double newGain, int newLowPassHz, string newEndpointId,
             bool newAudioEnabled, DualSenseControllerOptions.AudioOutputRoute newAudioRoute,
-            int newAudioVolume)
+            int newAudioVolume, DualSenseControllerOptions.AudioLatencyMode newLatencyMode)
         {
             lock (stateLock)
             {
@@ -123,7 +164,8 @@ namespace DS4Windows.InputDevices
                 // Gain, volume, and routing apply live; anything that changes the
                 // pipeline shape needs a restart.
                 if (running && newMode == mode && newLowPassHz == lowPassHz &&
-                    newEndpointId == endpointId && newAudioEnabled == audioEnabled)
+                    newEndpointId == endpointId && newAudioEnabled == audioEnabled &&
+                    newLatencyMode == latencyMode)
                 {
                     gain = newGain;
                     audioVolume = newAudioVolume;
@@ -141,6 +183,8 @@ namespace DS4Windows.InputDevices
                 audioEnabled = newAudioEnabled;
                 audioRoute = newAudioRoute;
                 audioVolume = newAudioVolume;
+                latencyMode = newLatencyMode;
+                profile = GetLatencyProfile(newLatencyMode);
 
                 if (audioEnabled || mode != DualSenseControllerOptions.HapticsMode.Off)
                 {
@@ -195,8 +239,8 @@ namespace DS4Windows.InputDevices
                                   mode == DualSenseControllerOptions.HapticsMode.Mix;
             bool needCapture = captureForHaptics || audioEnabled;
 
-            SampleRing hapticsRing = captureForHaptics ? new SampleRing(RING_CAPACITY) : null;
-            ShortRing audioRing = audioEnabled ? new ShortRing(AUDIO_SAMPLE_RATE * 2 / 5) : null; // 200 ms
+            SampleRing hapticsRing = captureForHaptics ? new SampleRing(profile.HapticsRingBytes) : null;
+            ShortRing audioRing = audioEnabled ? new ShortRing(profile.AudioRingSamples) : null;
             WasapiLoopbackCapture capture = null;
             IOpusEncoder opusEncoder = null;
 
@@ -226,7 +270,7 @@ namespace DS4Windows.InputDevices
                     pcmFrame = new short[OPUS_SAMPLES_PER_FRAME * 2];
                     silenceOpus = new byte[OPUS_FRAME_BYTES];
                     EncodeOpusFrame(opusEncoder, new short[OPUS_SAMPLES_PER_FRAME * 2], silenceOpus);
-                    opusQueue = new OpusFrameQueue(OPUS_QUEUE_DEPTH, OPUS_FRAME_BYTES);
+                    opusQueue = new OpusFrameQueue(profile.OpusQueueDepth, OPUS_FRAME_BYTES);
                 }
 
                 byte[] report = new byte[audioEnabled ? AUDIO_REPORT_SIZE : HAPTICS_REPORT_SIZE];
@@ -267,7 +311,7 @@ namespace DS4Windows.InputDevices
                     // send back-to-back to catch up: the controller's dejitter
                     // buffer absorbs the burst. Only resync (accepting an audio
                     // gap) after a stall too large to catch up from.
-                    if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > MAX_CATCHUP_MS)
+                    if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > profile.MaxCatchupMs)
                     {
                         nextDeadlineMs = clock.Elapsed.TotalMilliseconds;
                     }
@@ -292,7 +336,7 @@ namespace DS4Windows.InputDevices
                         {
                             // Bank a few frames before draining so transient
                             // capture gaps don't immediately become silence.
-                            if (!audioPrimed && opusQueue.Count >= OPUS_PREBUFFER_FRAMES)
+                            if (!audioPrimed && opusQueue.Count >= profile.OpusPrebufferFrames)
                             {
                                 audioPrimed = true;
                             }
@@ -380,7 +424,7 @@ namespace DS4Windows.InputDevices
             int captured = 0;
             if (ring != null)
             {
-                if (!primed && ring.Count >= PREBUFFER_BYTES)
+                if (!primed && ring.Count >= profile.HapticsPrebufferBytes)
                 {
                     primed = true;
                 }
@@ -475,10 +519,10 @@ namespace DS4Windows.InputDevices
             report[2] = 0x91; // config packet: PID 0x11 | sized
             report[3] = 6;
             report[4] = 0x7E; // haptics + speaker session, no mic
-            report[5] = CONTROLLER_AUDIO_BUFFER;
-            report[6] = CONTROLLER_AUDIO_BUFFER;
-            report[7] = CONTROLLER_AUDIO_BUFFER;
-            report[8] = CONTROLLER_AUDIO_BUFFER; // controller-side audio buffer length
+            report[5] = profile.ControllerBuffer;
+            report[6] = profile.ControllerBuffer;
+            report[7] = profile.ControllerBuffer;
+            report[8] = profile.ControllerBuffer; // controller-side audio buffer length
             packetCounter += 2;
             report[9] = packetCounter;
 

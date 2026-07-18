@@ -244,6 +244,13 @@ namespace DS4Windows
             Speaker,
         }
 
+        public enum AudioLatencyMode : ushort
+        {
+            Smooth,     // maximum buffering; survives congested links
+            Balanced,
+            LowLatency, // minimum buffering; needs a clean link
+        }
+
         private LEDBarMode ledMode = LEDBarMode.MultipleControllers;
         public LEDBarMode LedMode
         {
@@ -357,6 +364,18 @@ namespace DS4Windows
                 value = Math.Clamp(value, 0, 100);
                 if (btAudioVolume == value) return;
                 btAudioVolume = value;
+                BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private AudioLatencyMode btAudioLatency = AudioLatencyMode.Smooth;
+        public AudioLatencyMode BTAudioLatency
+        {
+            get => btAudioLatency;
+            set
+            {
+                if (btAudioLatency == value) return;
+                btAudioLatency = value;
                 BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
             }
         }
