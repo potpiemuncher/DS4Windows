@@ -84,19 +84,35 @@ custom BT profile. This is almost certainly the same mechanism DSX v3.2 uses.
 - UI page + profile persistence, following existing options-store patterns
   (`DualSenseControllerOptions`).
 
-### Phase 3 — BT speaker/headphone audio (the hard half)
-- The wireless **listening audio** format (headphone jack / internal speaker over BT) is
-  **not publicly documented** yet. DSX ships it, SAxense lists "duplex audio" as coming.
-- Likely the same 0x32–0x39 container protocol with a different packet PID, plausibly
-  SBC-encoded (the DS4's BT audio was RE'd as SBC; DualSense inherits a lot).
-- Acquisition paths, in order of preference:
-  1. Watch SAxense for the duplex-audio release (clean, attributable source).
-  2. Capture our own local HCI traffic (Wireshark + WDK `btvs.exe`) on a machine running
-     software that already streams BT audio to the controller, and decode the report
-     stream. (Interop RE of our own machine's traffic.)
-  3. Community: nondebug/dualsense issues, DS5Dongle forks, Ohjurot/DualSense-Windows #7.
-- Once known: system-audio → codec → container packets, plus volume/routing bytes that
-  already exist (commented out) in `PrepareOutReport`.
+### Phase 3 — BT speaker/headphone audio — DONE (3a, output side), verified on hardware
+The protocol came from [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle) (MIT),
+whose Pico 2 W firmware implements the full audio path. Working parameters as
+implemented in `DualSenseHapticsStreamer`:
+
+- **Codec: Opus** (not SBC) — 48 kHz stereo, 10 ms frames, 160 kbps CBR = exactly
+  200 bytes per frame. Complexity is free on PC (DS5Dongle uses 0 for the Pico).
+- **Container: report 0x39** (547 bytes) every ~21.33 ms:
+  `[0]=0x39, [1]=seq<<4, [2]=0x91, [3]=6, [4]=0x7E (0x7F w/ mic; bit6 mandatory,
+  bits = field presence), [5..8]=dejitter buffer len, [9]=frame counter (+2/report),
+  [10]=0xD2, [11]=64, [12..139]=2×64 B haptic PCM (signed s8 here),
+  [140]=route|0xC0 (PID 0x13 speaker / 0x16 headphone), [141]=200,
+  [142..341]+[342..541]=two Opus frames, CRC-32(0xA2‖first 543) at [543..546]`.
+- **The amp boots muted**: audio stays silent until a SetStateData container packet
+  (PID `0x10`, len `0x3F`, inside a 0x32 report) sets `AllowHeadphoneVolume|
+  AllowSpeakerVolume|AllowAudioControl` (byte0=0xB0), `AllowAudioControl2`
+  (byte1=0x80), volumes ≈ 0x64, and `SpeakerCompPreGain=2` (byte37).
+- **Audio is slaved to the haptics clock**: one 480-sample frame per ~10.667 ms slot
+  ⇒ deliver at **45 000 samples/s**, not real-time 48 kHz, or the stream drops a
+  frame every few reports (constant chop). This is why DS5Dongle resamples 512→480.
+- **Jitter defenses that made it clean on a congested link**: controller dejitter
+  buffer 120 (max 127), ~213 ms local Opus backlog, 4-frame prebuffer with
+  rebuffer-on-dry-out, burst catch-up ≤250 ms instead of clock resync.
+- Mic input (Phase 3b, not yet implemented): enable via 0x32 config packet len 1
+  data `0x03` (off: `0x02`); controller then interleaves 78-byte 0x31 input reports
+  with bit 1 of byte[1] set carrying 71-byte Opus mono (48 kHz) frames at [3..73].
+  These must be filtered out of gamepad parsing; exposing them as a Windows mic
+  needs a virtual audio driver.
+- Headset-plug detection: input status byte (`inputReport[54+reportOffset]`) bit 0.
 
 ### Phase 4 (stretch, likely out of scope) — virtual wired DualSense
 - DSX's trick for **native game haptics over BT**: a proprietary virtual "wired" DualSense
