@@ -33,6 +33,20 @@ internal static class Program
 
     private static int Main(string[] args)
     {
+        try
+        {
+            return Run(args);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"DSCompatProbe failed: {ex.GetType().Name}: {ex.Message}");
+            Console.Error.WriteLine(ex.StackTrace);
+            return 1;
+        }
+    }
+
+    private static int Run(string[] args)
+    {
         if (args.Length > 0 && args[0].Equals("parsepcap", StringComparison.OrdinalIgnoreCase))
         {
             return PcapIsoExtractor.Run(args.Skip(1).ToArray());
