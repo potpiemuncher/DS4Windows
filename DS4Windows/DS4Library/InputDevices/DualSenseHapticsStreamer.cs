@@ -71,15 +71,6 @@ namespace DS4Windows.InputDevices
 
         public bool Active => running;
 
-        /// <summary>
-        /// While synthesizing haptics from rumble values, the regular 0x31
-        /// rumble-emulation bytes should stay zero so the firmware does not
-        /// drive the actuators twice.
-        /// </summary>
-        public bool SuppressRumbleBytes =>
-            running && (mode == DualSenseControllerOptions.HapticsMode.RumbleToHaptics ||
-                        mode == DualSenseControllerOptions.HapticsMode.Mix);
-
         public DualSenseHapticsStreamer(DualSenseDevice device, HidDevice hidDevice)
         {
             this.device = device;
@@ -294,6 +285,7 @@ namespace DS4Windows.InputDevices
             WasapiLoopbackCapture capture = null;
             try
             {
+                string endpointName = null;
                 if (!string.IsNullOrEmpty(endpointId))
                 {
                     using MMDeviceEnumerator enumerator = new MMDeviceEnumerator();
@@ -303,6 +295,7 @@ namespace DS4Windows.InputDevices
                         if (endpoint != null && endpoint.State == DeviceState.Active)
                         {
                             capture = new WasapiLoopbackCapture(endpoint);
+                            endpointName = endpoint.FriendlyName;
                         }
                     }
                     catch (Exception)
@@ -311,7 +304,18 @@ namespace DS4Windows.InputDevices
                     }
                 }
 
-                capture ??= new WasapiLoopbackCapture();
+                if (capture == null)
+                {
+                    capture = new WasapiLoopbackCapture();
+                    try
+                    {
+                        using MMDeviceEnumerator enumerator = new MMDeviceEnumerator();
+                        endpointName = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia).FriendlyName;
+                    }
+                    catch (Exception) { }
+                }
+
+                AppLogger.LogToGui($"{device.MacAddress}: haptics capturing audio from \"{endpointName ?? "default output"}\"", false);
 
                 int inRate = capture.WaveFormat.SampleRate;
                 int inChannels = capture.WaveFormat.Channels;

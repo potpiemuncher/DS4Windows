@@ -101,7 +101,7 @@
                     </StackPanel>
 
                     <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,6,0,0"
-                               Text="Bluetooth connections only. Applies immediately. Protocol research credit: egormanga/SAxense." />
+                               Text="Bluetooth connections only. Applies immediately. While streaming is active, standard rumble emulation is disabled (the controller cannot do both at once) — use a mode that includes Rumble to keep feeling game rumble. Pick the audio source your game actually plays through. Protocol research credit: egormanga/SAxense." />
                 </StackPanel>
             </TabItem>
 

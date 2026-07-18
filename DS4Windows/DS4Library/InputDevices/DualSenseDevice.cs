@@ -497,6 +497,14 @@ namespace DS4Windows.InputDevices
                 nativeOptionsStore.BTHapticsGain,
                 nativeOptionsStore.BTHapticsLowPassHz,
                 nativeOptionsStore.BTHapticsAudioDeviceId);
+
+            // Push a fresh 0x31 report so the rumble-emulation flags reflect the
+            // new streaming state right away.
+            queueEvent(() =>
+            {
+                outputDirty = true;
+                currentHap.dirty = true;
+            });
         }
 
         private void TimeoutTestThread()
@@ -1221,17 +1229,25 @@ namespace DS4Windows.InputDevices
                 // 0x80 Enable internal mic (even while headset is connected)
                 outputReport[2] = useRumble ? (byte)0x0F : (byte)0x0C; // 0x02 | 0x01 | 0x04 | 0x08;
 
+                // The firmware treats rumble emulation and the 0x32 haptic audio
+                // stream as mutually exclusive modes: any report that asserts the
+                // motor flags or the improved-rumble bit knocks it back into
+                // rumble emulation and mutes the stream. While the haptics
+                // streamer is active, keep all rumble emulation out of 0x31.
+                bool hapticsStreamActive = hapticsStreamer?.Active ?? false;
+
                 // 0x01 Toggling microphone LED, 0x02 Toggling Audio/Mic Mute
                 // 0x04 Toggling LED strips on the sides of the Touchpad, 0x08 Turn off all LED lights
                 // 0x10 Toggle player LED lights below Touchpad, 0x20 ???
                 // 0x40 Adjust overall motor/effect power, 0x80 ???
                 outputReport[3] = 0x55; // 0x04 | 0x01 | 0x10 | 0x40
 
-                // Leave the emulated motors idle while the haptics streamer is
-                // synthesizing rumble through the audio path, so the actuators
-                // are not driven twice.
-                if ((useRumble || useAccurateRumble) &&
-                    !(hapticsStreamer?.SuppressRumbleBytes ?? false))
+                if (hapticsStreamActive)
+                {
+                    outputReport[2] = 0x0C; // trigger flags only; do not touch the main motors
+                }
+
+                if ((useRumble || useAccurateRumble) && !hapticsStreamActive)
                 {
                     // Right? High Freq Motor
                     outputReport[4] = currentHap.rumbleState.RumbleMotorStrengthRightLightFast;
@@ -1296,7 +1312,9 @@ namespace DS4Windows.InputDevices
                 // 0x01 Enabled LED brightness (value in index 43)
                 // 0x02 Uninterruptable blue LED pulse (action in index 42)
                 // 0x04 Enable improved rumble emulation (Requires 2.24 firmware or newer)
-                outputReport[40] = useAccurateRumble ? (byte)0x06 : (byte)0x02; 
+                // Never assert improved rumble emulation while streaming haptic
+                // audio; it switches the firmware out of haptics mode.
+                outputReport[40] = (useAccurateRumble && !hapticsStreamActive) ? (byte)0x06 : (byte)0x02;
 
                 // 0x01 Slowly (2s?) fade to blue (scheduled to when the regular LED settings are active)
                 // 0x02 Slowly (2s?) fade out (scheduled after fade-in completion) with eventual switch back to configured LED color; only a fade-out can cancel the pulse (neither index 2, 0x08, nor turning this off will cancel it!)
