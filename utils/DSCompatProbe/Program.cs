@@ -359,9 +359,11 @@ internal static class Program
             catch (Exception) { }
 
             object audioClientInfo = null;
+            object sessions = null;
             if (device.State == DeviceState.Active)
             {
                 audioClientInfo = ProbeAudioClient(device);
+                sessions = ProbeSessions(device);
             }
 
             string friendly = null;
@@ -375,12 +377,69 @@ internal static class Program
                 friendlyName = friendly,
                 properties = props,
                 audioClient = audioClientInfo,
+                sessions,
             });
 
             device.Dispose();
         }
 
         return new { defaults, endpoints };
+    }
+
+    /// <summary>
+    /// Active audio sessions per endpoint — the PID↔endpoint mapping is often
+    /// the most direct evidence of which device a game selected.
+    /// </summary>
+    private static object ProbeSessions(MMDevice device)
+    {
+        try
+        {
+            var list = new List<object>();
+            var mgr = device.AudioSessionManager;
+            var collection = mgr.Sessions;
+            for (int i = 0; i < collection.Count; i++)
+            {
+                try
+                {
+                    var session = collection[i];
+                    string processName = null;
+                    uint pid = 0;
+                    try
+                    {
+                        pid = session.GetProcessID;
+                        if (pid != 0)
+                        {
+                            using var proc = System.Diagnostics.Process.GetProcessById((int)pid);
+                            processName = proc.ProcessName;
+                        }
+                    }
+                    catch (Exception) { }
+
+                    list.Add(new
+                    {
+                        pid,
+                        processName,
+                        state = session.State.ToString(),
+                        displayName = session.DisplayName,
+                        identifier = TryGet(() => session.GetSessionIdentifier),
+                        instanceIdentifier = TryGet(() => session.GetSessionInstanceIdentifier),
+                        isSystemSounds = session.IsSystemSoundsSession,
+                    });
+                }
+                catch (Exception) { }
+            }
+
+            return list;
+        }
+        catch (Exception ex)
+        {
+            return new { error = ex.Message };
+        }
+    }
+
+    private static string TryGet(Func<string> getter)
+    {
+        try { return getter(); } catch (Exception) { return null; }
     }
 
     private static object ProbeAudioClient(MMDevice device)

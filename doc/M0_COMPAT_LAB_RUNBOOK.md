@@ -68,3 +68,23 @@ Answerable from the data:
 If ProcMon+ETW leave the association mechanism ambiguous, escalate to
 API-level tracing (Detours-style) of SetupDi*/CM_*/IMMDevice*/HidD_* calls
 with arguments — separate run.
+
+## Findings so far (2026-07-18, wired DualSense + AC Black Flag Resynced live)
+
+- Wired render endpoint: "Speakers (DualSense Wireless Controller)", mix
+  format **48 kHz / 4ch / 32-bit float**; capture endpoint "Headset
+  Microphone" 48 kHz / 2ch. 16-bit shared/exclusive 4ch rejected — games
+  render via the float engine format.
+- **Native association confirmed live**: `ACBlackFlag_Plus` holds an audio
+  session on the controller's render endpoint (session PID↔endpoint mapping
+  from the probe). Module list is blocked by anti-tamper, so the SDK in use
+  is still unknown — needs ProcMon Load Image trace.
+- Per-channel metering (IAudioMeterInformation, 30 Hz sampling): ch1/2 carry
+  occasional game audio to the pad (~19% duty in sample), **ch3/4 carry
+  haptic bursts** (peak 0.50, sub-1% duty, short punchy envelopes) —
+  waveform logs in `probe_runs/<ts>/channel_meter*.csv`. These are reference
+  targets for the Phase 4 BT relay quality.
+- Wired HID input: report 0x01 @ ~250 Hz steady while the title plays.
+- Still needed: USB payload capture (game's trigger-effect output reports +
+  iso audio frames) via USBPcap/Wireshark; two-controller fixture; per-title
+  ProcMon/WPR traces per section 2.
