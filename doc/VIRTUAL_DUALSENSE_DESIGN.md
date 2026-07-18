@@ -149,3 +149,37 @@ mismatch cancels because the controller consumes at the same slot clock.
 Long-run verification TODO: confirm 960 decoded samples per slot over
 thousands of reports and whether the effective rate drifts per
 controller/firmware/temperature; drive a slow ASRC from FIFO occupancy.
+
+## M2.0 result (2026-07-18) -- complete
+
+`DSCompatProbe freezeusb` now produces the byte-exact fixture in
+`utils/DSCompatProbe/fixtures/dualsense_usb_0ce6`:
+
+- 18-byte device descriptor, 227-byte composite configuration descriptor,
+  289-byte USB HID report descriptor, and language/manufacturer/product string
+  descriptors, each stored as binary plus decoded JSON and SHA-256.
+- The HID descriptor is read from the physical USB device with
+  `IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION`. HidSharp on Windows returns
+  a valid but reconstructed 489-byte descriptor; it is retained only as a
+  diagnostic and must not be used as the virtual device's wire image.
+- `verifyusb` re-parses and concatenates every device/config descriptor segment,
+  compares the exact original bytes, checks all hashes, checks the HID length
+  advertised by the configuration, and rejects incomplete fixtures.
+- `enumeration.json` preserves the control exchanges visible in the source
+  USBPcap. `capture-usb.ps1 -RestartDualSense` is available for traces that
+  need an explicit device restart, though direct hub reads make it unnecessary
+  for freezing the HID descriptor.
+
+This clears M2.0. The next implementation milestone is M2.1 driver
+qualification, followed by the user-space usbip protocol core (M2.2).
+
+## M2.2 protocol core status (started 2026-07-18)
+
+`utils/VirtualDualSenseUsbip` now contains the driver-independent framing
+foundation: network-order management and 48-byte URB headers, bounded transfer
+and ISO descriptor parsing, exact reads that tolerate arbitrary TCP
+fragmentation, RET_SUBMIT/RET_UNLINK encoders, fixed-width device records, and
+a semaphore-serialized stream writer. Its `selftest` checks the Linux kernel
+documentation's interrupt-IN/OUT golden vectors plus a one-byte-fragmented
+OP_REQ_IMPORT. VHCI attachment remains disabled until the M2.1 signed-driver
+qualification gate is completed.

@@ -8,10 +8,15 @@
 # Usage (elevated PowerShell):
 #   .\capture-usb.ps1              # 180-second capture on all USB root hubs
 #   .\capture-usb.ps1 -Seconds 300
+#   .\capture-usb.ps1 -Seconds 8 -InjectDescriptors -RestartDualSense
+# RestartDualSense briefly restarts only USB\VID_054C&PID_0CE6 so a trace can
+# include enumeration traffic. It is not required by freezeusb, which can read
+# the wire HID descriptor directly through the parent hub.
 #Requires -RunAsAdministrator
 param(
     [int]$Seconds = 180,
     [switch]$InjectDescriptors,
+    [switch]$RestartDualSense,
     [string]$OutDir = "$PSScriptRoot\usb_captures\$(Get-Date -Format yyyyMMdd_HHmmss)"
 )
 
@@ -43,6 +48,19 @@ foreach ($iface in $ifaces) {
     $captureArgs = @("-d", $iface, "-o", "$OutDir\hub$n.pcap", "-A")
     if ($InjectDescriptors) { $captureArgs += "--inject-descriptors" }
     $procs += Start-Process -FilePath $cmd -PassThru -WindowStyle Hidden -ArgumentList $captureArgs
+}
+
+if ($RestartDualSense) {
+    Start-Sleep -Seconds 2
+    $controller = Get-PnpDevice -PresentOnly | Where-Object {
+        $_.InstanceId -like 'USB\VID_054C&PID_0CE6\*'
+    } | Select-Object -First 1
+    if (-not $controller) {
+        Write-Error "No wired USB DualSense (VID 054C, PID 0CE6) found to restart"
+    } else {
+        Write-Host "Restarting $($controller.InstanceId) to capture real enumeration descriptors..."
+        & pnputil.exe /restart-device $controller.InstanceId
+    }
 }
 
 Start-Sleep -Seconds $Seconds

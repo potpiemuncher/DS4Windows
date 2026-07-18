@@ -1,0 +1,98 @@
+[
+  {
+    "frame": 25,
+    "timestampUtc": "2026-07-18T16:15:23.8659150Z",
+    "endpoint": 128,
+    "status": 0,
+    "setup": {
+      "bmRequestType": 128,
+      "bRequest": 6,
+      "wValue": 256,
+      "wIndex": 0,
+      "wLength": 18
+    },
+    "dataLength": 0,
+    "dataBase64": null
+  },
+  {
+    "frame": 26,
+    "timestampUtc": "2026-07-18T16:15:23.8659150Z",
+    "endpoint": 128,
+    "status": 0,
+    "setup": null,
+    "dataLength": 18,
+    "dataBase64": "EgEAAgAAAEBMBeYMAAEBAgAB"
+  },
+  {
+    "frame": 27,
+    "timestampUtc": "2026-07-18T16:15:23.8659150Z",
+    "endpoint": 128,
+    "status": 0,
+    "setup": {
+      "bmRequestType": 128,
+      "bRequest": 6,
+      "wValue": 512,
+      "wIndex": 0,
+      "wLength": 227
+    },
+    "dataLength": 0,
+    "dataBase64": null
+  },
+  {
+    "frame": 28,
+    "timestampUtc": "2026-07-18T16:15:23.8659150Z",
+    "endpoint": 128,
+    "status": 0,
+    "setup": null,
+    "dataLength": 227,
+    "dataBase64": "CQLjAAQBAMD6CQQAAAABAQAACiQBAAFJAAIBAgwkAgEBAQYEMwAAAAwkBgIBAQMAAAAAAAkkAwMBAwQCAAwkAgQCBAMCAwAAAAkkBgUEAQMAAAkkAwYBAQEFAAkEAQAAAQIAAAkEAQEBAQIAAAckAQEBAQALJAIBBAIQAYC7AAkFAQmIAQQAAAclAQAAAAAJBAIAAAECAAAJBAIBAQECAAAHJAEGAQEACyQCAQICEAGAuwAJBYIFxAAEAAAHJQEAAAAACQQDAAIDAAAACSERAQABIiEBBwWEA0AABgcFAwNAAAY="
+  },
+  {
+    "frame": 29,
+    "timestampUtc": "2026-07-18T16:15:23.8659150Z",
+    "endpoint": 0,
+    "status": 0,
+    "setup": {
+      "bmRequestType": 0,
+      "bRequest": 9,
+      "wValue": 1,
+      "wIndex": 0,
+      "wLength": 0
+    },
+    "dataLength": 0,
+    "dataBase64": null
+  },
+  {
+    "frame": 30,
+    "timestampUtc": "2026-07-18T16:15:23.8659150Z",
+    "endpoint": 0,
+    "status": 0,
+    "setup": null,
+    "dataLength": 0,
+    "dataBase64": null
+  },
+  {
+    "frame": 3230,
+    "timestampUtc": "2026-07-18T16:15:25.8005430Z",
+    "endpoint": 0,
+    "status": 0,
+    "setup": {
+      "bmRequestType": 0,
+      "bRequest": 11,
+      "wValue": 1,
+      "wIndex": 1,
+      "wLength": 0
+    },
+    "dataLength": 0,
+    "dataBase64": null
+  },
+  {
+    "frame": 3234,
+    "timestampUtc": "2026-07-18T16:15:25.8063220Z",
+    "endpoint": 0,
+    "status": 0,
+    "setup": null,
+    "dataLength": 0,
+    "dataBase64": null
+  }
+]

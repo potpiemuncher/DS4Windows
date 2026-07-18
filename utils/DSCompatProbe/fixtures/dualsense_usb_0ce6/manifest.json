@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "sourcePcap": "hub3.pcap",
+  "deviceAddress": 11,
+  "sourcePcapLastWriteUtc": "2026-07-18T16:15:25.8988574Z",
+  "wiredHidInterfaceFound": true,
+  "hidSource": "IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION (parent hub, port 2)",
+  "complete": true,
+  "missing": [],
+  "files": [
+    {
+      "name": "device.bin",
+      "length": 18,
+      "sha256": "22927b1c25944c109955431846621306a4c91db7a2ae5d92e740af5561e18bb6"
+    },
+    {
+      "name": "configuration.bin",
+      "length": 227,
+      "sha256": "a4c5e13ff088b3642dd2ce735eac5207a84f2b343bb9a41095f1d6fd806dccbf"
+    },
+    {
+      "name": "hid-report.bin",
+      "length": 289,
+      "sha256": "4f48767516627510521512af13c20a064877465122b7bcc7cac1f3b608d37994"
+    },
+    {
+      "name": "string-0-lang-0000.bin",
+      "length": 4,
+      "sha256": "2bf9e7166f6dce93c04c256e2163f634ee0e7d8e5b8efb029df785baa7e4c2f2"
+    },
+    {
+      "name": "string-1-lang-0409.bin",
+      "length": 62,
+      "sha256": "1e2a8747b339e7b139da98bae94358e0bcf4c80f386e4b2ac1042e41ef9bd155"
+    },
+    {
+      "name": "string-2-lang-0409.bin",
+      "length": 60,
+      "sha256": "7202a38073ad3a97ffffccd5691ff80fa976e11139de71a9844dd5c3c2c90c9a"
+    }
+  ]
+}

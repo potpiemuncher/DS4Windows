@@ -1,0 +1,276 @@
+{
+  "length": 227,
+  "descriptors": [
+    {
+      "offset": 0,
+      "length": 9,
+      "type": 2,
+      "name": "Configuration",
+      "rawHex": "0902E300040100C0FA",
+      "fields": {
+        "wTotalLength": 227,
+        "bNumInterfaces": 4,
+        "bConfigurationValue": 1,
+        "bmAttributes": "0xC0",
+        "bMaxPower": 250
+      }
+    },
+    {
+      "offset": 9,
+      "length": 9,
+      "type": 4,
+      "name": "Interface",
+      "rawHex": "090400000001010000",
+      "fields": {
+        "bInterfaceNumber": 0,
+        "bAlternateSetting": 0,
+        "bNumEndpoints": 0,
+        "bInterfaceClass": "0x01",
+        "bInterfaceSubClass": "0x01",
+        "bInterfaceProtocol": "0x00"
+      }
+    },
+    {
+      "offset": 18,
+      "length": 10,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "0A240100014900020102",
+      "fields": {}
+    },
+    {
+      "offset": 28,
+      "length": 12,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "0C2402010101060433000000",
+      "fields": {}
+    },
+    {
+      "offset": 40,
+      "length": 12,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "0C2406020101030000000000",
+      "fields": {}
+    },
+    {
+      "offset": 52,
+      "length": 9,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "092403030103040200",
+      "fields": {}
+    },
+    {
+      "offset": 61,
+      "length": 12,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "0C2402040204030203000000",
+      "fields": {}
+    },
+    {
+      "offset": 73,
+      "length": 9,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "092406050401030000",
+      "fields": {}
+    },
+    {
+      "offset": 82,
+      "length": 9,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "092403060101010500",
+      "fields": {}
+    },
+    {
+      "offset": 91,
+      "length": 9,
+      "type": 4,
+      "name": "Interface",
+      "rawHex": "090401000001020000",
+      "fields": {
+        "bInterfaceNumber": 1,
+        "bAlternateSetting": 0,
+        "bNumEndpoints": 0,
+        "bInterfaceClass": "0x01",
+        "bInterfaceSubClass": "0x02",
+        "bInterfaceProtocol": "0x00"
+      }
+    },
+    {
+      "offset": 100,
+      "length": 9,
+      "type": 4,
+      "name": "Interface",
+      "rawHex": "090401010101020000",
+      "fields": {
+        "bInterfaceNumber": 1,
+        "bAlternateSetting": 1,
+        "bNumEndpoints": 1,
+        "bInterfaceClass": "0x01",
+        "bInterfaceSubClass": "0x02",
+        "bInterfaceProtocol": "0x00"
+      }
+    },
+    {
+      "offset": 109,
+      "length": 7,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "07240101010100",
+      "fields": {}
+    },
+    {
+      "offset": 116,
+      "length": 11,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "0B2402010402100180BB00",
+      "fields": {}
+    },
+    {
+      "offset": 127,
+      "length": 9,
+      "type": 5,
+      "name": "Endpoint",
+      "rawHex": "090501098801040000",
+      "fields": {
+        "bEndpointAddress": "0x01",
+        "bmAttributes": "0x09",
+        "wMaxPacketSize": 392,
+        "bInterval": 4
+      }
+    },
+    {
+      "offset": 136,
+      "length": 7,
+      "type": 37,
+      "name": "ClassSpecificEndpoint",
+      "rawHex": "07250100000000",
+      "fields": {}
+    },
+    {
+      "offset": 143,
+      "length": 9,
+      "type": 4,
+      "name": "Interface",
+      "rawHex": "090402000001020000",
+      "fields": {
+        "bInterfaceNumber": 2,
+        "bAlternateSetting": 0,
+        "bNumEndpoints": 0,
+        "bInterfaceClass": "0x01",
+        "bInterfaceSubClass": "0x02",
+        "bInterfaceProtocol": "0x00"
+      }
+    },
+    {
+      "offset": 152,
+      "length": 9,
+      "type": 4,
+      "name": "Interface",
+      "rawHex": "090402010101020000",
+      "fields": {
+        "bInterfaceNumber": 2,
+        "bAlternateSetting": 1,
+        "bNumEndpoints": 1,
+        "bInterfaceClass": "0x01",
+        "bInterfaceSubClass": "0x02",
+        "bInterfaceProtocol": "0x00"
+      }
+    },
+    {
+      "offset": 161,
+      "length": 7,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "07240106010100",
+      "fields": {}
+    },
+    {
+      "offset": 168,
+      "length": 11,
+      "type": 36,
+      "name": "ClassSpecificInterface",
+      "rawHex": "0B2402010202100180BB00",
+      "fields": {}
+    },
+    {
+      "offset": 179,
+      "length": 9,
+      "type": 5,
+      "name": "Endpoint",
+      "rawHex": "09058205C400040000",
+      "fields": {
+        "bEndpointAddress": "0x82",
+        "bmAttributes": "0x05",
+        "wMaxPacketSize": 196,
+        "bInterval": 4
+      }
+    },
+    {
+      "offset": 188,
+      "length": 7,
+      "type": 37,
+      "name": "ClassSpecificEndpoint",
+      "rawHex": "07250100000000",
+      "fields": {}
+    },
+    {
+      "offset": 195,
+      "length": 9,
+      "type": 4,
+      "name": "Interface",
+      "rawHex": "090403000203000000",
+      "fields": {
+        "bInterfaceNumber": 3,
+        "bAlternateSetting": 0,
+        "bNumEndpoints": 2,
+        "bInterfaceClass": "0x03",
+        "bInterfaceSubClass": "0x00",
+        "bInterfaceProtocol": "0x00"
+      }
+    },
+    {
+      "offset": 204,
+      "length": 9,
+      "type": 33,
+      "name": "HID",
+      "rawHex": "092111010001222101",
+      "fields": {
+        "bcdHID": "0x0111",
+        "reportDescriptorLength": 289
+      }
+    },
+    {
+      "offset": 213,
+      "length": 7,
+      "type": 5,
+      "name": "Endpoint",
+      "rawHex": "07058403400006",
+      "fields": {
+        "bEndpointAddress": "0x84",
+        "bmAttributes": "0x03",
+        "wMaxPacketSize": 64,
+        "bInterval": 6
+      }
+    },
+    {
+      "offset": 220,
+      "length": 7,
+      "type": 5,
+      "name": "Endpoint",
+      "rawHex": "07050303400006",
+      "fields": {
+        "bEndpointAddress": "0x03",
+        "bmAttributes": "0x03",
+        "wMaxPacketSize": 64,
+        "bInterval": 6
+      }
+    }
+  ]
+}

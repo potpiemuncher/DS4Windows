@@ -1,0 +1,26 @@
+{
+  "length": 18,
+  "descriptors": [
+    {
+      "offset": 0,
+      "length": 18,
+      "type": 1,
+      "name": "Device",
+      "rawHex": "12010002000000404C05E60C000101020001",
+      "fields": {
+        "bcdUSB": "0x0200",
+        "bDeviceClass": 0,
+        "bDeviceSubClass": 0,
+        "bDeviceProtocol": 0,
+        "bMaxPacketSize0": 64,
+        "idVendor": "0x054C",
+        "idProduct": "0x0CE6",
+        "bcdDevice": "0x0100",
+        "iManufacturer": 1,
+        "iProduct": 2,
+        "iSerialNumber": 0,
+        "bNumConfigurations": 1
+      }
+    }
+  ]
+}
