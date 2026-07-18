@@ -229,6 +229,14 @@ namespace DS4Windows
             Pulse
         }
 
+        public enum HapticsMode : ushort
+        {
+            Off,
+            SystemAudio,
+            RumbleToHaptics,
+            Mix,
+        }
+
         private LEDBarMode ledMode = LEDBarMode.MultipleControllers;
         public LEDBarMode LedMode
         {
@@ -254,6 +262,61 @@ namespace DS4Windows
             }
         }
         public event EventHandler MuteLedModeChanged;
+
+        // Bluetooth audio-haptics streaming settings. Fires a single combined
+        // change event; the device restarts its haptics streamer on any change.
+        private HapticsMode btHapticsMode = HapticsMode.Off;
+        public HapticsMode BTHapticsMode
+        {
+            get => btHapticsMode;
+            set
+            {
+                if (btHapticsMode == value) return;
+                btHapticsMode = value;
+                BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private double btHapticsGain = 3.0;
+        public double BTHapticsGain
+        {
+            get => btHapticsGain;
+            set
+            {
+                value = Math.Clamp(value, 0.1, 10.0);
+                if (btHapticsGain == value) return;
+                btHapticsGain = value;
+                BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private int btHapticsLowPassHz = 350;
+        public int BTHapticsLowPassHz
+        {
+            get => btHapticsLowPassHz;
+            set
+            {
+                value = Math.Clamp(value, 40, 1000);
+                if (btHapticsLowPassHz == value) return;
+                btHapticsLowPassHz = value;
+                BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private string btHapticsAudioDeviceId = string.Empty;
+        public string BTHapticsAudioDeviceId
+        {
+            get => btHapticsAudioDeviceId;
+            set
+            {
+                value ??= string.Empty;
+                if (btHapticsAudioDeviceId == value) return;
+                btHapticsAudioDeviceId = value;
+                BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        public event EventHandler BTHapticsOptionChanged;
 
         public DualSenseControllerOptions(InputDeviceType deviceType) :
             base(deviceType)

@@ -40,16 +40,48 @@ namespace DS4WinWPF.DS4Control.DTOXml
             get; set;
         }
 
+        [XmlElement("BTHapticsMode")]
+        public HapticsMode BTHapticsMode
+        {
+            get; set;
+        } = HapticsMode.Off;
+
+        [XmlElement("BTHapticsGain")]
+        public double BTHapticsGain
+        {
+            get; set;
+        } = 3.0;
+
+        [XmlElement("BTHapticsLowPassHz")]
+        public int BTHapticsLowPassHz
+        {
+            get; set;
+        } = 350;
+
+        [XmlElement("BTHapticsAudioDeviceId")]
+        public string BTHapticsAudioDeviceId
+        {
+            get; set;
+        } = string.Empty;
+
         public void MapFrom(DualSenseControllerOptions source)
         {
             LEDMode = source.LedMode;
             MuteLedMode = source.MuteLedMode;
+            BTHapticsMode = source.BTHapticsMode;
+            BTHapticsGain = source.BTHapticsGain;
+            BTHapticsLowPassHz = source.BTHapticsLowPassHz;
+            BTHapticsAudioDeviceId = source.BTHapticsAudioDeviceId;
         }
 
         public void MapTo(DualSenseControllerOptions destination)
         {
             destination.LedMode = LEDMode;
             destination.MuteLedMode = MuteLedMode;
+            destination.BTHapticsMode = BTHapticsMode;
+            destination.BTHapticsGain = BTHapticsGain;
+            destination.BTHapticsLowPassHz = BTHapticsLowPassHz;
+            destination.BTHapticsAudioDeviceId = BTHapticsAudioDeviceId;
         }
     }
 }

@@ -209,6 +209,13 @@ namespace DS4Windows.InputDevices
         private DualSenseControllerOptions nativeOptionsStore;
         public DualSenseControllerOptions NativeOptionsStore { get => nativeOptionsStore; }
 
+        private DualSenseHapticsStreamer hapticsStreamer;
+        public DualSenseHapticsStreamer HapticsStreamer { get => hapticsStreamer; }
+
+        // Current rumble targets for the haptics streamer's rumble-to-haptics synth
+        internal byte CurrentRumbleHeavy => currentHap.rumbleState.RumbleMotorStrengthLeftHeavySlow;
+        internal byte CurrentRumbleLight => currentHap.rumbleState.RumbleMotorStrengthRightLightFast;
+
         public override event ReportHandler<EventArgs> Report = null;
         public override event EventHandler BatteryChanged;
         public override event EventHandler ChargingChanged;
@@ -468,9 +475,28 @@ namespace DS4Windows.InputDevices
                 ds4Input.Name = "DualSense Input thread: " + Mac;
                 ds4Input.IsBackground = true;
                 ds4Input.Start();
+
+                if (conType == ConnectionType.BT)
+                {
+                    RefreshHapticsStreamerState();
+                }
             }
             else
                 Console.WriteLine("Thread already running for DS4: " + Mac);
+        }
+
+        private void RefreshHapticsStreamerState()
+        {
+            if (conType != ConnectionType.BT || nativeOptionsStore == null)
+            {
+                return;
+            }
+
+            hapticsStreamer ??= new DualSenseHapticsStreamer(this, hDevice);
+            hapticsStreamer.Configure(nativeOptionsStore.BTHapticsMode,
+                nativeOptionsStore.BTHapticsGain,
+                nativeOptionsStore.BTHapticsLowPassHz,
+                nativeOptionsStore.BTHapticsAudioDeviceId);
         }
 
         private void TimeoutTestThread()
@@ -981,6 +1007,7 @@ namespace DS4Windows.InputDevices
 
         protected override void StopOutputUpdate()
         {
+            hapticsStreamer?.Stop();
             SendEmptyOutputReport();
         }
 
@@ -1200,7 +1227,11 @@ namespace DS4Windows.InputDevices
                 // 0x40 Adjust overall motor/effect power, 0x80 ???
                 outputReport[3] = 0x55; // 0x04 | 0x01 | 0x10 | 0x40
 
-                if (useRumble || useAccurateRumble)
+                // Leave the emulated motors idle while the haptics streamer is
+                // synthesizing rumble through the audio path, so the actuators
+                // are not driven twice.
+                if ((useRumble || useAccurateRumble) &&
+                    !(hapticsStreamer?.SuppressRumbleBytes ?? false))
                 {
                     // Right? High Freq Motor
                     outputReport[4] = currentHap.rumbleState.RumbleMotorStrengthRightLightFast;
@@ -1531,6 +1562,11 @@ namespace DS4Windows.InputDevices
                     PreparePlayerLEDBarByte();
                     queueEvent(() => { outputDirty = true; });
                 };
+
+                nativeOptionsStore.BTHapticsOptionChanged += (sender, e) =>
+                {
+                    RefreshHapticsStreamerState();
+                };
             }
         }
 
@@ -1540,6 +1576,7 @@ namespace DS4Windows.InputDevices
             {
                 PrepareMuteLEDByte();
                 PreparePlayerLEDBarByte();
+                RefreshHapticsStreamerState();
             }
         }
     }
