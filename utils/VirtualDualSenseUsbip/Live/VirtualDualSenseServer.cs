@@ -31,6 +31,8 @@ public sealed class VirtualDualSenseServer : IDisposable
     private readonly VirtualDualSenseServerOptions options;
     private readonly TcpListener listener;
     private readonly UsbIpDeviceInfo deviceInfo;
+    private readonly IInputReportSource inputReports;
+    private readonly FeatureReportSet featureReports;
     private WindowsTimerResolution? timerResolution;
     private bool started;
 
@@ -39,10 +41,14 @@ public sealed class VirtualDualSenseServer : IDisposable
     public event Action<HidOutputCapture>? HidOutputReceived;
 
     public VirtualDualSenseServer(DescriptorSet descriptors,
-        VirtualDualSenseServerOptions? options = null)
+        VirtualDualSenseServerOptions? options = null,
+        IInputReportSource? inputReports = null,
+        FeatureReportSet? featureReports = null)
     {
         this.descriptors = descriptors;
         this.options = options ?? new VirtualDualSenseServerOptions();
+        this.inputReports = inputReports ?? new NeutralInputReportSource();
+        this.featureReports = featureReports ?? FeatureReportSet.CreateVirtualDefaults();
         listener = new TcpListener(IPAddress.Loopback, this.options.Port);
         deviceInfo = new UsbIpDeviceInfo(
             "/virtual/ds4windows/dualsense-hid",
@@ -83,7 +89,8 @@ public sealed class VirtualDualSenseServer : IDisposable
         }
         started = true;
         Port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        EmitLog($"USB/IP server listening on 127.0.0.1:{Port}; busid {options.BusId}.");
+        EmitLog($"USB/IP server listening on 127.0.0.1:{Port}; busid {options.BusId}; " +
+            $"input {inputReports.Description}.");
     }
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
@@ -166,7 +173,8 @@ public sealed class VirtualDualSenseServer : IDisposable
                     cancellationToken);
                 EmitLog($"Imported busid {options.BusId}; beginning live URB session.");
                 var session = new UsbIpDeviceSession(
-                    stream, writer, descriptors, options.EffectiveInputInterval,
+                    stream, writer, descriptors, featureReports, inputReports,
+                    options.EffectiveInputInterval,
                     capture => HidOutputReceived?.Invoke(capture), EmitLog);
                 await session.RunAsync(cancellationToken);
                 return;
@@ -208,20 +216,22 @@ internal sealed class UsbIpDeviceSession
     private readonly Stream stream;
     private readonly SerializedStreamWriter writer;
     private readonly ControlEndpoint controlEndpoint;
+    private readonly IInputReportSource inputReports;
     private readonly TimeSpan inputInterval;
     private readonly Action<HidOutputCapture> captureOutput;
     private readonly Action<string> log;
     private readonly ConcurrentDictionary<uint, UsbIpSubmit> pendingInput = new();
     private readonly ConcurrentQueue<uint> pendingInputOrder = new();
-    private byte frameCounter;
 
     public UsbIpDeviceSession(Stream stream, SerializedStreamWriter writer,
-        DescriptorSet descriptors, TimeSpan inputInterval,
+        DescriptorSet descriptors, FeatureReportSet featureReports,
+        IInputReportSource inputReports, TimeSpan inputInterval,
         Action<HidOutputCapture> captureOutput, Action<string> log)
     {
         this.stream = stream;
         this.writer = writer;
-        controlEndpoint = new ControlEndpoint(descriptors);
+        controlEndpoint = new ControlEndpoint(descriptors, featureReports);
+        this.inputReports = inputReports;
         this.inputInterval = inputInterval;
         this.captureOutput = captureOutput;
         this.log = log;
@@ -377,34 +387,10 @@ internal sealed class UsbIpDeviceSession
                 continue;
             }
 
-            byte[] report = CreateNeutralInputReport(submit.TransferBufferLength);
+            byte[] report = inputReports.CreateReport(submit.TransferBufferLength);
             await ReplySubmitAsync(submit.Basic.SequenceNumber, status: 0,
                 report, cancellationToken);
         }
-    }
-
-    private byte[] CreateNeutralInputReport(int requestedLength)
-    {
-        byte[] report = new byte[Math.Min(64, requestedLength)];
-        if (report.Length == 0)
-        {
-            return report;
-        }
-
-        report[0] = 0x01;
-        for (int i = 1; i <= 4 && i < report.Length; i++)
-        {
-            report[i] = 0x80; // centered LX, LY, RX, RY
-        }
-        if (report.Length > 7)
-        {
-            report[7] = frameCounter++;
-        }
-        if (report.Length > 8)
-        {
-            report[8] = 0x08; // neutral d-pad, face buttons released
-        }
-        return report;
     }
 
     private ValueTask ReplySubmitAsync(uint sequenceNumber, int status, byte[] data,

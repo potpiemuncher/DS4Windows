@@ -193,11 +193,17 @@ Status and order:
    configuration retains the exact 289-byte captured report descriptor. EP0,
    pairing report `0x09`, firmware report `0x20`, 250 Hz interrupt IN,
    interrupt OUT capture, and UNLINK work. A 30-second live read delivered
-   7,504 reports at 250.1 Hz without failure. Calibration report `0x05`
-   intentionally stalls instead of returning fabricated sensor data.
-   Remaining M2.3 work: physical BT input forwarding, Steam-free native-title
-   recognition, all five adaptive-trigger programs, one-hour stability, and
-   repeated clean attach/detach cycles.
+   7,504 reports at 250.1 Hz without failure. In neutral-input mode,
+   calibration report `0x05` intentionally stalls instead of returning
+   fabricated sensor data.
+   An opt-in `--input bluetooth` bridge is implemented and synthetic-tested:
+   it validates physical `0x31` CRCs, maps bytes 2..64 to wired `0x01` bytes
+   1..63, and forwards real calibration at runtime without persisting hardware
+   values. Its first physical run is still pending because the controller HID
+   stream was asleep at handoff. Remaining M2.3 work: wake/reconnect the pad,
+   run `inputtest 5`, restart the server with `--input bluetooth`, prove
+   Steam-free native-title recognition, capture all five adaptive-trigger
+   programs, run one-hour stability, and repeat clean attach/detach cycles.
 5. **M2.4**: add exact UAC1 composite descriptors.
 6. **M2.5**: qualify isochronous timing and stability.
 7. **M2.6**: relay UAC haptic channels 3/4 to 3 kHz Bluetooth haptic PCM and

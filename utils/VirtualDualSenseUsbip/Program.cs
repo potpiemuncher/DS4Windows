@@ -24,16 +24,46 @@ if (args.Length >= 1 && args[0].Equals("servertest", StringComparison.OrdinalIgn
     return;
 }
 
+if (args.Length >= 1 && args[0].Equals("inputtest", StringComparison.OrdinalIgnoreCase))
+{
+    double seconds = args.Length >= 2 ? ParseSeconds(args[1]) : 5;
+    using var input = BluetoothDualSenseInputSource.Open(
+        message => Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {message}"));
+    Console.WriteLine($"Reading {input.Description} for {seconds:0.###} seconds...");
+    await Task.Delay(TimeSpan.FromSeconds(seconds));
+    byte[] latest = input.CreateReport(64);
+    Console.WriteLine($"Received {input.ValidReportCount} valid reports; " +
+        $"rejected {input.InvalidReportCount}. Latest USB report: {Convert.ToHexString(latest)}");
+    if (input.ValidReportCount == 0)
+    {
+        Environment.ExitCode = 1;
+    }
+    return;
+}
+
 if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCase))
 {
     string fixtures = GetOption(args, "--fixtures") ?? DefaultFixturesPath();
     string busId = GetOption(args, "--busid") ?? "1-1";
     string? capturePath = GetOption(args, "--capture");
+    string inputMode = GetOption(args, "--input") ?? "neutral";
     int port = ParsePort(GetOption(args, "--port"));
 
     DescriptorSet descriptors = DescriptorSet.LoadHidOnlyFromFixtures(Path.GetFullPath(fixtures));
+    using BluetoothDualSenseInputSource? bluetoothInput =
+        inputMode.Equals("bluetooth", StringComparison.OrdinalIgnoreCase)
+            ? BluetoothDualSenseInputSource.Open(
+                message => Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {message}"))
+            : inputMode.Equals("neutral", StringComparison.OrdinalIgnoreCase)
+                ? null
+                : throw new ArgumentException("--input must be 'neutral' or 'bluetooth'.");
+    IInputReportSource inputReports = bluetoothInput is not null
+        ? bluetoothInput
+        : new NeutralInputReportSource();
+    FeatureReportSet featureReports =
+        FeatureReportSet.CreateVirtualDefaults(bluetoothInput?.CalibrationFeatureReport);
     using var server = new VirtualDualSenseServer(descriptors,
-        new VirtualDualSenseServerOptions(port, busId));
+        new VirtualDualSenseServerOptions(port, busId), inputReports, featureReports);
     server.Log += message => Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {message}");
 
     StreamWriter? captureWriter = null;
@@ -97,7 +127,9 @@ Console.WriteLine("VirtualDualSenseUsbip M2.2 protocol core + M2.3 live HID devi
 Console.WriteLine("  selftest              USB/IP protocol golden vectors + fragmentation");
 Console.WriteLine("  devicetest [fixtures] replay captured EP0 enumeration byte-exact");
 Console.WriteLine("  servertest [fixtures] exercise the live server over loopback TCP");
+Console.WriteLine("  inputtest [seconds]   validate physical BT input and USB report conversion");
 Console.WriteLine("  serve [--fixtures DIR] [--port 3240] [--busid 1-1] [--capture FILE]");
+Console.WriteLine("        [--input neutral|bluetooth]");
 
 static string DefaultFixturesPath() => Path.Combine(AppContext.BaseDirectory,
     "..", "..", "..", "..", "DSCompatProbe", "fixtures", "dualsense_usb_0ce6");
@@ -130,4 +162,13 @@ static int ParsePort(string? value)
         throw new ArgumentOutOfRangeException(nameof(value), "Port must be between 1024 and 65535.");
     }
     return port;
+}
+
+static double ParseSeconds(string value)
+{
+    if (!double.TryParse(value, out double seconds) || !double.IsFinite(seconds) || seconds <= 0)
+    {
+        throw new ArgumentOutOfRangeException(nameof(value), "Seconds must be a positive number.");
+    }
+    return seconds;
 }

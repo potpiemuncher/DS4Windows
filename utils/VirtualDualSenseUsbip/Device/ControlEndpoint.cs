@@ -122,8 +122,8 @@ public sealed class ControlEndpoint
 
             case UsbHidRequest.GetReport:
                 // Only the captured/sanitized feature reports in FeatureReportSet
-                // are served. Calibration (0x05) remains intentionally stalled
-                // until a wired fixture is frozen; never invent sensor calibration.
+                // are served. Calibration (0x05) is available only when supplied
+                // from a real pad at runtime; never invent sensor calibration.
                 return featureReports.Get(setup);
 
             default:

@@ -18,12 +18,16 @@ M2.3-live enumeration is working on the primary Windows 11 PC:
   interrupt IN, interrupt OUT capture, and UNLINK are live.
 - Neutral interrupt-IN reports sustain 250 Hz; a 30-second run delivered 7,504
   reports at 250.1 Hz without a read failure.
-- Feature report `0x05` intentionally stalls until physical input forwarding
-  can supply real calibration instead of invented sensor values.
+- `--input bluetooth` reads authenticated report `0x31` frames from the real
+  pad, maps their shared payload to wired report `0x01`, and supplies real
+  calibration at runtime without logging or persisting hardware values. This
+  path passes synthetic CRC/mapping tests but still needs its first live run.
+- In neutral-input mode, feature report `0x05` intentionally stalls rather
+  than returning invented sensor calibration.
 
-Native-title recognition, physical controller input forwarding, the five
-adaptive-trigger programs, one-hour stability, and repeated clean attach/detach
-remain M2.3 acceptance work. UAC1 audio is not exposed yet.
+Live physical-input validation, native-title recognition, the five adaptive-
+trigger programs, one-hour stability, and repeated clean attach/detach remain
+M2.3 acceptance work. UAC1 audio is not exposed yet.
 
 ## Build and test
 
@@ -32,6 +36,7 @@ dotnet build .\utils\VirtualDualSenseUsbip\VirtualDualSenseUsbip.csproj -c Relea
 dotnet run --project .\utils\VirtualDualSenseUsbip -- selftest
 dotnet run --project .\utils\VirtualDualSenseUsbip -- devicetest
 dotnet run --project .\utils\VirtualDualSenseUsbip -- servertest
+dotnet run --project .\utils\VirtualDualSenseUsbip -- inputtest 5
 ```
 
 The tests cover USB/IP golden vectors and fragmentation, byte-exact replay of
@@ -44,7 +49,7 @@ Close DS4Windows for the first clean enumeration. Start the server from a
 normal terminal:
 
 ```powershell
-dotnet run --project .\utils\VirtualDualSenseUsbip -- serve --capture .\m23-hid-output.ndjson
+dotnet run --project .\utils\VirtualDualSenseUsbip -- serve --input bluetooth --capture .\m23-hid-output.ndjson
 ```
 
 Then attach from an elevated terminal:
@@ -62,6 +67,10 @@ The serial must contain at most 15 alphanumeric ASCII characters; hyphenated
 ```
 
 The port number can differ; use the value printed by `usbip port`.
+The physical controller must be awake and connected over Bluetooth before the
+server starts. Keep DS4Windows, DSX, and Steam Input closed for the first live
+bridge test. Use `--input neutral` when only enumeration/output capture is
+needed.
 
 Protocol source: [Linux kernel USB/IP protocol documentation](https://docs.kernel.org/usb/usbip_protocol.html).
 The captured descriptors live in

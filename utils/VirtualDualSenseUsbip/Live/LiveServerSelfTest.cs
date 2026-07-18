@@ -12,6 +12,9 @@ public static class LiveServerSelfTest
 
     public static async Task RunAsync(string fixturesDir)
     {
+        Console.WriteLine("servertest: Bluetooth-to-USB input conversion");
+        TestBluetoothInputConversion();
+
         Console.WriteLine("servertest: derive HID-only configuration");
         DescriptorSet descriptors = DescriptorSet.LoadHidOnlyFromFixtures(fixturesDir);
         Require(descriptors.NumInterfaces == 1 && descriptors.HidInterfaceNumber == 0,
@@ -50,6 +53,49 @@ public static class LiveServerSelfTest
         }
 
         Console.WriteLine("PASS: live USB/IP management, HID-only EP0, interrupt IN/OUT, and UNLINK.");
+    }
+
+    private static void TestBluetoothInputConversion()
+    {
+        byte[] bluetooth = new byte[78];
+        bluetooth[0] = 0x31;
+        bluetooth[1] = 0x10;
+        for (int i = 2; i < 74; i++)
+        {
+            bluetooth[i] = (byte)(i * 3);
+        }
+        uint crc = ComputeBluetoothCrc(0xA1, bluetooth.AsSpan(0, 74));
+        BinaryPrimitives.WriteUInt32LittleEndian(bluetooth.AsSpan(74), crc);
+
+        Require(BluetoothDualSenseInputSource.TryConvertBluetoothReport(
+                bluetooth, out byte[] usb) &&
+                usb.Length == 64 && usb[0] == 0x01 &&
+                usb.AsSpan(1).SequenceEqual(bluetooth.AsSpan(2, 63)),
+            "Bluetooth input did not map byte-exact to USB report 0x01");
+
+        bluetooth[10] ^= 0x01;
+        Require(!BluetoothDualSenseInputSource.TryConvertBluetoothReport(bluetooth, out _),
+            "Bluetooth input with an invalid CRC was accepted");
+    }
+
+    private static uint ComputeBluetoothCrc(byte seed, ReadOnlySpan<byte> data)
+    {
+        uint state = UpdateCrc32(0xFFFFFFFF, seed);
+        foreach (byte value in data)
+        {
+            state = UpdateCrc32(state, value);
+        }
+        return ~state;
+    }
+
+    private static uint UpdateCrc32(uint state, byte value)
+    {
+        state ^= value;
+        for (int bit = 0; bit < 8; bit++)
+        {
+            state = (state & 1) != 0 ? 0xEDB88320U ^ (state >> 1) : state >> 1;
+        }
+        return state;
     }
 
     private static async Task TestDeviceListAsync(int port)

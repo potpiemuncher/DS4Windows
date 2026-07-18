@@ -221,9 +221,15 @@ Live evidence on the qualified primary PC:
   input reports in 30.003 seconds (250.1 Hz) with no read failure. The server
   requests 1 ms Windows timer resolution while running to avoid default timer
   quantization near 64 Hz.
+- An opt-in Bluetooth input source now validates each physical `0x31` report's
+  CRC and copies its shared payload byte-exact into virtual wired report
+  `0x01`. Real feature `0x05` calibration is read and served only at runtime;
+  its values and the physical address are never logged or persisted. Synthetic
+  conversion/CRC tests pass. The first physical live run remains pending
+  because the paired controller's active HID stream was asleep at handoff.
 
 M2.3 is not fully accepted yet. Remaining work is to forward physical
-Bluetooth input instead of neutral reports, prove recognition in a Steam-free
+Bluetooth input through a live hardware run, prove recognition in a Steam-free
 native DualSense title, capture all five adaptive-trigger programs, run the
 one-hour stability test, and exercise repeated clean attach/detach cycles.
 M2.4 UAC1 composite enumeration has not started.

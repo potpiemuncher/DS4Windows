@@ -8,7 +8,8 @@ namespace VirtualDualSenseUsbip.Device;
 /// The pairing report uses a deterministic locally administered virtual MAC,
 /// never the user's physical controller address. The firmware body was read
 /// from the test controller; the final Bluetooth-only CRC bytes are cleared
-/// because the virtual device is presented as wired USB.
+/// because the virtual device is presented as wired USB. Optional calibration
+/// is supplied from the connected physical pad at runtime and is never stored.
 /// </summary>
 public sealed class FeatureReportSet
 {
@@ -19,7 +20,7 @@ public sealed class FeatureReportSet
         this.reports = reports;
     }
 
-    public static FeatureReportSet CreateVirtualDefaults()
+    public static FeatureReportSet CreateVirtualDefaults(byte[]? calibration = null)
     {
         // ReadSerial interprets bytes 1..6 in reverse order. This produces the
         // stable virtual address 02:54:C0:CE:60:01 (locally administered).
@@ -36,11 +37,24 @@ public sealed class FeatureReportSet
             "204A756C202034203230323531303A31303A333203000400130300002A00100140" +
             "1900000000000000000000300600002A0001000A000200060000000000000000");
 
-        return new FeatureReportSet(new Dictionary<byte, byte[]>
+        var reports = new Dictionary<byte, byte[]>
         {
             [0x09] = pairing,
             [0x20] = firmware,
-        });
+        };
+
+        if (calibration != null)
+        {
+            if (calibration.Length != 41 || calibration[0] != 0x05)
+            {
+                throw new ArgumentException(
+                    "DualSense calibration must be a 41-byte feature report 0x05.",
+                    nameof(calibration));
+            }
+            reports[0x05] = calibration.ToArray();
+        }
+
+        return new FeatureReportSet(reports);
     }
 
     public ControlResult Get(UsbSetupPacket setup)
