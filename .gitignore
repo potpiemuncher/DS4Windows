@@ -332,3 +332,6 @@ ASALocalRun/
 !DS4Windows/libs/x64/
 !DS4Windows/libs/x86/
 
+
+# Raw USB captures are large local fixtures - keep out of the repo
+utils/DSCompatProbe/usb_captures/

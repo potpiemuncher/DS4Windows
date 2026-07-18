@@ -14,14 +14,21 @@ param(
     [string]$OutDir = "$PSScriptRoot\usb_captures\$(Get-Date -Format yyyyMMdd_HHmmss)"
 )
 
-$cmd = "C:\Program Files\USBPcap\USBPcapCMD.exe"
-if (-not (Test-Path $cmd)) { Write-Error "USBPcap not installed"; exit 1 }
+Start-Transcript -Path "$PSScriptRoot\capture-usb.log" -Force | Out-Null
 
-$ifaceOutput = & $cmd --extcap-interfaces
+$cmd = "C:\Program Files\USBPcap\USBPcapCMD.exe"
+if (-not (Test-Path $cmd)) { Write-Error "USBPcap not installed"; Stop-Transcript; exit 1 }
+
+# USBPcapCMD's output doesn't survive PowerShell's native-exe pipe capture,
+# but cmd-level file redirection works reliably — enumerate via temp file.
+$listFile = Join-Path $env:TEMP "usbpcap_ifaces.txt"
+cmd /c "`"$cmd`" --extcap-interfaces > `"$listFile`" 2>&1" | Out-Null
+$ifaceOutput = Get-Content $listFile -ErrorAction SilentlyContinue
 $ifaces = $ifaceOutput | Select-String -Pattern "value=(\\\\\.\\USBPcap\d+)" -AllMatches |
     ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value }
 if (-not $ifaces) {
     Write-Error "No USBPcap capture interfaces found. Reboot after installing USBPcap, then retry."
+    Stop-Transcript
     exit 1
 }
 
@@ -41,3 +48,4 @@ $procs | Where-Object { -not $_.HasExited } | Stop-Process -Force
 Write-Host "Capture complete. Files:"
 Get-ChildItem $OutDir | Format-Table Name, Length
 Write-Host "Decode hint: tshark -r hubN.pcap -Y 'usb.idVendor == 0x054c' (find the hub with DualSense traffic)"
+Stop-Transcript
