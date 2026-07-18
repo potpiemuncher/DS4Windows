@@ -202,6 +202,10 @@ namespace DS4Windows.InputDevices
                 short[] pcmFrame = null;
                 if (audioEnabled)
                 {
+                    // The controller's audio amp defaults to muted volume; it only
+                    // plays the stream after headphone/speaker volume is set.
+                    SendAudioVolumeSetup();
+
                     opusEncoder = OpusCodecFactory.CreateEncoder(AUDIO_SAMPLE_RATE, 2,
                         OpusApplication.OPUS_APPLICATION_AUDIO);
                     opusEncoder.Bitrate = OPUS_FRAME_BYTES * 8 * 100;
@@ -468,6 +472,34 @@ namespace DS4Windows.InputDevices
             Buffer.BlockCopy(opusB, 0, report, 142 + OPUS_FRAME_BYTES, OPUS_FRAME_BYTES);
 
             ApplyCrc(report, AUDIO_REPORT_SIZE);
+        }
+
+        /// <summary>
+        /// Sends a SetStateData container packet (PID 0x10 inside a 0x32 report)
+        /// that unmutes the controller's audio amp: headphone/speaker volume 100
+        /// with a mild speaker pre-gain boost. Mirrors what DS5Dongle emits when
+        /// the USB host sets its volume; without this the Opus stream is silent.
+        /// </summary>
+        private void SendAudioVolumeSetup()
+        {
+            byte[] pkt = new byte[HAPTICS_REPORT_SIZE];
+            pkt[0] = HAPTICS_REPORT_ID;
+            pkt[1] = (byte)((seq & 0x0F) << 4);
+            seq = (byte)((seq + 1) & 0x0F);
+
+            pkt[2] = 0x90; // SetStateData packet: PID 0x10 | sized
+            pkt[3] = 0x3F;
+
+            // SetStateData payload starts at pkt[4] (offsets per Nielk1's layout)
+            pkt[4] = 0xB0;      // AllowHeadphoneVolume | AllowSpeakerVolume | AllowAudioControl
+            pkt[5] = 0x80;      // AllowAudioControl2
+            pkt[4 + 4] = 0x64;  // VolumeHeadphones (max 0x7F)
+            pkt[4 + 5] = 0x64;  // VolumeSpeaker (PS5 uses 0x3D..0x64)
+            pkt[4 + 7] = 0x00;  // AudioControl: mic auto, default output path
+            pkt[4 + 37] = 0x02; // AudioControl2: SpeakerCompPreGain = 2
+
+            ApplyCrc(pkt, HAPTICS_REPORT_SIZE);
+            hidDevice.WriteOutputReportViaInterrupt(pkt, 100);
         }
 
         private void ApplyCrc(byte[] report, int totalSize)
