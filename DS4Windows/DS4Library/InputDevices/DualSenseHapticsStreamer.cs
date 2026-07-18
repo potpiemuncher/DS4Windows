@@ -33,10 +33,9 @@ namespace DS4Windows.InputDevices
     ///
     /// Haptics-only mode uses the self-contained HID output report 0x36 carrying
     /// controller state plus 3 kHz stereo PCM for the voice-coil actuators. When
-    /// listening audio is enabled, the larger 0x39 container is used instead,
-    /// carrying both the haptic PCM and
-    /// Opus-encoded 48 kHz stereo audio (10 ms frames, 160 kbps CBR) routed to
-    /// the controller's headphone jack or internal speaker.
+    /// listening audio is enabled, the same container also carries one
+    /// Opus-encoded 48 kHz stereo frame (10 ms, 160 kbps CBR) routed to the
+    /// controller's headphone jack or internal speaker.
     ///
     /// Protocol research credit: egormanga/SAxense (haptics stream) and
     /// awalol/DS5Dongle (audio container, Opus parameters, routing).
@@ -52,11 +51,11 @@ namespace DS4Windows.InputDevices
         private const int STATE_SETUP_REPORT_SIZE = 142;
         private const byte STATE_SETUP_REPORT_ID = 0x32;
 
-        // 0x39 haptics + listening audio container
-        private const int AUDIO_REPORT_SIZE = 547;
-        private const byte AUDIO_REPORT_ID = 0x39;
+        // 0x36 haptics + one listening-audio frame
+        private const int AUDIO_REPORT_SIZE = 398;
+        private const byte AUDIO_REPORT_ID = 0x36;
         private const int OPUS_FRAME_BYTES = 200;      // CBR: 160 kbps * 10 ms / 8
-        private const int OPUS_SAMPLES_PER_FRAME = 480; // one frame per report half, per channel
+        private const int OPUS_SAMPLES_PER_FRAME = 480; // one frame per report, per channel
         private const int AUDIO_SAMPLE_RATE = 48000;   // Opus codec rate
 
         // The controller consumes one 480-sample Opus frame per ~10.667 ms haptic
@@ -304,10 +303,8 @@ namespace DS4Windows.InputDevices
                 }
 
                 byte[] report = new byte[audioEnabled ? AUDIO_REPORT_SIZE : HAPTICS_REPORT_SIZE];
-                byte[] chunkA = new byte[HAPTIC_CHUNK_BYTES];
-                byte[] chunkB = new byte[HAPTIC_CHUNK_BYTES];
+                byte[] chunk = new byte[HAPTIC_CHUNK_BYTES];
                 byte[] opusA = new byte[OPUS_FRAME_BYTES];
-                byte[] opusB = new byte[OPUS_FRAME_BYTES];
                 bool primed = false;
                 bool audioPrimed = false;
                 long audioUnderruns = 0;
@@ -347,7 +344,6 @@ namespace DS4Windows.InputDevices
                         nextDeadlineMs = clock.Elapsed.TotalMilliseconds;
                     }
 
-                    byte[] chunk = (tick & 1) == 0 ? chunkA : chunkB;
                     bool hapticsActive = FillHapticsChunk(chunk, hapticsRing,
                         useRumbleSynth, ref primed);
 
@@ -366,7 +362,6 @@ namespace DS4Windows.InputDevices
 
                     synthStreamWasActive = hapticsActive;
 
-                    bool sendNow;
                     if (audioEnabled)
                     {
                         // Encode any pending captured audio into Opus frames.
@@ -377,55 +372,37 @@ namespace DS4Windows.InputDevices
                             opusQueue.CommitSlot();
                         }
 
-                        // One 0x39 container per two haptic chunks (~21.3 ms).
-                        sendNow = (tick & 1) == 1;
-                        if (sendNow)
+                        // One self-contained 0x36 report per haptic clock slot.
+                        // Each carries one 64-byte haptic chunk and one Opus frame.
+                        if (!audioPrimed && opusQueue.Count >= profile.OpusPrebufferFrames)
                         {
-                            // Bank a few frames before draining so transient
-                            // capture gaps don't immediately become silence.
-                            if (!audioPrimed && opusQueue.Count >= profile.OpusPrebufferFrames)
-                            {
-                                audioPrimed = true;
-                            }
-
-                            bool gotA = audioPrimed && opusQueue.TryDequeue(opusA);
-                            bool gotB = audioPrimed && opusQueue.TryDequeue(opusB);
-                            if (!gotA)
-                            {
-                                Buffer.BlockCopy(silenceOpus, 0, opusA, 0, OPUS_FRAME_BYTES);
-                            }
-
-                            if (!gotB)
-                            {
-                                Buffer.BlockCopy(silenceOpus, 0, opusB, 0, OPUS_FRAME_BYTES);
-                            }
-
-                            if (audioPrimed && !gotB)
-                            {
-                                audioPrimed = false; // ran dry: rebuffer before resuming
-                                audioUnderruns++;
-                            }
-
-                            if (audioUnderruns > 0 && tick - lastUnderrunLogTick > 2800) // ~30 s
-                            {
-                                AppLogger.LogToGui($"{device.MacAddress}: BT audio underruns in last interval: {audioUnderruns}", false);
-                                audioUnderruns = 0;
-                                lastUnderrunLogTick = tick;
-                            }
-
-                            BuildAudioReport(report, chunkA, chunkB, opusA, opusB);
+                            audioPrimed = true;
                         }
+
+                        bool gotAudio = audioPrimed && opusQueue.TryDequeue(opusA);
+                        if (!gotAudio)
+                        {
+                            Buffer.BlockCopy(silenceOpus, 0, opusA, 0, OPUS_FRAME_BYTES);
+                        }
+
+                        if (audioPrimed && !gotAudio)
+                        {
+                            audioPrimed = false; // ran dry: rebuffer before resuming
+                            audioUnderruns++;
+                        }
+
+                        if (audioUnderruns > 0 && tick - lastUnderrunLogTick > 2800) // ~30 s
+                        {
+                            AppLogger.LogToGui($"{device.MacAddress}: BT audio underruns in last interval: {audioUnderruns}", false);
+                            audioUnderruns = 0;
+                            lastUnderrunLogTick = tick;
+                        }
+
+                        BuildAudioReport(report, chunk, opusA);
                     }
                     else
                     {
-                        sendNow = true;
                         BuildHapticsReport(report, chunk);
-                    }
-
-                    if (!sendNow)
-                    {
-                        tick++;
-                        continue;
                     }
 
                     if (hidDevice.WriteOutputReportViaInterrupt(report, 100))
@@ -588,17 +565,11 @@ namespace DS4Windows.InputDevices
         }
 
         /// <summary>
-        /// Report 0x39 layout (547 bytes), per DS5Dongle:
-        ///   [0]=0x39, [1]=seq&lt;&lt;4
-        ///   [2]=0x91, [3]=6, [4]=0x7E flags, [5..8]=audio buffer length (64),
-        ///   [9]=frame counter (+2 per report)
-        ///   [10]=0xD2, [11]=64, [12..139]=two 64-byte haptic chunks (signed PCM)
-        ///   [140]=route PID (0x13 speaker / 0x16 headphone) | 0xC0, [141]=200,
-        ///   [142..341]/[342..541]=two 200-byte Opus frames
-        ///   [543..546]=CRC-32 over 0xA2 || first 543 bytes
+        /// Self-contained report 0x36 with listening audio, per
+        /// DS5Dongle-AutoHaptics: config, SetStateData, one signed haptic chunk,
+        /// and one 200-byte Opus speaker/headphone packet.
         /// </summary>
-        private void BuildAudioReport(byte[] report, byte[] chunkA, byte[] chunkB,
-            byte[] opusA, byte[] opusB)
+        private void BuildAudioReport(byte[] report, byte[] chunk, byte[] opus)
         {
             Array.Clear(report, 0, AUDIO_REPORT_SIZE);
             report[0] = AUDIO_REPORT_ID;
@@ -606,22 +577,24 @@ namespace DS4Windows.InputDevices
             seq = (byte)((seq + 1) & 0x0F);
 
             report[2] = 0x91; // config packet: PID 0x11 | sized
-            report[3] = 6;
-            report[4] = 0x7E; // haptics + speaker session, no mic
-            report[5] = profile.ControllerBuffer;
-            report[6] = profile.ControllerBuffer;
-            report[7] = profile.ControllerBuffer;
-            report[8] = profile.ControllerBuffer; // controller-side audio buffer length
-            packetCounter += 2;
-            report[9] = packetCounter;
+            report[3] = 0x07;
+            report[4] = 0xFE;
+            report[5] = HAPTICS_CONTROLLER_BUFFER;
+            report[6] = HAPTICS_CONTROLLER_BUFFER;
+            report[7] = HAPTICS_CONTROLLER_BUFFER;
+            report[8] = HAPTICS_CONTROLLER_BUFFER;
+            report[9] = HAPTICS_CONTROLLER_BUFFER;
+            report[10] = ++packetCounter;
 
-            report[10] = 0xD2; // haptic packet: PID 0x12 | 0xC0, two frames
-            report[11] = HAPTIC_CHUNK_BYTES;
+            report[11] = 0x90; // SetStateData packet: PID 0x10 | sized
+            report[12] = (byte)HAPTICS_STATE.Length;
+            Buffer.BlockCopy(HAPTICS_STATE, 0, report, 13, HAPTICS_STATE.Length);
+
+            report[76] = 0x92; // haptic packet: PID 0x12 | sized
+            report[77] = HAPTIC_CHUNK_BYTES;
             for (int i = 0; i < HAPTIC_CHUNK_BYTES; i++)
             {
-                // Ring stores u8 offset-binary; the 0x39 container carries signed PCM.
-                report[12 + i] = (byte)(chunkA[i] ^ 0x80);
-                report[12 + HAPTIC_CHUNK_BYTES + i] = (byte)(chunkB[i] ^ 0x80);
+                report[78 + i] = (byte)(chunk[i] ^ 0x80);
             }
 
             bool headphone;
@@ -639,10 +612,9 @@ namespace DS4Windows.InputDevices
                     break;
             }
 
-            report[140] = (byte)((headphone ? 0x16 : 0x13) | 0xC0);
-            report[141] = OPUS_FRAME_BYTES;
-            Buffer.BlockCopy(opusA, 0, report, 142, OPUS_FRAME_BYTES);
-            Buffer.BlockCopy(opusB, 0, report, 142 + OPUS_FRAME_BYTES, OPUS_FRAME_BYTES);
+            report[142] = (byte)((headphone ? 0x16 : 0x13) | 0x80);
+            report[143] = OPUS_FRAME_BYTES;
+            Buffer.BlockCopy(opus, 0, report, 144, OPUS_FRAME_BYTES);
 
             ApplyCrc(report, AUDIO_REPORT_SIZE);
         }
@@ -660,7 +632,7 @@ namespace DS4Windows.InputDevices
             // SetStateData uses a fixed command byte here, not the rolling
             // report sequence used by 0x11/0x12 audio containers. Sending a
             // sequence nibble causes the controller to ignore the amplifier
-            // unmute/volume state while still accepting subsequent 0x39 writes.
+            // unmute/volume state while still accepting subsequent audio writes.
             pkt[1] = 0x10;
 
             pkt[2] = 0x90; // SetStateData packet: PID 0x10 | sized
@@ -760,12 +732,13 @@ namespace DS4Windows.InputDevices
                     {
                         float[] inBuffer;
                         int inOffset;
-                        int needed = resampler.ResamplePrepare(frames, 2, out inBuffer, out inOffset);
+                        resampler.ResamplePrepare(frames, 2, out inBuffer, out inOffset);
                         for (int i = 0; i < frames; i++)
                         {
-                            inBuffer[inOffset + i * 2] = samples[i * inChannels];
-                            inBuffer[inOffset + i * 2 + 1] =
-                                inChannels > 1 ? samples[i * inChannels + 1] : samples[i * inChannels];
+                            DownmixToStereo(samples, i * inChannels, inChannels,
+                                out float left, out float right);
+                            inBuffer[inOffset + i * 2] = left;
+                            inBuffer[inOffset + i * 2 + 1] = right;
                         }
 
                         int outFrames = resampler.ResampleOut(resampleOut, 0, frames, resampleOut.Length / 2, 2);
@@ -776,8 +749,10 @@ namespace DS4Windows.InputDevices
                     {
                         for (int i = 0; i < frames; i++)
                         {
-                            double l = lpfL.Process(samples[i * inChannels]);
-                            double r = lpfR.Process(inChannels > 1 ? samples[i * inChannels + 1] : samples[i * inChannels]);
+                            DownmixToStereo(samples, i * inChannels, inChannels,
+                                out float left, out float right);
+                            double l = lpfL.Process(left);
+                            double r = lpfR.Process(right);
 
                             decimPhase += SAMPLE_RATE;
                             if (decimPhase < inRate)
@@ -799,6 +774,80 @@ namespace DS4Windows.InputDevices
                 capture?.Dispose();
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Downmixes common mono, stereo, quad, 5.0, 5.1, and 7.1 channel orders
+        /// to stereo. Center is shared at -3 dB, LFE at -6 dB, and surround
+        /// channels at -3 dB. Multichannel sums use a soft limiter so loud scenes
+        /// cannot hard-clip before Opus encoding.
+        /// </summary>
+        internal static void DownmixToStereo(ReadOnlySpan<float> samples, int offset,
+            int channels, out float left, out float right)
+        {
+            if (channels <= 0 || offset < 0 || offset + channels > samples.Length)
+            {
+                left = 0.0f;
+                right = 0.0f;
+                return;
+            }
+
+            float frontLeft = samples[offset];
+            if (channels == 1)
+            {
+                left = frontLeft;
+                right = frontLeft;
+                return;
+            }
+
+            float frontRight = samples[offset + 1];
+            if (channels == 2)
+            {
+                left = frontLeft;
+                right = frontRight;
+                return;
+            }
+
+            const float centerWeight = 0.70710678f;
+            const float surroundWeight = 0.70710678f;
+            const float lfeWeight = 0.5f;
+
+            float mixedLeft = frontLeft;
+            float mixedRight = frontRight;
+            if (channels == 3)
+            {
+                float center = samples[offset + 2] * centerWeight;
+                mixedLeft += center;
+                mixedRight += center;
+            }
+            else if (channels == 4)
+            {
+                mixedLeft += samples[offset + 2] * surroundWeight;
+                mixedRight += samples[offset + 3] * surroundWeight;
+            }
+            else if (channels == 5)
+            {
+                float center = samples[offset + 2] * centerWeight;
+                mixedLeft += center + samples[offset + 3] * surroundWeight;
+                mixedRight += center + samples[offset + 4] * surroundWeight;
+            }
+            else
+            {
+                // Standard WAVEFORMATEXTENSIBLE 5.1/7.1 order:
+                // FL, FR, FC, LFE, BL, BR, [SL, SR].
+                float center = samples[offset + 2] * centerWeight;
+                float lfe = samples[offset + 3] * lfeWeight;
+                mixedLeft += center + lfe + samples[offset + 4] * surroundWeight;
+                mixedRight += center + lfe + samples[offset + 5] * surroundWeight;
+                if (channels >= 8)
+                {
+                    mixedLeft += samples[offset + 6] * surroundWeight;
+                    mixedRight += samples[offset + 7] * surroundWeight;
+                }
+            }
+
+            left = MathF.Tanh(mixedLeft);
+            right = MathF.Tanh(mixedRight);
         }
 
         private static byte SoftClipToU8(double x)
