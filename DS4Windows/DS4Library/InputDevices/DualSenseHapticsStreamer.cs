@@ -59,6 +59,11 @@ namespace DS4Windows.InputDevices
         // and drops frames audibly. Same reason DS5Dongle resamples 512->480.
         private const int AUDIO_DELIVERY_RATE = 45000;
 
+        private const byte CONTROLLER_AUDIO_BUFFER = 120; // controller-side dejitter buffer [16,127]
+        private const int OPUS_QUEUE_DEPTH = 10;          // ~213 ms of local frame backlog
+        private const int OPUS_PREBUFFER_FRAMES = 4;      // frames banked before playback starts
+        private const double MAX_CATCHUP_MS = 250.0;      // burst catch-up window before resync
+
         private const int SAMPLE_RATE = 3000;          // haptic PCM rate per channel
         private const int HAPTIC_CHUNK_BYTES = 64;     // 32 stereo frames
         private const double TICK_MS = 32 * 1000.0 / SAMPLE_RATE; // ~10.667 ms
@@ -221,7 +226,7 @@ namespace DS4Windows.InputDevices
                     pcmFrame = new short[OPUS_SAMPLES_PER_FRAME * 2];
                     silenceOpus = new byte[OPUS_FRAME_BYTES];
                     EncodeOpusFrame(opusEncoder, new short[OPUS_SAMPLES_PER_FRAME * 2], silenceOpus);
-                    opusQueue = new OpusFrameQueue(4, OPUS_FRAME_BYTES);
+                    opusQueue = new OpusFrameQueue(OPUS_QUEUE_DEPTH, OPUS_FRAME_BYTES);
                 }
 
                 byte[] report = new byte[audioEnabled ? AUDIO_REPORT_SIZE : HAPTICS_REPORT_SIZE];
@@ -230,6 +235,9 @@ namespace DS4Windows.InputDevices
                 byte[] opusA = new byte[OPUS_FRAME_BYTES];
                 byte[] opusB = new byte[OPUS_FRAME_BYTES];
                 bool primed = false;
+                bool audioPrimed = false;
+                long audioUnderruns = 0;
+                long lastUnderrunLogTick = 0;
                 int consecutiveFailures = 0;
                 long tick = 0;
 
@@ -255,7 +263,11 @@ namespace DS4Windows.InputDevices
                         break;
                     }
 
-                    if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > 100.0)
+                    // If we fall behind (a stalled BT write, a scheduler hiccup),
+                    // send back-to-back to catch up: the controller's dejitter
+                    // buffer absorbs the burst. Only resync (accepting an audio
+                    // gap) after a stall too large to catch up from.
+                    if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > MAX_CATCHUP_MS)
                     {
                         nextDeadlineMs = clock.Elapsed.TotalMilliseconds;
                     }
@@ -278,14 +290,36 @@ namespace DS4Windows.InputDevices
                         sendNow = (tick & 1) == 1;
                         if (sendNow)
                         {
-                            if (!opusQueue.TryDequeue(opusA))
+                            // Bank a few frames before draining so transient
+                            // capture gaps don't immediately become silence.
+                            if (!audioPrimed && opusQueue.Count >= OPUS_PREBUFFER_FRAMES)
+                            {
+                                audioPrimed = true;
+                            }
+
+                            bool gotA = audioPrimed && opusQueue.TryDequeue(opusA);
+                            bool gotB = audioPrimed && opusQueue.TryDequeue(opusB);
+                            if (!gotA)
                             {
                                 Buffer.BlockCopy(silenceOpus, 0, opusA, 0, OPUS_FRAME_BYTES);
                             }
 
-                            if (!opusQueue.TryDequeue(opusB))
+                            if (!gotB)
                             {
                                 Buffer.BlockCopy(silenceOpus, 0, opusB, 0, OPUS_FRAME_BYTES);
+                            }
+
+                            if (audioPrimed && !gotB)
+                            {
+                                audioPrimed = false; // ran dry: rebuffer before resuming
+                                audioUnderruns++;
+                            }
+
+                            if (audioUnderruns > 0 && tick - lastUnderrunLogTick > 2800) // ~30 s
+                            {
+                                AppLogger.LogToGui($"{device.MacAddress}: BT audio underruns in last interval: {audioUnderruns}", false);
+                                audioUnderruns = 0;
+                                lastUnderrunLogTick = tick;
                             }
 
                             BuildAudioReport(report, chunkA, chunkB, opusA, opusB);
@@ -441,10 +475,10 @@ namespace DS4Windows.InputDevices
             report[2] = 0x91; // config packet: PID 0x11 | sized
             report[3] = 6;
             report[4] = 0x7E; // haptics + speaker session, no mic
-            report[5] = 64;
-            report[6] = 64;
-            report[7] = 64;
-            report[8] = 64;   // controller-side audio buffer length
+            report[5] = CONTROLLER_AUDIO_BUFFER;
+            report[6] = CONTROLLER_AUDIO_BUFFER;
+            report[7] = CONTROLLER_AUDIO_BUFFER;
+            report[8] = CONTROLLER_AUDIO_BUFFER; // controller-side audio buffer length
             packetCounter += 2;
             report[9] = packetCounter;
 
@@ -751,6 +785,8 @@ namespace DS4Windows.InputDevices
             private readonly object gate = new object();
             private int head;
             private int count;
+
+            public int Count { get { lock (gate) return count; } }
 
             public OpusFrameQueue(int depth, int frameBytes)
             {
