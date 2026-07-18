@@ -22,6 +22,16 @@ Usage:
       Captures system audio (WASAPI loopback), low-passes it, and streams it
       as haptics until Ctrl+C. Play a bass-heavy game/video and feel it.
 
+  DSHapticsProto features
+      Reads and prints the real controller's calibration, serial, and firmware
+      feature reports without changing controller state.
+
+  DSHapticsProto featuresusb
+      Reads the same reports from the HID-only virtual USB DualSense.
+
+  DSHapticsProto readusb [seconds=2]
+      Reads virtual USB input reports and measures the interrupt-IN rate.
+
 Run while the pad is connected over Bluetooth. Close DS4Windows/DSX/Steam
 first so nothing else is holding or rewriting controller output state.
 */
@@ -48,7 +58,9 @@ internal static class Program
     {
         string mode = args.Length > 0 ? args[0].ToLowerInvariant() : "test";
 
-        HidDevice device = FindBtDualSense();
+        HidDevice device = mode is "featuresusb" or "readusb"
+            ? FindUsbDualSense()
+            : FindBtDualSense();
         if (device == null)
         {
             Console.Error.WriteLine("No Bluetooth-connected DualSense found (VID 054C, PID 0CE6/0DF2 with large output reports).");
@@ -116,8 +128,20 @@ internal static class Program
                     RunCapture(handle, gain, lpfHz);
                     return 0;
                 }
+                case "features":
+                case "featuresusb":
+                {
+                    RunFeatureDump(handle);
+                    return 0;
+                }
+                case "readusb":
+                {
+                    double seconds = args.Length > 1 ? double.Parse(args[1]) : 2.0;
+                    RunUsbReadRate(handle, seconds);
+                    return 0;
+                }
                 default:
-                    Console.Error.WriteLine($"Unknown mode '{mode}'. Use 'test36', 'test', 'rumble', 'capture', or 'probe'.");
+                    Console.Error.WriteLine($"Unknown mode '{mode}'. Use 'test36', 'test', 'rumble', 'capture', 'features', 'featuresusb', 'readusb', or 'probe'.");
                     return 2;
             }
         }
@@ -125,6 +149,49 @@ internal static class Program
         {
             NativeHid.TimeEndPeriod(1);
         }
+    }
+
+    private static void RunFeatureDump(SafeFileHandle handle)
+    {
+        foreach ((byte reportId, int length, string name) in new[]
+        {
+            ((byte)0x05, 41, "calibration"),
+            ((byte)0x09, 64, "serial/pairing"),
+            ((byte)0x20, 64, "firmware"),
+        })
+        {
+            byte[] report = new byte[length];
+            report[0] = reportId;
+            bool success = NativeHid.GetFeature(handle, report, out int error);
+            Console.WriteLine($"feature 0x{reportId:X2} {name}: success={success} " +
+                $"length={length} error={error}");
+            if (success)
+            {
+                Console.WriteLine(Convert.ToHexString(report));
+            }
+        }
+    }
+
+    private static void RunUsbReadRate(SafeFileHandle handle, double seconds)
+    {
+        byte[] report = new byte[64];
+        int count = 0;
+        long bytes = 0;
+        var timer = Stopwatch.StartNew();
+        while (timer.Elapsed.TotalSeconds < seconds)
+        {
+            if (!NativeHid.Read(handle, report, out uint read, out int error))
+            {
+                throw new IOException($"Virtual USB ReadFile failed after {count} reports (error {error}).");
+            }
+            count++;
+            bytes += read;
+        }
+
+        timer.Stop();
+        double rate = count / timer.Elapsed.TotalSeconds;
+        Console.WriteLine($"Read {count} reports / {bytes} bytes in {timer.Elapsed.TotalSeconds:0.000} s " +
+            $"({rate:0.0} reports/s). Last report: {Convert.ToHexString(report)}");
     }
 
     /// <summary>
@@ -145,6 +212,26 @@ internal static class Program
 
             Console.WriteLine($"Found DualSense (PID 0x{dev.ProductID:X4}), max output report {maxOut} bytes.");
             if (maxOut >= 100)
+                return dev;
+        }
+
+        return null;
+    }
+
+    private static HidDevice FindUsbDualSense()
+    {
+        foreach (HidDevice dev in DeviceList.Local.GetHidDevices(SonyVid))
+        {
+            if (dev.ProductID != DualSensePid && dev.ProductID != DualSenseEdgePid)
+                continue;
+
+            int maxOut;
+            try { maxOut = dev.GetMaxOutputReportLength(); }
+            catch { continue; }
+
+            Console.WriteLine($"Found USB DualSense candidate (PID 0x{dev.ProductID:X4}), " +
+                $"max output report {maxOut} bytes.");
+            if (maxOut is > 0 and <= 64)
                 return dev;
         }
 
@@ -796,6 +883,14 @@ internal static class NativeHid
     private static extern bool WriteFile(SafeFileHandle file, byte[] buffer, uint bytesToWrite,
         out uint bytesWritten, IntPtr overlapped);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadFile(SafeFileHandle file, byte[] buffer, uint bytesToRead,
+        out uint bytesRead, IntPtr overlapped);
+
+    [DllImport("hid.dll", SetLastError = true)]
+    private static extern bool HidD_GetFeature(SafeFileHandle hidDeviceObject,
+        byte[] reportBuffer, uint reportBufferLength);
+
     [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
     public static extern uint TimeBeginPeriod(uint ms);
 
@@ -818,5 +913,19 @@ internal static class NativeHid
         // length (547) regardless of the actual report size, so only the
         // WriteFile result is meaningful.
         return rawResult;
+    }
+
+    public static bool GetFeature(SafeFileHandle handle, byte[] report, out int error)
+    {
+        bool result = HidD_GetFeature(handle, report, (uint)report.Length);
+        error = result ? 0 : Marshal.GetLastWin32Error();
+        return result;
+    }
+
+    public static bool Read(SafeFileHandle handle, byte[] report, out uint read, out int error)
+    {
+        bool result = ReadFile(handle, report, (uint)report.Length, out read, IntPtr.Zero);
+        error = result ? 0 : Marshal.GetLastWin32Error();
+        return result;
     }
 }

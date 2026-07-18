@@ -11,6 +11,7 @@ namespace VirtualDualSenseUsbip.Device;
 public sealed class ControlEndpoint
 {
     private readonly DescriptorSet descriptors;
+    private readonly FeatureReportSet featureReports;
     private readonly Dictionary<byte, byte> interfaceAltSettings = new();
     private readonly Dictionary<byte, byte> idleRates = new();
 
@@ -21,9 +22,10 @@ public sealed class ControlEndpoint
     /// isochronous streaming alt setting. (interface, altSetting).</summary>
     public event Action<byte, byte>? InterfaceAltChanged;
 
-    public ControlEndpoint(DescriptorSet descriptors)
+    public ControlEndpoint(DescriptorSet descriptors, FeatureReportSet? featureReports = null)
     {
         this.descriptors = descriptors;
+        this.featureReports = featureReports ?? FeatureReportSet.CreateVirtualDefaults();
     }
 
     public byte GetAltSetting(byte interfaceNumber) =>
@@ -119,10 +121,10 @@ public sealed class ControlEndpoint
                 return ControlResult.Ok(new byte[] { 1 }); // report protocol
 
             case UsbHidRequest.GetReport:
-                // Feature/input report reads over EP0. Real feature reports must be
-                // captured before we can answer authentically; stall for now so we
-                // never feed a game fabricated calibration data.
-                return ControlResult.Stalled();
+                // Only the captured/sanitized feature reports in FeatureReportSet
+                // are served. Calibration (0x05) remains intentionally stalled
+                // until a wired fixture is frozen; never invent sensor calibration.
+                return featureReports.Get(setup);
 
             default:
                 return ControlResult.Stalled();

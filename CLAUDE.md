@@ -94,6 +94,9 @@ Phase 4/native-game foundation:
 - `6c0d39a` completes M2.0 byte-exact wired DualSense descriptor fixtures and
   starts the user-space USB/IP protocol core (M2.2).
 - `558ae95` prevents DSCompatProbe failures from showing CLR crash dialogs.
+- `ebdf780` records the successful M2.1 usbip-win2 driver qualification.
+- The current M2.3-live work adds a HID-only server, live VHCI attachment,
+  feature reports, 250 Hz interrupt input, and interrupt-output capture.
 
 Latest user-validated fixes:
 
@@ -170,11 +173,7 @@ Status and order:
 
 1. **M2.0 complete**: exact wired DualSense descriptors/fixtures live under
    `utils/DSCompatProbe/fixtures/dualsense_usb_0ce6`.
-2. **M2.2 protocol foundation complete**: `utils/VirtualDualSenseUsbip`
-   implements USB/IP management framing, 48-byte URB headers, fragmented reads,
-   bounded transfer parsing, and serialized responses. It does not attach a
-   device yet.
-3. **M2.1 PASSED (2026-07-18)**: usbip-win2 0.9.7.8 x64 installed on the primary
+2. **M2.1 PASSED (2026-07-18)**: usbip-win2 0.9.7.8 x64 installed on the primary
    PC. Both `usbip2_ude.sys` and `usbip2_filter.sys` are signed by "Microsoft
    Windows Hardware Compatibility Publisher" (WHQL, EKU 1.3.6.1.4.1.311.10.3.5)
    and load/run under Secure Boot + HVCI with testsigning OFF. Services are
@@ -183,16 +182,22 @@ Status and order:
    added to Root/TrustedPublisher (VIIPER test-CA warning is stale for 0.9.7.8),
    no Code Integrity blocks, security posture unchanged. Audit trail in
    `C:\USBIP-M2.1-Audit`. CLI at `C:\Program Files\USBip\usbip.exe`; uninstall
-   via `C:\Program Files\USBip\unins000.exe`. M2.3 EP0/descriptor layer already
-   built and offline-verified (see below).
-   The offline device layer (`utils/VirtualDualSenseUsbip/Device`) replays the
-   captured enumeration byte-exact; next is the live usbip server (TCP import
-   session + interrupt IN/OUT) so `usbip attach` materializes a HID-only virtual
-   DualSense through the qualified controller.
-4. **M2.3**: implement HID-only virtual DualSense enumeration: EP0 standard
-   requests, exact HID report descriptor, feature reports, 250 Hz interrupt IN,
-   and interrupt OUT capture. First prove a native title recognizes it and
-   capture adaptive-trigger blocks.
+   via `C:\Program Files\USBip\unins000.exe`.
+3. **M2.2 protocol foundation complete**: `utils/VirtualDualSenseUsbip`
+   implements USB/IP management framing, 48-byte URB headers, fragmented reads,
+   bounded transfer parsing, serialized responses, pending requests, and
+   UNLINK. Its protocol and fragmentation self-tests pass.
+4. **M2.3 live enumeration core complete; acceptance in progress**: the signed
+   VHCI driver attaches `054c:0ce6` as `DS4WSPKHID001`; Windows binds healthy
+   USB Input Device and HID game-controller nodes. The 41-byte HID-only
+   configuration retains the exact 289-byte captured report descriptor. EP0,
+   pairing report `0x09`, firmware report `0x20`, 250 Hz interrupt IN,
+   interrupt OUT capture, and UNLINK work. A 30-second live read delivered
+   7,504 reports at 250.1 Hz without failure. Calibration report `0x05`
+   intentionally stalls instead of returning fabricated sensor data.
+   Remaining M2.3 work: physical BT input forwarding, Steam-free native-title
+   recognition, all five adaptive-trigger programs, one-hour stability, and
+   repeated clean attach/detach cycles.
 5. **M2.4**: add exact UAC1 composite descriptors.
 6. **M2.5**: qualify isochronous timing and stability.
 7. **M2.6**: relay UAC haptic channels 3/4 to 3 kHz Bluetooth haptic PCM and
@@ -205,6 +210,11 @@ have the user save work and leave active games/calls/transfers, record Secure
 Boot/HVCI/testsigning state, create a restore point if available, and verify the
 downloaded package/signatures. Do not weaken Windows security to make the
 driver load.
+
+The primary PC has already completed this installation and qualification. Do
+not reinstall or cycle its USB hubs for ordinary M2.3 server work. For live
+tests, use the already installed CLI and the alphanumeric serial
+`DS4WSPKHID001`; usbip-win2 rejects the older hyphenated serial.
 
 ## Working Rules for the Next Agent
 

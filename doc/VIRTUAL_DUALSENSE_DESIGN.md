@@ -109,7 +109,8 @@ Milestones:
   cycles.
 - **M2.3 HID-only DualSense**: EP0 std requests, exact HID report descriptor,
   feature reports, 250 Hz interrupt IN, interrupt OUT capture. Use serial
-  DS4WSPK-HID-001 to avoid polluting cached instance state. Acceptance: native
+  DS4WSPKHID001 to avoid polluting cached instance state. usbip-win2 limits the
+  serial to 15 alphanumeric ASCII characters. Acceptance: native
   title recognizes it (no Steam), 1 h stable, all 5 trigger programs arrive on
   interrupt OUT, clean detach.
 - **M2.4 Composite enumeration**: add exact UAC1 descriptors, no relay yet.
@@ -170,10 +171,20 @@ controller/firmware/temperature; drive a slow ASRC from FIFO occupancy.
   need an explicit device restart, though direct hub reads make it unnecessary
   for freezing the HID descriptor.
 
-This clears M2.0. The next implementation milestone is M2.1 driver
-qualification, followed by the user-space usbip protocol core (M2.2).
+This clears M2.0. M2.1 and the M2.2 protocol foundation have since completed;
+see the live status below.
 
-## M2.2 protocol core status (started 2026-07-18)
+## M2.1 driver qualification result (2026-07-18) -- complete
+
+usbip-win2 0.9.7.8 x64 is installed on the primary Windows 11 PC. Its
+`usbip2_ude.sys` and `usbip2_filter.sys` drivers are WHQL-signed by Microsoft
+Windows Hardware Compatibility Publisher and load with Secure Boot and Memory
+Integrity enabled and testsigning disabled. No test root or trusted-publisher
+certificate was added. Services remain demand-start. The full qualification
+transcript, signature evidence, certificate-store diffs, and security-state
+checks are preserved outside the repository at `C:\USBIP-M2.1-Audit`.
+
+## M2.2 protocol core status (2026-07-18) -- foundation complete
 
 `utils/VirtualDualSenseUsbip` now contains the driver-independent framing
 foundation: network-order management and 48-byte URB headers, bounded transfer
@@ -181,5 +192,38 @@ and ISO descriptor parsing, exact reads that tolerate arbitrary TCP
 fragmentation, RET_SUBMIT/RET_UNLINK encoders, fixed-width device records, and
 a semaphore-serialized stream writer. Its `selftest` checks the Linux kernel
 documentation's interrupt-IN/OUT golden vectors plus a one-byte-fragmented
-OP_REQ_IMPORT. VHCI attachment remains disabled until the M2.1 signed-driver
-qualification gate is completed.
+OP_REQ_IMPORT. The same protocol core now backs the live M2.3 server.
+
+## M2.3 HID-only live status (2026-07-18) -- enumeration core complete
+
+`VirtualDualSenseUsbip serve` now runs a local USB/IP server with
+OP_REQ_DEVLIST/IMPORT, EP0, queued interrupt IN, interrupt OUT capture, and
+CMD_UNLINK handling. It derives a 41-byte HID-only configuration from the
+captured 227-byte composite descriptor while retaining the exact 289-byte HID
+report descriptor. The original composite fixture remains unchanged and still
+passes byte-exact offline replay.
+
+Live evidence on the qualified primary PC:
+
+- `usbip list` finds Sony `054c:0ce6`; `usbip attach` materializes instance
+  `USB\VID_054C&PID_0CE6\DS4WSPKHID001`.
+- Windows reports both the USB Input Device and HID-compliant game controller
+  nodes as healthy. DSCompatProbe sees the expected product/manufacturer,
+  64-byte input, 48-byte output, and 64-byte feature-report limits.
+- Windows initialization generated authentic 48-byte interrupt-OUT reports,
+  which the server captured successfully.
+- Pairing feature report `0x09` uses a stable synthetic locally administered
+  address, never the physical controller's address. Firmware report `0x20` is
+  served in the captured format. Calibration report `0x05` deliberately stalls
+  rather than fabricating hardware-specific sensor calibration.
+- A loopback integration test covers management, descriptors, feature reports,
+  interrupt IN/OUT, and UNLINK. The live VHCI device sustained 7,504 neutral
+  input reports in 30.003 seconds (250.1 Hz) with no read failure. The server
+  requests 1 ms Windows timer resolution while running to avoid default timer
+  quantization near 64 Hz.
+
+M2.3 is not fully accepted yet. Remaining work is to forward physical
+Bluetooth input instead of neutral reports, prove recognition in a Steam-free
+native DualSense title, capture all five adaptive-trigger programs, run the
+one-hour stability test, and exercise repeated clean attach/detach cycles.
+M2.4 UAC1 composite enumeration has not started.

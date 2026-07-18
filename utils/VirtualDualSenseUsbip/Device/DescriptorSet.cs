@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+
 namespace VirtualDualSenseUsbip.Device;
 
 /// <summary>
@@ -20,8 +22,10 @@ public sealed class DescriptorSet
     public byte HidInterfaceNumber { get; }
     public ushort VendorId { get; }
     public ushort ProductId { get; }
+    public ushort DeviceBcd { get; }
     public byte NumConfigurations { get; }
     public byte NumInterfaces { get; }
+    public int ConfigurationDescriptorLength => configuration.Length;
 
     private DescriptorSet(byte[] device, byte[] configuration, byte[] hidReport,
         byte[] hidDescriptor, Dictionary<byte, byte[]> strings, byte hidInterfaceNumber)
@@ -35,6 +39,7 @@ public sealed class DescriptorSet
 
         VendorId = (ushort)(device[8] | (device[9] << 8));
         ProductId = (ushort)(device[10] | (device[11] << 8));
+        DeviceBcd = (ushort)(device[12] | (device[13] << 8));
         NumConfigurations = device[17];
         NumInterfaces = configuration[4];
     }
@@ -71,6 +76,81 @@ public sealed class DescriptorSet
         };
 
         return new DescriptorSet(device, configuration, hidReport, hidDescriptor, strings, hidInterface);
+    }
+
+    /// <summary>
+    /// Loads the captured descriptors, then derives the deliberately HID-only
+    /// configuration used by M2.3-live. The HID class/report descriptors and
+    /// endpoint descriptors remain byte-exact; only the configuration's total
+    /// length/interface count and the HID interface number are rewritten.
+    /// Audio interfaces return in M2.4 after live HID enumeration is stable.
+    /// </summary>
+    public static DescriptorSet LoadHidOnlyFromFixtures(string fixturesDir)
+    {
+        DescriptorSet captured = LoadFromFixtures(fixturesDir);
+        byte[] hidOnlyConfiguration = BuildHidOnlyConfiguration(
+            captured.configuration, captured.HidInterfaceNumber);
+
+        return new DescriptorSet(
+            captured.device.ToArray(),
+            hidOnlyConfiguration,
+            captured.hidReport.ToArray(),
+            captured.hidDescriptor.ToArray(),
+            captured.strings.ToDictionary(pair => pair.Key, pair => pair.Value.ToArray()),
+            hidInterfaceNumber: 0);
+    }
+
+    private static byte[] BuildHidOnlyConfiguration(byte[] captured, byte hidInterfaceNumber)
+    {
+        if (captured.Length < 9 || captured[1] != UsbDescriptorType.Configuration)
+        {
+            throw new InvalidDataException("configuration.bin has no valid configuration header.");
+        }
+
+        int interfaceStart = -1;
+        int interfaceEnd = captured.Length;
+        int offset = captured[0];
+        while (offset + 2 <= captured.Length)
+        {
+            int length = captured[offset];
+            int type = captured[offset + 1];
+            if (length < 2 || offset + length > captured.Length)
+            {
+                throw new InvalidDataException("Malformed descriptor in configuration.bin.");
+            }
+
+            if (type == UsbDescriptorType.Interface)
+            {
+                byte number = captured[offset + 2];
+                if (interfaceStart >= 0)
+                {
+                    interfaceEnd = offset;
+                    break;
+                }
+
+                if (number == hidInterfaceNumber)
+                {
+                    interfaceStart = offset;
+                }
+            }
+
+            offset += length;
+        }
+
+        if (interfaceStart < 0)
+        {
+            throw new InvalidDataException("Captured HID interface was not found in configuration.bin.");
+        }
+
+        byte[] hidOnly = new byte[captured[0] + interfaceEnd - interfaceStart];
+        captured.AsSpan(0, captured[0]).CopyTo(hidOnly);
+        captured.AsSpan(interfaceStart, interfaceEnd - interfaceStart)
+            .CopyTo(hidOnly.AsSpan(captured[0]));
+
+        BinaryPrimitives.WriteUInt16LittleEndian(hidOnly.AsSpan(2, 2), checked((ushort)hidOnly.Length));
+        hidOnly[4] = 1; // bNumInterfaces
+        hidOnly[captured[0] + 2] = 0; // bInterfaceNumber
+        return hidOnly;
     }
 
     /// <summary>
