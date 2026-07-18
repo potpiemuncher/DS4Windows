@@ -174,10 +174,21 @@ Status and order:
    implements USB/IP management framing, 48-byte URB headers, fragmented reads,
    bounded transfer parsing, and serialized responses. It does not attach a
    device yet.
-3. **M2.1 is the immediate gate**: qualify the production-signed usbip-win2
-   0.9.7.8 VHCI driver with Secure Boot and Memory Integrity/HVCI enabled,
-   testsigning disabled, and no test root CA. No matching USB/IP/VHCI service or
-   driver was installed when last checked.
+3. **M2.1 PASSED (2026-07-18)**: usbip-win2 0.9.7.8 x64 installed on the primary
+   PC. Both `usbip2_ude.sys` and `usbip2_filter.sys` are signed by "Microsoft
+   Windows Hardware Compatibility Publisher" (WHQL, EKU 1.3.6.1.4.1.311.10.3.5)
+   and load/run under Secure Boot + HVCI with testsigning OFF. Services are
+   demand-start and Running; emulated host controller present as
+   `ROOT\USB\0002` ("USBip 3.X Emulated Host Controller", status OK). No certs
+   added to Root/TrustedPublisher (VIIPER test-CA warning is stale for 0.9.7.8),
+   no Code Integrity blocks, security posture unchanged. Audit trail in
+   `C:\USBIP-M2.1-Audit`. CLI at `C:\Program Files\USBip\usbip.exe`; uninstall
+   via `C:\Program Files\USBip\unins000.exe`. M2.3 EP0/descriptor layer already
+   built and offline-verified (see below).
+   The offline device layer (`utils/VirtualDualSenseUsbip/Device`) replays the
+   captured enumeration byte-exact; next is the live usbip server (TCP import
+   session + interrupt IN/OUT) so `usbip attach` materializes a HID-only virtual
+   DualSense through the qualified controller.
 4. **M2.3**: implement HID-only virtual DualSense enumeration: EP0 standard
    requests, exact HID report descriptor, feature reports, 250 Hz interrupt IN,
    and interrupt OUT capture. First prove a native title recognizes it and
