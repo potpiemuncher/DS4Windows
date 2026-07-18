@@ -114,6 +114,13 @@ namespace DS4Windows.InputDevices
         private const double ENVELOPE_ATTACK = 0.35;
         private const double ENVELOPE_RELEASE = 0.015;
 
+        // Voice-coil haptics can reproduce rumble values that are too weak to
+        // move a conventional eccentric motor. Some games continuously emit
+        // those tiny values during stick movement, turning them into an
+        // unintended buzz. Match the effective noise floor of a normal motor,
+        // then rescale the remaining range so full-strength rumble stays full.
+        internal const byte RUMBLE_SYNTH_DEADZONE = 16;
+
         private readonly DualSenseDevice device;
         private readonly HidDevice hidDevice;
         private readonly byte[] outputBTCrc32Head = new byte[] { 0xA2 };
@@ -284,6 +291,7 @@ namespace DS4Windows.InputDevices
                 long lastUnderrunLogTick = 0;
                 int consecutiveFailures = 0;
                 long tick = 0;
+                bool synthStreamWasActive = false;
 
                 Stopwatch clock = Stopwatch.StartNew();
                 double nextDeadlineMs = 0.0;
@@ -317,7 +325,23 @@ namespace DS4Windows.InputDevices
                     }
 
                     byte[] chunk = (tick & 1) == 0 ? chunkA : chunkB;
-                    FillHapticsChunk(chunk, hapticsRing, useRumbleSynth, ref primed);
+                    bool hapticsActive = FillHapticsChunk(chunk, hapticsRing,
+                        useRumbleSynth, ref primed);
+
+                    // A continuous stream of nominally silent 0x32 packets can
+                    // leave the voice-coil actuators faintly energized. In the
+                    // pure rumble-synth pipeline there is no audio clock to
+                    // maintain, so send one final centered chunk after an effect
+                    // and stop writing until a real rumble signal arrives.
+                    bool idleRumbleSynth = !audioEnabled && !captureForHaptics &&
+                        useRumbleSynth && !hapticsActive;
+                    if (idleRumbleSynth && !synthStreamWasActive)
+                    {
+                        tick++;
+                        continue;
+                    }
+
+                    synthStreamWasActive = hapticsActive;
 
                     bool sendNow;
                     if (audioEnabled)
@@ -419,7 +443,7 @@ namespace DS4Windows.InputDevices
         /// Fills one 64-byte haptic chunk (u8 offset-binary, silence = 0x80)
         /// from the capture ring and/or the rumble synth.
         /// </summary>
-        private void FillHapticsChunk(byte[] chunk, SampleRing ring, bool useRumbleSynth, ref bool primed)
+        private bool FillHapticsChunk(byte[] chunk, SampleRing ring, bool useRumbleSynth, ref bool primed)
         {
             int captured = 0;
             if (ring != null)
@@ -443,8 +467,10 @@ namespace DS4Windows.InputDevices
 
             if (useRumbleSynth)
             {
-                double heavyTarget = device.CurrentRumbleHeavy / 255.0;
-                double lightTarget = device.CurrentRumbleLight / 255.0;
+                byte rawHeavy = device.CurrentRumbleHeavy;
+                byte rawLight = device.CurrentRumbleLight;
+                double heavyTarget = ScaleRumbleStrength(rawHeavy);
+                double lightTarget = ScaleRumbleStrength(rawLight);
                 double heavyInc = 2.0 * Math.PI * HEAVY_FREQ_HZ / SAMPLE_RATE;
                 double lightInc = 2.0 * Math.PI * LIGHT_FREQ_HZ / SAMPLE_RATE;
                 for (int i = 0; i < chunk.Length / 2; i++)
@@ -463,6 +489,32 @@ namespace DS4Windows.InputDevices
                     chunk[i * 2 + 1] = SoftClipToU8(right);
                 }
             }
+
+            return HasHapticSignal(chunk);
+        }
+
+        internal static double ScaleRumbleStrength(byte strength)
+        {
+            if (strength <= RUMBLE_SYNTH_DEADZONE)
+            {
+                return 0.0;
+            }
+
+            return (strength - RUMBLE_SYNTH_DEADZONE) /
+                (double)(byte.MaxValue - RUMBLE_SYNTH_DEADZONE);
+        }
+
+        internal static bool HasHapticSignal(byte[] chunk)
+        {
+            for (int i = 0; i < chunk.Length; i++)
+            {
+                if (chunk[i] != 0x80)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private void EncodeOpusFrame(IOpusEncoder encoder, short[] pcm, byte[] dest)
