@@ -50,8 +50,14 @@ namespace DS4Windows.InputDevices
         private const int AUDIO_REPORT_SIZE = 547;
         private const byte AUDIO_REPORT_ID = 0x39;
         private const int OPUS_FRAME_BYTES = 200;      // CBR: 160 kbps * 10 ms / 8
-        private const int OPUS_SAMPLES_PER_FRAME = 480; // 10 ms at 48 kHz, per channel
-        private const int AUDIO_SAMPLE_RATE = 48000;
+        private const int OPUS_SAMPLES_PER_FRAME = 480; // one frame per report half, per channel
+        private const int AUDIO_SAMPLE_RATE = 48000;   // Opus codec rate
+
+        // The controller consumes one 480-sample Opus frame per ~10.667 ms haptic
+        // slot (audio is slaved to the 3 kHz haptics clock), so audio must be
+        // delivered at 480 / 10.667 ms = 45000 samples/s or the stream overruns
+        // and drops frames audibly. Same reason DS5Dongle resamples 512->480.
+        private const int AUDIO_DELIVERY_RATE = 45000;
 
         private const int SAMPLE_RATE = 3000;          // haptic PCM rate per channel
         private const int HAPTIC_CHUNK_BYTES = 64;     // 32 stereo frames
@@ -564,7 +570,7 @@ namespace DS4Windows.InputDevices
                     resampler.SetMode(true, 2, false);
                     resampler.SetFilterParms();
                     resampler.SetFeedMode(true);
-                    resampler.SetRates(inRate, AUDIO_SAMPLE_RATE);
+                    resampler.SetRates(inRate, AUDIO_DELIVERY_RATE);
                     resampleOut = new float[16384];
                 }
 
