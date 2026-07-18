@@ -237,6 +237,13 @@ namespace DS4Windows
             Mix,
         }
 
+        public enum AudioOutputRoute : ushort
+        {
+            Auto,       // headphone jack when plugged in, speaker otherwise
+            Headphone,
+            Speaker,
+        }
+
         private LEDBarMode ledMode = LEDBarMode.MultipleControllers;
         public LEDBarMode LedMode
         {
@@ -312,6 +319,44 @@ namespace DS4Windows
                 value ??= string.Empty;
                 if (btHapticsAudioDeviceId == value) return;
                 btHapticsAudioDeviceId = value;
+                BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        // Bluetooth listening-audio (headphone jack / speaker) settings.
+        private bool btAudioEnabled = false;
+        public bool BTAudioEnabled
+        {
+            get => btAudioEnabled;
+            set
+            {
+                if (btAudioEnabled == value) return;
+                btAudioEnabled = value;
+                BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private AudioOutputRoute btAudioRoute = AudioOutputRoute.Auto;
+        public AudioOutputRoute BTAudioRoute
+        {
+            get => btAudioRoute;
+            set
+            {
+                if (btAudioRoute == value) return;
+                btAudioRoute = value;
+                BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private int btAudioVolume = 85;
+        public int BTAudioVolume
+        {
+            get => btAudioVolume;
+            set
+            {
+                value = Math.Clamp(value, 0, 100);
+                if (btAudioVolume == value) return;
+                btAudioVolume = value;
                 BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
             }
         }

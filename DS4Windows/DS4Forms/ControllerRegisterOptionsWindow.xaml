@@ -100,8 +100,26 @@
                         <TextBlock Text="{Binding Options.BTHapticsLowPassHz}" Margin="8,4,0,0" VerticalAlignment="Center" MinWidth="32" />
                     </StackPanel>
 
+                    <Separator Margin="0,12,0,4" />
+                    <TextBlock Text="Bluetooth Audio (headphones / speaker)" FontWeight="Bold" Margin="0,4,0,0" />
+                    <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,2,0,0"
+                               Text="Streams the selected audio source to the controller's headphone jack or built-in speaker over Bluetooth — no USB cable needed." />
+
+                    <CheckBox Content="Send audio to controller" IsChecked="{Binding Options.BTAudioEnabled}" Margin="0,8,0,0" />
+
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <Label Content="Output:" />
+                        <ComboBox ItemsSource="{Binding Path=DsAudioRoutes}" DisplayMemberPath="DisplayName" SelectedValuePath="ChoiceValue" SelectedValue="{Binding Options.BTAudioRoute}" Margin="8,0,0,0" MinWidth="220" />
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                        <Label Content="Volume:" />
+                        <Slider Value="{Binding Options.BTAudioVolume}" Minimum="0" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True" Width="180" Margin="8,4,0,0" VerticalAlignment="Center" />
+                        <TextBlock Text="{Binding Options.BTAudioVolume}" Margin="8,4,0,0" VerticalAlignment="Center" MinWidth="32" />
+                    </StackPanel>
+
                     <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,6,0,0"
-                               Text="Bluetooth connections only. Applies immediately. While streaming is active, standard rumble emulation is disabled (the controller cannot do both at once) — use a mode that includes Rumble to keep feeling game rumble. Pick the audio source your game actually plays through. Protocol research credit: egormanga/SAxense." />
+                               Text="Bluetooth connections only. Applies immediately. While streaming is active, standard rumble emulation is disabled (the controller cannot do both at once) — use a haptics mode that includes Rumble to keep feeling game rumble. Pick the audio source your game actually plays through. Protocol research credit: egormanga/SAxense and awalol/DS5Dongle." />
                 </StackPanel>
             </TabItem>
 

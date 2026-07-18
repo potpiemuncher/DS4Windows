@@ -298,6 +298,15 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         private List<HapticsAudioDeviceChoice> hapticsAudioDevices = new List<HapticsAudioDeviceChoice>();
         public List<HapticsAudioDeviceChoice> HapticsAudioDevices { get => hapticsAudioDevices; }
 
+        private List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>> dsAudioRoutes =
+            new List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>>()
+        {
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>("Auto (headphones when plugged in)", DualSenseControllerOptions.AudioOutputRoute.Auto),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>("Headphone jack", DualSenseControllerOptions.AudioOutputRoute.Headphone),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>("Built-in speaker", DualSenseControllerOptions.AudioOutputRoute.Speaker),
+        };
+        public List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>> DsAudioRoutes { get => dsAudioRoutes; }
+
         public DualSenseControllerOptionsWrapper(DualSenseControllerOptions options,
             DualSenseDeviceOptions parentOpts)
         {

@@ -20,39 +20,49 @@ using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Concentus;
+using Concentus.Enums;
 using NAudio.CoreAudioApi;
+using NAudio.Dsp;
 using NAudio.Wave;
 
 namespace DS4Windows.InputDevices
 {
     /// <summary>
-    /// Streams haptic PCM audio (3 kHz, unsigned 8-bit, stereo L/R actuator) to a
-    /// Bluetooth-connected DualSense using HID output report 0x32, enabling
-    /// audio-driven haptic feedback without a USB cable.
+    /// Streams haptic and listening audio to a Bluetooth-connected DualSense.
     ///
-    /// Wire protocol reverse engineered by egormanga's SAxense project
-    /// (https://github.com/egormanga/SAxense). Windows requires the report to be
-    /// written as exactly 142 bytes (report ID + 141 data bytes).
+    /// Haptics-only mode uses HID output report 0x32 carrying 3 kHz stereo PCM
+    /// for the voice-coil actuators. When listening audio is enabled, the
+    /// larger 0x39 container is used instead, carrying both the haptic PCM and
+    /// Opus-encoded 48 kHz stereo audio (10 ms frames, 160 kbps CBR) routed to
+    /// the controller's headphone jack or internal speaker.
+    ///
+    /// Protocol research credit: egormanga/SAxense (haptics stream) and
+    /// awalol/DS5Dongle (audio container, Opus parameters, routing).
     /// </summary>
     public class DualSenseHapticsStreamer
     {
-        private const int REPORT_SIZE = 142;
-        private const int CRC_OFFSET = REPORT_SIZE - 4;
-        private const int AUDIO_OFFSET = 13;
-        private const int AUDIO_BYTES = 64;
-        private const int SAMPLE_RATE = 3000;
-        private const int FRAMES_PER_REPORT = AUDIO_BYTES / 2;
-        private const double PERIOD_MS = FRAMES_PER_REPORT * 1000.0 / SAMPLE_RATE; // ~10.667 ms
-        private const int RING_CAPACITY = 1920;   // ~320 ms of buffered samples
-        private const int PREBUFFER_BYTES = 576;  // ~96 ms cushion before draining
+        // 0x32 haptics-only report
+        private const int HAPTICS_REPORT_SIZE = 142;
+        private const byte HAPTICS_REPORT_ID = 0x32;
+
+        // 0x39 haptics + listening audio container
+        private const int AUDIO_REPORT_SIZE = 547;
+        private const byte AUDIO_REPORT_ID = 0x39;
+        private const int OPUS_FRAME_BYTES = 200;      // CBR: 160 kbps * 10 ms / 8
+        private const int OPUS_SAMPLES_PER_FRAME = 480; // 10 ms at 48 kHz, per channel
+        private const int AUDIO_SAMPLE_RATE = 48000;
+
+        private const int SAMPLE_RATE = 3000;          // haptic PCM rate per channel
+        private const int HAPTIC_CHUNK_BYTES = 64;     // 32 stereo frames
+        private const double TICK_MS = 32 * 1000.0 / SAMPLE_RATE; // ~10.667 ms
+        private const int RING_CAPACITY = 1920;
+        private const int PREBUFFER_BYTES = 576;
         private const int MAX_CONSECUTIVE_WRITE_FAILURES = 50;
 
-        // Rumble-to-haptics synthesis: the heavy (left) motor is voiced as deep
-        // rumble, the light (right) motor as a higher buzz, with envelope
-        // smoothing so steps in motor values do not click.
         private const double HEAVY_FREQ_HZ = 62.0;
         private const double LIGHT_FREQ_HZ = 170.0;
-        private const double ENVELOPE_ATTACK = 0.35;  // per-sample smoothing coefficients
+        private const double ENVELOPE_ATTACK = 0.35;
         private const double ENVELOPE_RELEASE = 0.015;
 
         private readonly DualSenseDevice device;
@@ -68,6 +78,16 @@ namespace DS4Windows.InputDevices
         private double gain = 3.0;
         private int lowPassHz = 350;
         private string endpointId = string.Empty;
+        private bool audioEnabled = false;
+        private DualSenseControllerOptions.AudioOutputRoute audioRoute =
+            DualSenseControllerOptions.AudioOutputRoute.Auto;
+        private int audioVolume = 85;
+
+        // Rumble-to-haptics synth state
+        private double heavyEnv, lightEnv, heavyPhase, lightPhase;
+
+        private byte seq;
+        private byte packetCounter;
 
         public bool Active => running;
 
@@ -78,19 +98,25 @@ namespace DS4Windows.InputDevices
         }
 
         public void Configure(DualSenseControllerOptions.HapticsMode newMode,
-            double newGain, int newLowPassHz, string newEndpointId)
+            double newGain, int newLowPassHz, string newEndpointId,
+            bool newAudioEnabled, DualSenseControllerOptions.AudioOutputRoute newAudioRoute,
+            int newAudioVolume)
         {
             lock (stateLock)
             {
                 newGain = Math.Clamp(newGain, 0.1, 10.0);
                 newLowPassHz = Math.Clamp(newLowPassHz, 40, 1000);
                 newEndpointId ??= string.Empty;
+                newAudioVolume = Math.Clamp(newAudioVolume, 0, 100);
 
-                // Gain applies live; everything else needs a pipeline restart.
-                if (running && newMode == mode &&
-                    newLowPassHz == lowPassHz && newEndpointId == endpointId)
+                // Gain, volume, and routing apply live; anything that changes the
+                // pipeline shape needs a restart.
+                if (running && newMode == mode && newLowPassHz == lowPassHz &&
+                    newEndpointId == endpointId && newAudioEnabled == audioEnabled)
                 {
                     gain = newGain;
+                    audioVolume = newAudioVolume;
+                    audioRoute = newAudioRoute;
                     return;
                 }
 
@@ -101,14 +127,17 @@ namespace DS4Windows.InputDevices
                 gain = newGain;
                 lowPassHz = newLowPassHz;
                 endpointId = newEndpointId;
+                audioEnabled = newAudioEnabled;
+                audioRoute = newAudioRoute;
+                audioVolume = newAudioVolume;
 
-                if (mode != DualSenseControllerOptions.HapticsMode.Off)
+                if (audioEnabled || mode != DualSenseControllerOptions.HapticsMode.Off)
                 {
                     StartLocked();
                 }
                 else if (wasRunning)
                 {
-                    AppLogger.LogToGui($"{device.MacAddress}: BT haptics streaming stopped", false);
+                    AppLogger.LogToGui($"{device.MacAddress}: BT haptics/audio streaming stopped", false);
                 }
             }
         }
@@ -131,7 +160,8 @@ namespace DS4Windows.InputDevices
                 Name = $"DualSense Haptics thread: {device.MacAddress}",
             };
             streamThread.Start();
-            AppLogger.LogToGui($"{device.MacAddress}: BT haptics streaming started ({mode})", false);
+            AppLogger.LogToGui($"{device.MacAddress}: BT streaming started " +
+                $"(haptics: {mode}{(audioEnabled ? ", audio: on" : "")})", false);
         }
 
         private void StopLocked()
@@ -148,39 +178,57 @@ namespace DS4Windows.InputDevices
 
         private void StreamLoop()
         {
-            bool useCapture = mode == DualSenseControllerOptions.HapticsMode.SystemAudio ||
-                              mode == DualSenseControllerOptions.HapticsMode.Mix;
+            bool captureForHaptics = mode == DualSenseControllerOptions.HapticsMode.SystemAudio ||
+                                     mode == DualSenseControllerOptions.HapticsMode.Mix;
             bool useRumbleSynth = mode == DualSenseControllerOptions.HapticsMode.RumbleToHaptics ||
                                   mode == DualSenseControllerOptions.HapticsMode.Mix;
+            bool needCapture = captureForHaptics || audioEnabled;
 
-            SampleRing ring = useCapture ? new SampleRing(RING_CAPACITY) : null;
+            SampleRing hapticsRing = captureForHaptics ? new SampleRing(RING_CAPACITY) : null;
+            ShortRing audioRing = audioEnabled ? new ShortRing(AUDIO_SAMPLE_RATE * 2 / 5) : null; // 200 ms
             WasapiLoopbackCapture capture = null;
+            IOpusEncoder opusEncoder = null;
 
             try
             {
-                if (useCapture)
+                if (needCapture)
                 {
-                    capture = CreateCapture(ring);
+                    capture = CreateCapture(hapticsRing, audioRing);
                     capture?.StartRecording();
                 }
 
-                byte[] report = new byte[REPORT_SIZE];
-                byte[] audio = new byte[AUDIO_BYTES];
-                byte seq = 0;
-                byte counter = 0;
+                byte[] silenceOpus = null;
+                OpusFrameQueue opusQueue = null;
+                short[] pcmFrame = null;
+                if (audioEnabled)
+                {
+                    opusEncoder = OpusCodecFactory.CreateEncoder(AUDIO_SAMPLE_RATE, 2,
+                        OpusApplication.OPUS_APPLICATION_AUDIO);
+                    opusEncoder.Bitrate = OPUS_FRAME_BYTES * 8 * 100;
+                    opusEncoder.UseVBR = false;
+                    opusEncoder.Complexity = 5;
+
+                    pcmFrame = new short[OPUS_SAMPLES_PER_FRAME * 2];
+                    silenceOpus = new byte[OPUS_FRAME_BYTES];
+                    EncodeOpusFrame(opusEncoder, new short[OPUS_SAMPLES_PER_FRAME * 2], silenceOpus);
+                    opusQueue = new OpusFrameQueue(4, OPUS_FRAME_BYTES);
+                }
+
+                byte[] report = new byte[audioEnabled ? AUDIO_REPORT_SIZE : HAPTICS_REPORT_SIZE];
+                byte[] chunkA = new byte[HAPTIC_CHUNK_BYTES];
+                byte[] chunkB = new byte[HAPTIC_CHUNK_BYTES];
+                byte[] opusA = new byte[OPUS_FRAME_BYTES];
+                byte[] opusB = new byte[OPUS_FRAME_BYTES];
                 bool primed = false;
                 int consecutiveFailures = 0;
-                double heavyEnv = 0.0, lightEnv = 0.0;
-                double heavyPhase = 0.0, lightPhase = 0.0;
-                double heavyInc = 2.0 * Math.PI * HEAVY_FREQ_HZ / SAMPLE_RATE;
-                double lightInc = 2.0 * Math.PI * LIGHT_FREQ_HZ / SAMPLE_RATE;
+                long tick = 0;
 
                 Stopwatch clock = Stopwatch.StartNew();
                 double nextDeadlineMs = 0.0;
 
                 while (running)
                 {
-                    nextDeadlineMs += PERIOD_MS;
+                    nextDeadlineMs += TICK_MS;
                     double wait = nextDeadlineMs - clock.Elapsed.TotalMilliseconds;
                     if (wait > 2.0)
                     {
@@ -197,58 +245,53 @@ namespace DS4Windows.InputDevices
                         break;
                     }
 
-                    // System stall: resync instead of bursting a backlog of reports.
                     if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > 100.0)
                     {
                         nextDeadlineMs = clock.Elapsed.TotalMilliseconds;
                     }
 
-                    int captured = 0;
-                    if (useCapture)
+                    byte[] chunk = (tick & 1) == 0 ? chunkA : chunkB;
+                    FillHapticsChunk(chunk, hapticsRing, useRumbleSynth, ref primed);
+
+                    bool sendNow;
+                    if (audioEnabled)
                     {
-                        if (!primed && ring.Count >= PREBUFFER_BYTES)
+                        // Encode any pending captured audio into Opus frames.
+                        while (audioRing.ReadExact(pcmFrame))
                         {
-                            primed = true;
+                            byte[] frame = opusQueue.RentSlot();
+                            EncodeOpusFrame(opusEncoder, pcmFrame, frame);
+                            opusQueue.CommitSlot();
                         }
 
-                        captured = primed ? ring.ReadPartial(audio) : 0;
-                        if (primed && captured == 0)
+                        // One 0x39 container per two haptic chunks (~21.3 ms).
+                        sendNow = (tick & 1) == 1;
+                        if (sendNow)
                         {
-                            primed = false; // source dried up; rebuffer before draining again
+                            if (!opusQueue.TryDequeue(opusA))
+                            {
+                                Buffer.BlockCopy(silenceOpus, 0, opusA, 0, OPUS_FRAME_BYTES);
+                            }
+
+                            if (!opusQueue.TryDequeue(opusB))
+                            {
+                                Buffer.BlockCopy(silenceOpus, 0, opusB, 0, OPUS_FRAME_BYTES);
+                            }
+
+                            BuildAudioReport(report, chunkA, chunkB, opusA, opusB);
                         }
                     }
-
-                    if (captured < AUDIO_BYTES)
+                    else
                     {
-                        Array.Fill(audio, (byte)0x80, captured, AUDIO_BYTES - captured);
+                        sendNow = true;
+                        BuildHapticsReport(report, chunk);
                     }
 
-                    if (useRumbleSynth)
+                    if (!sendNow)
                     {
-                        double heavyTarget = device.CurrentRumbleHeavy / 255.0;
-                        double lightTarget = device.CurrentRumbleLight / 255.0;
-                        for (int i = 0; i < FRAMES_PER_REPORT; i++)
-                        {
-                            heavyEnv += (heavyTarget - heavyEnv) *
-                                (heavyTarget > heavyEnv ? ENVELOPE_ATTACK : ENVELOPE_RELEASE);
-                            lightEnv += (lightTarget - lightEnv) *
-                                (lightTarget > lightEnv ? ENVELOPE_ATTACK : ENVELOPE_RELEASE);
-
-                            double left = (audio[i * 2] - 128) / 127.0 +
-                                heavyEnv * Math.Sin(heavyPhase);
-                            double right = (audio[i * 2 + 1] - 128) / 127.0 +
-                                lightEnv * Math.Sin(lightPhase);
-                            heavyPhase += heavyInc;
-                            lightPhase += lightInc;
-
-                            audio[i * 2] = SoftClipToU8(left);
-                            audio[i * 2 + 1] = SoftClipToU8(right);
-                        }
+                        tick++;
+                        continue;
                     }
-
-                    BuildReport(report, seq, counter, audio);
-                    seq = (byte)((seq + 1) & 0x0F);
-                    counter++;
 
                     if (hidDevice.WriteOutputReportViaInterrupt(report, 100))
                     {
@@ -256,14 +299,16 @@ namespace DS4Windows.InputDevices
                     }
                     else if (++consecutiveFailures >= MAX_CONSECUTIVE_WRITE_FAILURES)
                     {
-                        AppLogger.LogToGui($"{device.MacAddress}: BT haptics stream aborted after repeated write failures", true);
+                        AppLogger.LogToGui($"{device.MacAddress}: BT haptics/audio stream aborted after repeated write failures", true);
                         running = false;
                     }
+
+                    tick++;
                 }
             }
             catch (Exception ex)
             {
-                AppLogger.LogToGui($"{device.MacAddress}: BT haptics stream error: {ex.Message}", true);
+                AppLogger.LogToGui($"{device.MacAddress}: BT haptics/audio stream error: {ex.Message}", true);
                 running = false;
             }
             finally
@@ -277,10 +322,166 @@ namespace DS4Windows.InputDevices
                     }
                     catch (Exception) { }
                 }
+
+                (opusEncoder as IDisposable)?.Dispose();
             }
         }
 
-        private WasapiLoopbackCapture CreateCapture(SampleRing ring)
+        /// <summary>
+        /// Fills one 64-byte haptic chunk (u8 offset-binary, silence = 0x80)
+        /// from the capture ring and/or the rumble synth.
+        /// </summary>
+        private void FillHapticsChunk(byte[] chunk, SampleRing ring, bool useRumbleSynth, ref bool primed)
+        {
+            int captured = 0;
+            if (ring != null)
+            {
+                if (!primed && ring.Count >= PREBUFFER_BYTES)
+                {
+                    primed = true;
+                }
+
+                captured = primed ? ring.ReadPartial(chunk) : 0;
+                if (primed && captured == 0)
+                {
+                    primed = false;
+                }
+            }
+
+            if (captured < chunk.Length)
+            {
+                Array.Fill(chunk, (byte)0x80, captured, chunk.Length - captured);
+            }
+
+            if (useRumbleSynth)
+            {
+                double heavyTarget = device.CurrentRumbleHeavy / 255.0;
+                double lightTarget = device.CurrentRumbleLight / 255.0;
+                double heavyInc = 2.0 * Math.PI * HEAVY_FREQ_HZ / SAMPLE_RATE;
+                double lightInc = 2.0 * Math.PI * LIGHT_FREQ_HZ / SAMPLE_RATE;
+                for (int i = 0; i < chunk.Length / 2; i++)
+                {
+                    heavyEnv += (heavyTarget - heavyEnv) *
+                        (heavyTarget > heavyEnv ? ENVELOPE_ATTACK : ENVELOPE_RELEASE);
+                    lightEnv += (lightTarget - lightEnv) *
+                        (lightTarget > lightEnv ? ENVELOPE_ATTACK : ENVELOPE_RELEASE);
+
+                    double left = (chunk[i * 2] - 128) / 127.0 + heavyEnv * Math.Sin(heavyPhase);
+                    double right = (chunk[i * 2 + 1] - 128) / 127.0 + lightEnv * Math.Sin(lightPhase);
+                    heavyPhase += heavyInc;
+                    lightPhase += lightInc;
+
+                    chunk[i * 2] = SoftClipToU8(left);
+                    chunk[i * 2 + 1] = SoftClipToU8(right);
+                }
+            }
+        }
+
+        private void EncodeOpusFrame(IOpusEncoder encoder, short[] pcm, byte[] dest)
+        {
+            int written = encoder.Encode(pcm, OPUS_SAMPLES_PER_FRAME, dest, dest.Length);
+            if (written < dest.Length && written > 0)
+            {
+                Array.Clear(dest, written, dest.Length - written);
+            }
+        }
+
+        /// <summary>
+        /// Report 0x32 layout (142 bytes): see Phase 1/2 research. Config packet
+        /// 0x11 with the 0xFE haptics flags, one 64-byte audio packet 0x12.
+        /// </summary>
+        private void BuildHapticsReport(byte[] report, byte[] chunk)
+        {
+            Array.Clear(report, 0, HAPTICS_REPORT_SIZE);
+            report[0] = HAPTICS_REPORT_ID;
+            report[1] = (byte)((seq & 0x0F) << 4);
+            seq = (byte)((seq + 1) & 0x0F);
+
+            report[2] = 0x91; // config packet: PID 0x11 | sized
+            report[3] = 0x07;
+            report[4] = 0xFE;
+            report[9] = 0xFF;
+            report[10] = ++packetCounter;
+
+            report[11] = 0x92; // haptic audio packet: PID 0x12 | sized
+            report[12] = HAPTIC_CHUNK_BYTES;
+            Buffer.BlockCopy(chunk, 0, report, 13, HAPTIC_CHUNK_BYTES);
+
+            ApplyCrc(report, HAPTICS_REPORT_SIZE);
+        }
+
+        /// <summary>
+        /// Report 0x39 layout (547 bytes), per DS5Dongle:
+        ///   [0]=0x39, [1]=seq&lt;&lt;4
+        ///   [2]=0x91, [3]=6, [4]=0x7E flags, [5..8]=audio buffer length (64),
+        ///   [9]=frame counter (+2 per report)
+        ///   [10]=0xD2, [11]=64, [12..139]=two 64-byte haptic chunks (signed PCM)
+        ///   [140]=route PID (0x13 speaker / 0x16 headphone) | 0xC0, [141]=200,
+        ///   [142..341]/[342..541]=two 200-byte Opus frames
+        ///   [543..546]=CRC-32 over 0xA2 || first 543 bytes
+        /// </summary>
+        private void BuildAudioReport(byte[] report, byte[] chunkA, byte[] chunkB,
+            byte[] opusA, byte[] opusB)
+        {
+            Array.Clear(report, 0, AUDIO_REPORT_SIZE);
+            report[0] = AUDIO_REPORT_ID;
+            report[1] = (byte)((seq & 0x0F) << 4);
+            seq = (byte)((seq + 1) & 0x0F);
+
+            report[2] = 0x91; // config packet: PID 0x11 | sized
+            report[3] = 6;
+            report[4] = 0x7E; // haptics + speaker session, no mic
+            report[5] = 64;
+            report[6] = 64;
+            report[7] = 64;
+            report[8] = 64;   // controller-side audio buffer length
+            packetCounter += 2;
+            report[9] = packetCounter;
+
+            report[10] = 0xD2; // haptic packet: PID 0x12 | 0xC0, two frames
+            report[11] = HAPTIC_CHUNK_BYTES;
+            for (int i = 0; i < HAPTIC_CHUNK_BYTES; i++)
+            {
+                // Ring stores u8 offset-binary; the 0x39 container carries signed PCM.
+                report[12 + i] = (byte)(chunkA[i] ^ 0x80);
+                report[12 + HAPTIC_CHUNK_BYTES + i] = (byte)(chunkB[i] ^ 0x80);
+            }
+
+            bool headphone;
+            switch (audioRoute)
+            {
+                case DualSenseControllerOptions.AudioOutputRoute.Headphone:
+                    headphone = true;
+                    break;
+                case DualSenseControllerOptions.AudioOutputRoute.Speaker:
+                    headphone = false;
+                    break;
+                case DualSenseControllerOptions.AudioOutputRoute.Auto:
+                default:
+                    headphone = device.HeadsetPlugged;
+                    break;
+            }
+
+            report[140] = (byte)((headphone ? 0x16 : 0x13) | 0xC0);
+            report[141] = OPUS_FRAME_BYTES;
+            Buffer.BlockCopy(opusA, 0, report, 142, OPUS_FRAME_BYTES);
+            Buffer.BlockCopy(opusB, 0, report, 142 + OPUS_FRAME_BYTES, OPUS_FRAME_BYTES);
+
+            ApplyCrc(report, AUDIO_REPORT_SIZE);
+        }
+
+        private void ApplyCrc(byte[] report, int totalSize)
+        {
+            int crcOffset = totalSize - 4;
+            uint calcCrc32 = ~Crc32Algorithm.Compute(outputBTCrc32Head);
+            calcCrc32 = ~Crc32Algorithm.CalculateBasicHash(ref calcCrc32, ref report, 0, crcOffset);
+            report[crcOffset] = (byte)calcCrc32;
+            report[crcOffset + 1] = (byte)(calcCrc32 >> 8);
+            report[crcOffset + 2] = (byte)(calcCrc32 >> 16);
+            report[crcOffset + 3] = (byte)(calcCrc32 >> 24);
+        }
+
+        private WasapiLoopbackCapture CreateCapture(SampleRing hapticsRing, ShortRing audioRing)
         {
             WasapiLoopbackCapture capture = null;
             try
@@ -315,33 +516,70 @@ namespace DS4Windows.InputDevices
                     catch (Exception) { }
                 }
 
-                AppLogger.LogToGui($"{device.MacAddress}: haptics capturing audio from \"{endpointName ?? "default output"}\"", false);
+                AppLogger.LogToGui($"{device.MacAddress}: capturing audio from \"{endpointName ?? "default output"}\"", false);
 
                 int inRate = capture.WaveFormat.SampleRate;
                 int inChannels = capture.WaveFormat.Channels;
-                BiquadLowPass lpfL = new BiquadLowPass(lowPassHz, inRate);
-                BiquadLowPass lpfR = new BiquadLowPass(lowPassHz, inRate);
+                BiquadLowPass lpfL = hapticsRing != null ? new BiquadLowPass(lowPassHz, inRate) : null;
+                BiquadLowPass lpfR = hapticsRing != null ? new BiquadLowPass(lowPassHz, inRate) : null;
                 int decimPhase = 0;
+
+                WdlResampler resampler = null;
+                float[] resampleOut = null;
+                if (audioRing != null)
+                {
+                    resampler = new WdlResampler();
+                    resampler.SetMode(true, 2, false);
+                    resampler.SetFilterParms();
+                    resampler.SetFeedMode(true);
+                    resampler.SetRates(inRate, AUDIO_SAMPLE_RATE);
+                    resampleOut = new float[16384];
+                }
 
                 capture.DataAvailable += (sender, e) =>
                 {
-                    double captureGain = gain; // field read: live intensity changes
-                    // WASAPI shared-mode loopback delivers 32-bit float frames.
+                    double captureGain = gain;
+                    double volumeScale = audioVolume / 100.0;
                     ReadOnlySpan<float> samples = MemoryMarshal.Cast<byte, float>(
                         e.Buffer.AsSpan(0, e.BytesRecorded));
-                    for (int i = 0; i + inChannels <= samples.Length; i += inChannels)
+                    int frames = samples.Length / inChannels;
+                    if (frames <= 0)
                     {
-                        double l = lpfL.Process(samples[i]);
-                        double r = lpfR.Process(inChannels > 1 ? samples[i + 1] : samples[i]);
+                        return;
+                    }
 
-                        decimPhase += SAMPLE_RATE;
-                        if (decimPhase < inRate)
+                    if (audioRing != null)
+                    {
+                        float[] inBuffer;
+                        int inOffset;
+                        int needed = resampler.ResamplePrepare(frames, 2, out inBuffer, out inOffset);
+                        for (int i = 0; i < frames; i++)
                         {
-                            continue;
+                            inBuffer[inOffset + i * 2] = samples[i * inChannels];
+                            inBuffer[inOffset + i * 2 + 1] =
+                                inChannels > 1 ? samples[i * inChannels + 1] : samples[i * inChannels];
                         }
 
-                        decimPhase -= inRate;
-                        ring.Write(SoftClipToU8(l * captureGain), SoftClipToU8(r * captureGain));
+                        int outFrames = resampler.ResampleOut(resampleOut, 0, frames, resampleOut.Length / 2, 2);
+                        audioRing.Write(resampleOut, outFrames * 2, volumeScale);
+                    }
+
+                    if (hapticsRing != null)
+                    {
+                        for (int i = 0; i < frames; i++)
+                        {
+                            double l = lpfL.Process(samples[i * inChannels]);
+                            double r = lpfR.Process(inChannels > 1 ? samples[i * inChannels + 1] : samples[i * inChannels]);
+
+                            decimPhase += SAMPLE_RATE;
+                            if (decimPhase < inRate)
+                            {
+                                continue;
+                            }
+
+                            decimPhase -= inRate;
+                            hapticsRing.Write(SoftClipToU8(l * captureGain), SoftClipToU8(r * captureGain));
+                        }
                     }
                 };
 
@@ -349,41 +587,10 @@ namespace DS4Windows.InputDevices
             }
             catch (Exception ex)
             {
-                AppLogger.LogToGui($"{device.MacAddress}: failed to open audio capture for haptics: {ex.Message}", true);
+                AppLogger.LogToGui($"{device.MacAddress}: failed to open audio capture: {ex.Message}", true);
                 capture?.Dispose();
                 return null;
             }
-        }
-
-        /// <summary>
-        /// Report 0x32 layout (142 bytes total):
-        ///   [0]=0x32, [1]=sequence&lt;&lt;4, [2..10]=config packet 0x11
-        ///   (FE 00 00 00 00 FF counter), [11..76]=audio packet 0x12 with 64
-        ///   PCM bytes, zero padding, CRC-32 over 0xA2 || first 138 bytes
-        ///   stored little-endian in the last 4 bytes.
-        /// </summary>
-        private void BuildReport(byte[] report, byte seq, byte counter, byte[] audio)
-        {
-            Array.Clear(report, 0, REPORT_SIZE);
-            report[0] = 0x32;
-            report[1] = (byte)((seq & 0x0F) << 4);
-
-            report[2] = 0x91; // config packet: PID 0x11 | sized flag 0x80
-            report[3] = 0x07;
-            report[4] = 0xFE;
-            report[9] = 0xFF;
-            report[10] = counter;
-
-            report[11] = 0x92; // audio packet: PID 0x12 | sized flag 0x80
-            report[12] = (byte)AUDIO_BYTES;
-            Buffer.BlockCopy(audio, 0, report, AUDIO_OFFSET, AUDIO_BYTES);
-
-            uint calcCrc32 = ~Crc32Algorithm.Compute(outputBTCrc32Head);
-            calcCrc32 = ~Crc32Algorithm.CalculateBasicHash(ref calcCrc32, ref report, 0, CRC_OFFSET);
-            report[CRC_OFFSET] = (byte)calcCrc32;
-            report[CRC_OFFSET + 1] = (byte)(calcCrc32 >> 8);
-            report[CRC_OFFSET + 2] = (byte)(calcCrc32 >> 16);
-            report[CRC_OFFSET + 3] = (byte)(calcCrc32 >> 24);
         }
 
         private static byte SoftClipToU8(double x)
@@ -392,7 +599,7 @@ namespace DS4Windows.InputDevices
             return (byte)Math.Clamp(128.0 + y * 127.0, 0, 255);
         }
 
-        /// <summary>Byte ring for interleaved L/R u8 samples with bounded latency.</summary>
+        /// <summary>Byte ring for interleaved L/R u8 haptic samples with bounded latency.</summary>
         private sealed class SampleRing
         {
             private readonly byte[] buffer;
@@ -411,7 +618,6 @@ namespace DS4Windows.InputDevices
             {
                 lock (gate)
                 {
-                    // Overwrite oldest when full: fresher haptics beat growing latency.
                     if (count > buffer.Length - 2)
                     {
                         head = (head + 2) % buffer.Length;
@@ -438,6 +644,124 @@ namespace DS4Windows.InputDevices
 
                     count -= n;
                     return n;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Ring of 16-bit interleaved stereo samples at 48 kHz feeding the Opus
+        /// encoder. Drops oldest data when full to bound latency.
+        /// </summary>
+        private sealed class ShortRing
+        {
+            private readonly short[] buffer;
+            private readonly object gate = new object();
+            private int head;
+            private int count;
+
+            public ShortRing(int capacitySamples)
+            {
+                buffer = new short[capacitySamples];
+            }
+
+            public void Write(float[] samples, int sampleCount, double volumeScale)
+            {
+                lock (gate)
+                {
+                    for (int i = 0; i < sampleCount; i++)
+                    {
+                        if (count >= buffer.Length)
+                        {
+                            head = (head + 2) % buffer.Length;
+                            count -= 2;
+                        }
+
+                        double v = samples[i] * volumeScale * 32767.0;
+                        int tail = (head + count) % buffer.Length;
+                        buffer[tail] = (short)Math.Clamp(v, short.MinValue, short.MaxValue);
+                        count++;
+                    }
+                }
+            }
+
+            /// <summary>Reads exactly dest.Length samples or returns false leaving state unchanged.</summary>
+            public bool ReadExact(short[] dest)
+            {
+                lock (gate)
+                {
+                    if (count < dest.Length)
+                    {
+                        return false;
+                    }
+
+                    for (int i = 0; i < dest.Length; i++)
+                    {
+                        dest[i] = buffer[head];
+                        head = (head + 1) % buffer.Length;
+                    }
+
+                    count -= dest.Length;
+                    return true;
+                }
+            }
+        }
+
+        /// <summary>Small fixed-size queue of Opus frames with drop-oldest overflow.</summary>
+        private sealed class OpusFrameQueue
+        {
+            private readonly byte[][] slots;
+            private readonly object gate = new object();
+            private int head;
+            private int count;
+
+            public OpusFrameQueue(int depth, int frameBytes)
+            {
+                slots = new byte[depth][];
+                for (int i = 0; i < depth; i++)
+                {
+                    slots[i] = new byte[frameBytes];
+                }
+            }
+
+            /// <summary>Returns the buffer to encode into; call CommitSlot afterwards.</summary>
+            public byte[] RentSlot()
+            {
+                lock (gate)
+                {
+                    if (count >= slots.Length)
+                    {
+                        head = (head + 1) % slots.Length; // drop oldest
+                        count--;
+                    }
+
+                    return slots[(head + count) % slots.Length];
+                }
+            }
+
+            public void CommitSlot()
+            {
+                lock (gate)
+                {
+                    if (count < slots.Length)
+                    {
+                        count++;
+                    }
+                }
+            }
+
+            public bool TryDequeue(byte[] dest)
+            {
+                lock (gate)
+                {
+                    if (count == 0)
+                    {
+                        return false;
+                    }
+
+                    Buffer.BlockCopy(slots[head], 0, dest, 0, dest.Length);
+                    head = (head + 1) % slots.Length;
+                    count--;
+                    return true;
                 }
             }
         }

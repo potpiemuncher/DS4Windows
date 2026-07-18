@@ -216,6 +216,9 @@ namespace DS4Windows.InputDevices
         internal byte CurrentRumbleHeavy => currentHap.rumbleState.RumbleMotorStrengthLeftHeavySlow;
         internal byte CurrentRumbleLight => currentHap.rumbleState.RumbleMotorStrengthRightLightFast;
 
+        private bool headsetPlugged = false;
+        public bool HeadsetPlugged => headsetPlugged;
+
         public override event ReportHandler<EventArgs> Report = null;
         public override event EventHandler BatteryChanged;
         public override event EventHandler ChargingChanged;
@@ -496,7 +499,10 @@ namespace DS4Windows.InputDevices
             hapticsStreamer.Configure(nativeOptionsStore.BTHapticsMode,
                 nativeOptionsStore.BTHapticsGain,
                 nativeOptionsStore.BTHapticsLowPassHz,
-                nativeOptionsStore.BTHapticsAudioDeviceId);
+                nativeOptionsStore.BTHapticsAudioDeviceId,
+                nativeOptionsStore.BTAudioEnabled,
+                nativeOptionsStore.BTAudioRoute,
+                nativeOptionsStore.BTAudioVolume);
 
             // Push a fresh 0x31 report so the rumble-emulation flags reflect the
             // new streaming state right away.
@@ -757,6 +763,10 @@ namespace DS4Windows.InputDevices
                     cState.FnR = (tempByte & (1 << 5)) != 0;
                     cState.BLP = (tempByte & (1 << 6)) != 0;
                     cState.BRP = (tempByte & (1 << 7)) != 0;
+
+                    // Bit 0 of the status byte flags a headset in the 3.5mm jack;
+                    // used for automatic BT audio routing.
+                    headsetPlugged = (inputReport[54 + reportOffset] & 0x01) != 0;
 
                     if ((this.featureSet & VidPidFeatureSet.NoBatteryReading) == 0)
                     {

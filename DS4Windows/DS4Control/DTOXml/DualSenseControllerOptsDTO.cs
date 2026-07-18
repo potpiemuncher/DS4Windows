@@ -64,6 +64,24 @@ namespace DS4WinWPF.DS4Control.DTOXml
             get; set;
         } = string.Empty;
 
+        [XmlElement("BTAudioEnabled")]
+        public bool BTAudioEnabled
+        {
+            get; set;
+        } = false;
+
+        [XmlElement("BTAudioRoute")]
+        public AudioOutputRoute BTAudioRoute
+        {
+            get; set;
+        } = AudioOutputRoute.Auto;
+
+        [XmlElement("BTAudioVolume")]
+        public int BTAudioVolume
+        {
+            get; set;
+        } = 85;
+
         public void MapFrom(DualSenseControllerOptions source)
         {
             LEDMode = source.LedMode;
@@ -72,6 +90,9 @@ namespace DS4WinWPF.DS4Control.DTOXml
             BTHapticsGain = source.BTHapticsGain;
             BTHapticsLowPassHz = source.BTHapticsLowPassHz;
             BTHapticsAudioDeviceId = source.BTHapticsAudioDeviceId;
+            BTAudioEnabled = source.BTAudioEnabled;
+            BTAudioRoute = source.BTAudioRoute;
+            BTAudioVolume = source.BTAudioVolume;
         }
 
         public void MapTo(DualSenseControllerOptions destination)
@@ -82,6 +103,9 @@ namespace DS4WinWPF.DS4Control.DTOXml
             destination.BTHapticsGain = BTHapticsGain;
             destination.BTHapticsLowPassHz = BTHapticsLowPassHz;
             destination.BTHapticsAudioDeviceId = BTHapticsAudioDeviceId;
+            destination.BTAudioEnabled = BTAudioEnabled;
+            destination.BTAudioRoute = BTAudioRoute;
+            destination.BTAudioVolume = BTAudioVolume;
         }
     }
 }
