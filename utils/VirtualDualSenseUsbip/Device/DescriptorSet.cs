@@ -1,0 +1,139 @@
+namespace VirtualDualSenseUsbip.Device;
+
+/// <summary>
+/// Byte-exact descriptor store for the virtual wired DualSense, loaded from the
+/// frozen M2.0 capture fixtures (utils/DSCompatProbe/fixtures/dualsense_usb_0ce6).
+///
+/// Serving raw captured bytes — rather than reconstructing descriptors from
+/// parsed fields — guarantees the emulated device is indistinguishable from the
+/// real controller at the descriptor level, which is the whole point of the
+/// composite-emulation approach.
+/// </summary>
+public sealed class DescriptorSet
+{
+    private readonly byte[] device;
+    private readonly byte[] configuration;
+    private readonly byte[] hidReport;
+    private readonly byte[] hidDescriptor;       // 9-byte 0x21 descriptor sliced from config
+    private readonly Dictionary<byte, byte[]> strings; // string index -> descriptor bytes (0x0409)
+
+    public byte HidInterfaceNumber { get; }
+    public ushort VendorId { get; }
+    public ushort ProductId { get; }
+    public byte NumConfigurations { get; }
+    public byte NumInterfaces { get; }
+
+    private DescriptorSet(byte[] device, byte[] configuration, byte[] hidReport,
+        byte[] hidDescriptor, Dictionary<byte, byte[]> strings, byte hidInterfaceNumber)
+    {
+        this.device = device;
+        this.configuration = configuration;
+        this.hidReport = hidReport;
+        this.hidDescriptor = hidDescriptor;
+        this.strings = strings;
+        HidInterfaceNumber = hidInterfaceNumber;
+
+        VendorId = (ushort)(device[8] | (device[9] << 8));
+        ProductId = (ushort)(device[10] | (device[11] << 8));
+        NumConfigurations = device[17];
+        NumInterfaces = configuration[4];
+    }
+
+    public static DescriptorSet LoadFromFixtures(string fixturesDir)
+    {
+        byte[] Read(string name)
+        {
+            string path = Path.Combine(fixturesDir, name);
+            if (!File.Exists(path))
+            {
+                throw new FileNotFoundException($"Missing descriptor fixture: {path}");
+            }
+
+            return File.ReadAllBytes(path);
+        }
+
+        byte[] device = Read("device.bin");
+        byte[] configuration = Read("configuration.bin");
+        byte[] hidReport = Read("hid-report.bin");
+
+        if (device.Length != 18 || device[1] != UsbDescriptorType.Device)
+        {
+            throw new InvalidDataException("device.bin is not an 18-byte device descriptor.");
+        }
+
+        byte[] hidDescriptor = SliceHidDescriptor(configuration, out byte hidInterface);
+
+        var strings = new Dictionary<byte, byte[]>
+        {
+            [0] = Read("string-0-lang-0000.bin"),
+            [1] = Read("string-1-lang-0409.bin"),
+            [2] = Read("string-2-lang-0409.bin"),
+        };
+
+        return new DescriptorSet(device, configuration, hidReport, hidDescriptor, strings, hidInterface);
+    }
+
+    /// <summary>
+    /// Walks the configuration descriptor to find the HID class descriptor (0x21)
+    /// and the interface number it belongs to. Keeps the served HID descriptor
+    /// byte-identical to what the real device reports inside its config.
+    /// </summary>
+    private static byte[] SliceHidDescriptor(byte[] config, out byte hidInterface)
+    {
+        hidInterface = 0xFF;
+        int offset = 0;
+        byte currentInterface = 0xFF;
+        while (offset + 2 <= config.Length)
+        {
+            int len = config[offset];
+            int type = config[offset + 1];
+            if (len == 0 || offset + len > config.Length)
+            {
+                break;
+            }
+
+            if (type == UsbDescriptorType.Interface)
+            {
+                currentInterface = config[offset + 2];
+            }
+            else if (type == UsbDescriptorType.Hid)
+            {
+                hidInterface = currentInterface;
+                return config.AsSpan(offset, len).ToArray();
+            }
+
+            offset += len;
+        }
+
+        throw new InvalidDataException("No HID (0x21) descriptor found in configuration.bin.");
+    }
+
+    /// <summary>
+    /// Serves a standard GET_DESCRIPTOR request. Returns a stall for descriptor
+    /// types the real full-speed device does not provide (e.g. device qualifier).
+    /// Every response is truncated to wLength, matching real EP0 behavior.
+    /// </summary>
+    public ControlResult GetDescriptor(UsbSetupPacket setup)
+    {
+        byte type = setup.DescriptorType;
+        byte index = setup.DescriptorIndex;
+
+        byte[]? source = type switch
+        {
+            UsbDescriptorType.Device => device,
+            UsbDescriptorType.Configuration => configuration,
+            UsbDescriptorType.Hid => hidDescriptor,
+            UsbDescriptorType.HidReport => hidReport,
+            UsbDescriptorType.String => strings.GetValueOrDefault(index),
+            _ => null,
+        };
+
+        if (source == null)
+        {
+            return ControlResult.Stalled();
+        }
+
+        int take = Math.Min(source.Length, setup.Length);
+        return ControlResult.Ok(source.AsSpan(0, take).ToArray());
+    }
+}
