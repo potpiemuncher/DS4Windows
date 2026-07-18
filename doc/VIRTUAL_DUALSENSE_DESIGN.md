@@ -225,11 +225,28 @@ Live evidence on the qualified primary PC:
   CRC and copies its shared payload byte-exact into virtual wired report
   `0x01`. Real feature `0x05` calibration is read and served only at runtime;
   its values and the physical address are never logged or persisted. Synthetic
-  conversion/CRC tests pass. The first physical live run remains pending
-  because the paired controller's active HID stream was asleep at handoff.
+  conversion/CRC tests pass. Its live run received 3,660 authenticated reports
+  in five seconds. The virtual USB path then delivered 3,003 reports in 12.000
+  seconds (250.3 Hz), full LX/LY and L2/R2 ranges, and exactly three requested
+  Cross-button presses.
+- Assassin's Creed Black Flag Resynced recognized the HID-only device as a
+  native wired DualSense. The analyzed session captured 30,442 game HID output
+  reports with 18 unique full payloads. Of those, 15,455 contained nonzero
+  adaptive-trigger blocks: R2 modes `0x05` and `0x22`, and L2 mode `0x05`.
+- The Bluetooth bridge now relays only the two 11-byte trigger blocks on a
+  latest-value background writer, coalesces repeated states, sets only the R2
+  and L2 update flags, and rebuilds the Bluetooth `0x31` CRC. It never blocks
+  USB completion or touches rumble/audio/lightbar state. The user confirmed R2
+  resistance while firing in Resynced. A verified zero-trigger game report was
+  relayed before the test device was detached.
 
-M2.3 is not fully accepted yet. Remaining work is to forward physical
-Bluetooth input through a live hardware run, prove recognition in a Steam-free
-native DualSense title, capture all five adaptive-trigger programs, run the
-one-hour stability test, and exercise repeated clean attach/detach cycles.
-M2.4 UAC1 composite enumeration has not started.
+The M2.3 functional path has passed, but durability acceptance is not complete.
+Remaining work is to capture the other planned trigger programs, run the
+one-hour stability test, add a graceful server shutdown path, and exercise
+repeated clean attach/detach cycles. Raw captures and logs remain outside the
+repository under `C:\Users\patri\PS5Haptics\m23-*-hid-output.ndjson` and
+`m23-*-server.*.log`.
+
+M2.4 UAC1 composite enumeration is next. No cable-like native haptic audio was
+expected or heard during the HID-only Resynced test because Windows had no
+virtual DualSense audio endpoint to receive the game's four-channel stream.

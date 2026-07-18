@@ -68,6 +68,8 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
 
     StreamWriter? captureWriter = null;
     object captureGate = new();
+    long hidOutputCount = 0;
+    byte[]? lastLoggedTriggerBlock = null;
     if (!string.IsNullOrWhiteSpace(capturePath))
     {
         string fullCapturePath = Path.GetFullPath(capturePath);
@@ -78,24 +80,45 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
 
     server.HidOutputReceived += capture =>
     {
+        _ = bluetoothInput?.QueueTriggerReport(capture.Data);
         string hex = Convert.ToHexString(capture.Data);
-        Console.WriteLine($"{capture.Timestamp.ToLocalTime():HH:mm:ss.fff} HID OUT " +
-            $"seq={capture.SequenceNumber} via={capture.Transport} bytes={capture.Data.Length} " +
-            $"{hex[..Math.Min(hex.Length, 64)]}");
-        if (captureWriter != null)
-        {
-            string json = JsonSerializer.Serialize(new
+        bool triggerChanged = false;
+        long outputNumber;
+        string? json = captureWriter != null
+            ? JsonSerializer.Serialize(new
             {
                 timestampUtc = capture.Timestamp,
                 capture.SequenceNumber,
                 capture.Transport,
                 length = capture.Data.Length,
                 dataHex = hex,
-            });
-            lock (captureGate)
+            })
+            : null;
+
+        lock (captureGate)
+        {
+            outputNumber = ++hidOutputCount;
+            if (capture.Data.Length >= 33 && capture.Data[0] == 0x02)
+            {
+                ReadOnlySpan<byte> triggerBlock = capture.Data.AsSpan(11, 22);
+                if (lastLoggedTriggerBlock == null ||
+                    !triggerBlock.SequenceEqual(lastLoggedTriggerBlock))
+                {
+                    lastLoggedTriggerBlock = triggerBlock.ToArray();
+                    triggerChanged = true;
+                }
+            }
+            if (captureWriter != null)
             {
                 captureWriter.WriteLine(json);
             }
+        }
+
+        if (outputNumber == 1 || triggerChanged || outputNumber % 5000 == 0)
+        {
+            Console.WriteLine($"{capture.Timestamp.ToLocalTime():HH:mm:ss.fff} HID OUT " +
+                $"total={outputNumber} seq={capture.SequenceNumber} via={capture.Transport} " +
+                $"bytes={capture.Data.Length} {hex[..Math.Min(hex.Length, 64)]}");
         }
     };
 

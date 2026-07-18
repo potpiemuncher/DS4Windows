@@ -32,6 +32,9 @@ Usage:
   DSHapticsProto readusb [seconds=2]
       Reads virtual USB input reports and measures the interrupt-IN rate.
 
+  DSHapticsProto watchusb [seconds=10]
+      Measures virtual USB stick/trigger ranges and counts Cross-button presses.
+
 Run while the pad is connected over Bluetooth. Close DS4Windows/DSX/Steam
 first so nothing else is holding or rewriting controller output state.
 */
@@ -58,7 +61,7 @@ internal static class Program
     {
         string mode = args.Length > 0 ? args[0].ToLowerInvariant() : "test";
 
-        HidDevice device = mode is "featuresusb" or "readusb"
+        HidDevice device = mode is "featuresusb" or "readusb" or "watchusb"
             ? FindUsbDualSense()
             : FindBtDualSense();
         if (device == null)
@@ -140,8 +143,14 @@ internal static class Program
                     RunUsbReadRate(handle, seconds);
                     return 0;
                 }
+                case "watchusb":
+                {
+                    double seconds = args.Length > 1 ? double.Parse(args[1]) : 10.0;
+                    RunUsbInputWatch(handle, seconds);
+                    return 0;
+                }
                 default:
-                    Console.Error.WriteLine($"Unknown mode '{mode}'. Use 'test36', 'test', 'rumble', 'capture', 'features', 'featuresusb', 'readusb', or 'probe'.");
+                    Console.Error.WriteLine($"Unknown mode '{mode}'. Use 'test36', 'test', 'rumble', 'capture', 'features', 'featuresusb', 'readusb', 'watchusb', or 'probe'.");
                     return 2;
             }
         }
@@ -192,6 +201,50 @@ internal static class Program
         double rate = count / timer.Elapsed.TotalSeconds;
         Console.WriteLine($"Read {count} reports / {bytes} bytes in {timer.Elapsed.TotalSeconds:0.000} s " +
             $"({rate:0.0} reports/s). Last report: {Convert.ToHexString(report)}");
+    }
+
+    private static void RunUsbInputWatch(SafeFileHandle handle, double seconds)
+    {
+        byte[] report = new byte[64];
+        int valid = 0;
+        int minLx = 255, maxLx = 0, minLy = 255, maxLy = 0;
+        int maxL2 = 0, maxR2 = 0, crossPresses = 0;
+        bool crossWasDown = false;
+        var timer = Stopwatch.StartNew();
+        while (timer.Elapsed.TotalSeconds < seconds)
+        {
+            if (!NativeHid.Read(handle, report, out uint read, out int error))
+            {
+                throw new IOException($"Virtual USB ReadFile failed after {valid} reports (error {error}).");
+            }
+            if (read < 9 || report[0] != 0x01)
+            {
+                continue;
+            }
+
+            valid++;
+            minLx = Math.Min(minLx, report[1]);
+            maxLx = Math.Max(maxLx, report[1]);
+            minLy = Math.Min(minLy, report[2]);
+            maxLy = Math.Max(maxLy, report[2]);
+            maxL2 = Math.Max(maxL2, report[5]);
+            maxR2 = Math.Max(maxR2, report[6]);
+            bool crossIsDown = (report[8] & 0x20) != 0;
+            if (crossIsDown && !crossWasDown)
+            {
+                crossPresses++;
+            }
+            crossWasDown = crossIsDown;
+        }
+
+        timer.Stop();
+        if (valid == 0)
+        {
+            throw new IOException("No USB input report 0x01 frames were received.");
+        }
+        Console.WriteLine($"Observed {valid} reports in {timer.Elapsed.TotalSeconds:0.000} s: " +
+            $"LX {minLx}..{maxLx}, LY {minLy}..{maxLy}, " +
+            $"L2 max {maxL2}, R2 max {maxR2}, Cross presses {crossPresses}.");
     }
 
     /// <summary>

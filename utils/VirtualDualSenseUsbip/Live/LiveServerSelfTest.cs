@@ -76,6 +76,25 @@ public static class LiveServerSelfTest
         bluetooth[10] ^= 0x01;
         Require(!BluetoothDualSenseInputSource.TryConvertBluetoothReport(bluetooth, out _),
             "Bluetooth input with an invalid CRC was accepted");
+
+        byte[] usbOutput = new byte[48];
+        usbOutput[0] = 0x02;
+        usbOutput[11] = 0x22;
+        usbOutput[12] = 0x12;
+        usbOutput[13] = 0x00;
+        usbOutput[14] = 0x21;
+        usbOutput[22] = 0x05;
+        usbOutput[45] = 0xFF; // must not leak unrelated lightbar state
+        Require(BluetoothDualSenseInputSource.TryBuildBluetoothTriggerReport(
+                usbOutput, out byte[] bluetoothOutput) &&
+                bluetoothOutput.Length == 78 && bluetoothOutput[0] == 0x31 &&
+                bluetoothOutput[1] == 0x02 && bluetoothOutput[2] == 0x0C &&
+                bluetoothOutput.AsSpan(12, 11).SequenceEqual(usbOutput.AsSpan(11, 11)) &&
+                bluetoothOutput.AsSpan(23, 11).SequenceEqual(usbOutput.AsSpan(22, 11)) &&
+                bluetoothOutput[46] == 0 &&
+                BinaryPrimitives.ReadUInt32LittleEndian(bluetoothOutput.AsSpan(74)) ==
+                    ComputeBluetoothCrc(0xA2, bluetoothOutput.AsSpan(0, 74)),
+            "USB output did not map to an authenticated trigger-only Bluetooth report");
     }
 
     private static uint ComputeBluetoothCrc(byte seed, ReadOnlySpan<byte> data)

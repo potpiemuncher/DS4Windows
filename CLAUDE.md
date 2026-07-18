@@ -155,12 +155,12 @@ Do not rely on an old process ID; check the current process and binary path.
 
 ## Current Limitation
 
-Today, games normally see the existing virtual XInput controller. Therefore
-ordinary game rumble can be synthesized into haptics, but native DualSense PC
-game haptic audio and game-authored adaptive-trigger output are not yet being
-captured. That is the purpose of Phase 4. Do not claim native game support until
-a game recognizes the virtual device as a wired DualSense and its HID/UAC
-output has been relayed successfully.
+The HID-only virtual wired DualSense is now recognized by a native PC title,
+and game-authored adaptive-trigger output is captured and relayed to the real
+Bluetooth pad. Native game haptic audio is not available yet because the
+virtual device does not expose its UAC1 audio interfaces. Do not claim native
+haptic-audio support until M2.4-M2.6 materialize the 4-channel endpoint,
+qualify isochronous timing, and relay channels 3/4 successfully.
 
 ## Next Milestone: Native DualSense Game Compatibility
 
@@ -187,7 +187,7 @@ Status and order:
    implements USB/IP management framing, 48-byte URB headers, fragmented reads,
    bounded transfer parsing, serialized responses, pending requests, and
    UNLINK. Its protocol and fragmentation self-tests pass.
-4. **M2.3 live enumeration core complete; acceptance in progress**: the signed
+4. **M2.3 functional path PASSED; durability acceptance remains**: the signed
    VHCI driver attaches `054c:0ce6` as `DS4WSPKHID001`; Windows binds healthy
    USB Input Device and HID game-controller nodes. The 41-byte HID-only
    configuration retains the exact 289-byte captured report descriptor. EP0,
@@ -196,19 +196,24 @@ Status and order:
    7,504 reports at 250.1 Hz without failure. In neutral-input mode,
    calibration report `0x05` intentionally stalls instead of returning
    fabricated sensor data.
-   An opt-in `--input bluetooth` bridge is implemented and synthetic-tested:
+   The opt-in `--input bluetooth` bridge is live-validated:
    it validates physical `0x31` CRCs, maps bytes 2..64 to wired `0x01` bytes
    1..63, and forwards real calibration at runtime without persisting hardware
-   values. Its first physical run is still pending because the controller HID
-   stream was asleep at handoff. Remaining M2.3 work: wake/reconnect the pad,
-   run `inputtest 5`, restart the server with `--input bluetooth`, prove
-   Steam-free native-title recognition, capture all five adaptive-trigger
-   programs, run one-hour stability, and repeat clean attach/detach cycles.
+   values. `inputtest 5` received 3,660 valid authenticated reports; an
+   end-to-end USB watch delivered 3,003 reports in 12.000 s (250.3 Hz), full
+   0..255 LX/LY and L2/R2 ranges, and exactly three requested Cross presses.
+   Assassin's Creed Black Flag Resynced recognized the virtual wired pad and
+   generated 30,442 captured HID outputs in the analyzed session. Two distinct
+   trigger blocks were observed (R2 modes `0x05` and `0x22`, L2 `0x05`); 15,455
+   reports carried nonzero trigger data. A non-blocking, coalescing,
+   trigger-only Bluetooth relay rebuilt the `0x31` CRC, and the user confirmed
+   physical R2 resistance while firing. Remaining M2.3 work: capture the other
+   planned trigger programs, run one-hour stability, add graceful server
+   shutdown, and repeat clean attach/detach cycles.
 5. **M2.4**: add exact UAC1 composite descriptors.
 6. **M2.5**: qualify isochronous timing and stability.
-7. **M2.6**: relay UAC haptic channels 3/4 to 3 kHz Bluetooth haptic PCM and
-   forward native 11-byte adaptive-trigger blocks into Bluetooth controller
-   state.
+7. **M2.6**: relay UAC haptic channels 3/4 to 3 kHz Bluetooth haptic PCM. The
+   native 11-byte adaptive-trigger relay is already proven in M2.3.
 
 Installing the VHCI kernel driver is a material system change and briefly
 restarts USB 3.0 hubs/devices. Before doing it, get explicit user approval,

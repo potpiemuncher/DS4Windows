@@ -20,14 +20,21 @@ M2.3-live enumeration is working on the primary Windows 11 PC:
   reports at 250.1 Hz without a read failure.
 - `--input bluetooth` reads authenticated report `0x31` frames from the real
   pad, maps their shared payload to wired report `0x01`, and supplies real
-  calibration at runtime without logging or persisting hardware values. This
-  path passes synthetic CRC/mapping tests but still needs its first live run.
+  calibration at runtime without logging or persisting hardware values. The
+  live path has passed at 250.3 virtual USB reports/s with full stick/trigger
+  ranges and exact button transitions.
+- Native game output is relayed through a non-blocking latest-value worker that
+  copies only the two 11-byte adaptive-trigger blocks into authenticated
+  Bluetooth `0x31` reports. Black Flag Resynced recognized the virtual wired
+  device, emitted R2 modes `0x05`/`0x22` and L2 mode `0x05`, and the user
+  confirmed physical R2 resistance while firing.
 - In neutral-input mode, feature report `0x05` intentionally stalls rather
   than returning invented sensor calibration.
 
-Live physical-input validation, native-title recognition, the five adaptive-
-trigger programs, one-hour stability, and repeated clean attach/detach remain
-M2.3 acceptance work. UAC1 audio is not exposed yet.
+Capturing the other planned adaptive-trigger programs, one-hour stability,
+graceful server shutdown, and repeated clean attach/detach remain M2.3
+durability work. UAC1 audio is not exposed yet, so native cable-like haptic
+audio is not expected; that begins in M2.4.
 
 ## Build and test
 
@@ -37,6 +44,7 @@ dotnet run --project .\utils\VirtualDualSenseUsbip -- selftest
 dotnet run --project .\utils\VirtualDualSenseUsbip -- devicetest
 dotnet run --project .\utils\VirtualDualSenseUsbip -- servertest
 dotnet run --project .\utils\VirtualDualSenseUsbip -- inputtest 5
+dotnet run --project .\utils\DSHapticsProto -- watchusb 12
 ```
 
 The tests cover USB/IP golden vectors and fragmentation, byte-exact replay of
