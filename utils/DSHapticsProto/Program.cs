@@ -1,7 +1,7 @@
 /*
 DSHapticsProto — DualSense Bluetooth haptics streaming prototype for DS4Windows.
 
-Streams haptic PCM audio (3 kHz, unsigned 8-bit, stereo L/R actuator) to a
+Streams haptic PCM audio (3 kHz, signed 8-bit, stereo L/R actuator) to a
 Bluetooth-connected DualSense / DualSense Edge using HID output report 0x32.
 
 Protocol credit: reverse engineered by egormanga's SAxense project
@@ -10,7 +10,13 @@ implementation of the documented wire format.
 
 Usage:
   DSHapticsProto test [seconds=4] [freqHz=100] [amp=0.6]
-      Plays a sine burst on both actuators. Quick protocol validation.
+      Tests the compact 0x32 format on both actuators.
+
+  DSHapticsProto test36 [seconds=10] [freqHz=120] [amp=1.0]
+      Plays a sine burst using the self-contained 0x36 format used on Windows.
+
+  DSHapticsProto rumble [seconds=5]
+      Plays compatibility rumble to verify the basic Bluetooth output path.
 
   DSHapticsProto capture [gain=3.0] [lpfHz=350]
       Captures system audio (WASAPI loopback), low-passes it, and streams it
@@ -80,20 +86,38 @@ internal static class Program
                     double freq = args.Length > 2 ? double.Parse(args[2]) : 100.0;
                     double amp = args.Length > 3 ? double.Parse(args[3]) : 0.6;
                     if (args.Length > 4) HapticReport.TotalSize = int.Parse(args[4]);
+                    SendHapticsModeSetup(handle);
                     Console.WriteLine($"Sine test: {seconds:0.#} s @ {freq:0.#} Hz, amplitude {amp:0.##}, report size {HapticReport.TotalSize}");
                     RunSineTest(handle, seconds, freq, amp);
+                    return 0;
+                }
+                case "test36":
+                {
+                    double seconds = args.Length > 1 ? double.Parse(args[1]) : 10.0;
+                    double freq = args.Length > 2 ? double.Parse(args[2]) : 120.0;
+                    double amp = args.Length > 3 ? double.Parse(args[3]) : 1.0;
+                    Console.WriteLine($"Self-contained 0x36 sine test: {seconds:0.#} s @ {freq:0.#} Hz, amplitude {amp:0.##}");
+                    RunSineTest36(handle, seconds, freq, amp);
+                    return 0;
+                }
+                case "rumble":
+                {
+                    double seconds = args.Length > 1 ? double.Parse(args[1]) : 5.0;
+                    Console.WriteLine($"Compatibility rumble test: {seconds:0.#} s at full strength");
+                    RunCompatibilityRumbleTest(handle, seconds);
                     return 0;
                 }
                 case "capture":
                 {
                     double gain = args.Length > 1 ? double.Parse(args[1]) : 3.0;
                     double lpfHz = args.Length > 2 ? double.Parse(args[2]) : 350.0;
+                    SendHapticsModeSetup(handle);
                     Console.WriteLine($"System audio capture: gain {gain:0.##}, low-pass {lpfHz:0.#} Hz. Ctrl+C to stop.");
                     RunCapture(handle, gain, lpfHz);
                     return 0;
                 }
                 default:
-                    Console.Error.WriteLine($"Unknown mode '{mode}'. Use 'test' or 'capture'.");
+                    Console.Error.WriteLine($"Unknown mode '{mode}'. Use 'test36', 'test', 'rumble', 'capture', or 'probe'.");
                     return 2;
             }
         }
@@ -179,8 +203,8 @@ internal static class Program
         rep31[77] = (byte)(crc >> 24);
         ProbeOne(handle, "0x31 no-op @78", rep31);
 
+        // Report 0x32 transports signed 8-bit PCM. Zero is therefore silence.
         byte[] silence = new byte[HapticReport.AudioBytes];
-        Array.Fill(silence, (byte)0x80);
 
         foreach (int size in new[] { 141, 142, 547 })
         {
@@ -207,6 +231,70 @@ internal static class Program
         }
     }
 
+    /// <summary>
+    /// A freshly powered-on Bluetooth controller needs a packetized SetStateData
+    /// command before it accepts PCM haptics. This is the exact 0x32/0x10
+    /// initialization shape used by DS5Dongle when its HID interrupt channel opens.
+    /// </summary>
+    private static void SendHapticsModeSetup(SafeFileHandle handle)
+    {
+        byte[] report = new byte[142];
+        report[0] = 0x32;
+        report[1] = 0x10;
+        report[2] = 0x90; // packet 0x10 | sized flag
+        report[3] = 0x3F; // 63-byte SetStateData payload
+
+        Haptics36Report.CopyKnownStateTo(report.AsSpan(4, Haptics36Report.StateBytes));
+
+        uint crc = Crc32.Update(0xFFFFFFFF, 0xA2);
+        crc = Crc32.Update(crc, report.AsSpan(0, 138));
+        crc = ~crc;
+        report[138] = (byte)crc;
+        report[139] = (byte)(crc >> 8);
+        report[140] = (byte)(crc >> 16);
+        report[141] = (byte)(crc >> 24);
+
+        bool ok = NativeHid.Write(handle, report, out bool raw, out uint written, out int err);
+        Console.WriteLine($"Haptics mode setup: ok={ok} WriteFile={raw} written={written}/{report.Length} err={err}");
+        Thread.Sleep(50);
+    }
+
+    private static void RunCompatibilityRumbleTest(SafeFileHandle handle, double seconds)
+    {
+        int writes = Math.Max(1, (int)Math.Ceiling(seconds * 50.0));
+        byte sequence = 0;
+        int failures = 0;
+
+        for (int i = 0; i < writes + 5; i++)
+        {
+            bool active = i < writes;
+            byte[] report = new byte[78];
+            report[0] = 0x31;
+            report[1] = (byte)((sequence++ & 0x0F) << 4);
+            report[2] = 0x10;
+            report[3] = 0x03; // compatible vibration + select compatibility haptics
+            report[5] = active ? (byte)0xFF : (byte)0x00; // right/light
+            report[6] = active ? (byte)0xFF : (byte)0x00; // left/heavy
+
+            uint crc = Crc32.Update(0xFFFFFFFF, 0xA2);
+            crc = Crc32.Update(crc, report.AsSpan(0, 74));
+            crc = ~crc;
+            report[74] = (byte)crc;
+            report[75] = (byte)(crc >> 8);
+            report[76] = (byte)(crc >> 16);
+            report[77] = (byte)(crc >> 24);
+
+            if (!NativeHid.Write(handle, report, out _, out _, out _))
+            {
+                failures++;
+            }
+
+            Thread.Sleep(20);
+        }
+
+        Console.WriteLine($"Compatibility rumble done. {writes + 5} reports, {failures} write failures.");
+    }
+
     private static void RunSineTest(SafeFileHandle handle, double seconds, double freq, double amp)
     {
         amp = Math.Clamp(amp, 0.0, 1.0);
@@ -220,7 +308,8 @@ internal static class Program
         {
             for (int i = 0; i < FramesPerReport; i++)
             {
-                byte s = (byte)Math.Clamp(128.0 + amp * 127.0 * Math.Sin(phase), 0, 255);
+                sbyte signedSample = (sbyte)Math.Clamp(amp * 127.0 * Math.Sin(phase), -127.0, 127.0);
+                byte s = unchecked((byte)signedSample);
                 phase += phaseInc;
                 audio[i * 2] = s;     // left actuator
                 audio[i * 2 + 1] = s; // right actuator
@@ -231,7 +320,38 @@ internal static class Program
         }
 
         // Trailing silence so the actuators settle cleanly.
-        Array.Fill(audio, (byte)0x80);
+        Array.Clear(audio);
+        for (int i = 0; i < 6; i++)
+            sender.SendPaced(audio);
+
+        Console.WriteLine($"Done. {sender.ReportsSent} reports sent, {sender.WriteErrors} write errors.");
+    }
+
+    private static void RunSineTest36(SafeFileHandle handle, double seconds, double freq, double amp)
+    {
+        amp = Math.Clamp(amp, 0.0, 1.0);
+        long totalReports = (long)Math.Ceiling(seconds * 1000.0 / ReportPeriodMs);
+        var sender = new Report36Sender(handle);
+        byte[] audio = new byte[FramesPerReport * 2];
+        double phase = 0.0;
+        double phaseInc = 2.0 * Math.PI * freq / HapticsSampleRate;
+
+        for (long n = 0; n < totalReports; n++)
+        {
+            for (int i = 0; i < FramesPerReport; i++)
+            {
+                sbyte signedSample = (sbyte)Math.Clamp(amp * 127.0 * Math.Sin(phase), -127.0, 127.0);
+                phase += phaseInc;
+                byte s = unchecked((byte)signedSample);
+                audio[i * 2] = s;
+                audio[i * 2 + 1] = s;
+            }
+
+            if (!sender.SendPaced(audio))
+                return;
+        }
+
+        Array.Clear(audio);
         for (int i = 0; i < 6; i++)
             sender.SendPaced(audio);
 
@@ -282,7 +402,7 @@ internal static class Program
                     continue;
                 decimPhase -= inRate;
 
-                ring.Write(SoftClipToU8(l * gain), SoftClipToU8(r * gain));
+                ring.Write(SoftClipToS8Byte(l * gain), SoftClipToS8Byte(r * gain));
             }
 
             lock (meterGate)
@@ -312,7 +432,7 @@ internal static class Program
 
             int got = primed ? ring.ReadPartial(audio) : 0;
             if (got < audio.Length)
-                Array.Fill(audio, (byte)0x80, got, audio.Length - got);
+                Array.Clear(audio, got, audio.Length - got);
             if (primed && got == 0)
                 primed = false; // source went quiet; rebuffer before draining again
 
@@ -337,10 +457,11 @@ internal static class Program
         Console.WriteLine($"Stopped. {sender.ReportsSent} reports sent, {sender.WriteErrors} write errors.");
     }
 
-    private static byte SoftClipToU8(double x)
+    private static byte SoftClipToS8Byte(double x)
     {
         double y = x / (1.0 + Math.Abs(x)); // smooth limiter, no hard clipping artifacts
-        return (byte)Math.Clamp(128.0 + y * 127.0, 0, 255);
+        sbyte signedSample = (sbyte)Math.Clamp(y * 127.0, -127.0, 127.0);
+        return unchecked((byte)signedSample);
     }
 }
 
@@ -356,7 +477,7 @@ internal static class Program
 ///   [4..10]    FE 00 00 00 00 FF cc   (cc = incrementing counter)
 ///   [11]       0x92 = audio packet header (PID 0x12 | sized flag 0x80)
 ///   [12]       0x40 = audio payload length (64)
-///   [13..76]   64 bytes PCM: u8, stereo interleaved L/R, 3000 Hz
+///   [13..76]   64 bytes PCM: signed 8-bit, stereo interleaved L/R, 3000 Hz
 ///   [77..N-5]  zero padding
 ///   [N-4..N-1] CRC-32 (little-endian) over 0xA2 || report[0..N-5]
 /// </summary>
@@ -390,6 +511,112 @@ internal static class HapticReport
         report[crcOffset + 1] = (byte)(crc >> 8);
         report[crcOffset + 2] = (byte)(crc >> 16);
         report[crcOffset + 3] = (byte)(crc >> 24);
+    }
+}
+
+/// <summary>
+/// Builds DS5Dongle-AutoHaptics' self-contained Bluetooth report 0x36. Unlike
+/// the compact 0x32 stream, every report carries SetStateData before the PCM.
+/// </summary>
+internal static class Haptics36Report
+{
+    public const int TotalSize = 398;
+    public const int StateBytes = 63;
+    private const int AudioOffset = 78;
+    private const int AudioBytes = 64;
+
+    private static readonly byte[] KnownState = new byte[StateBytes]
+    {
+        0xFD, 0xF7, 0x00, 0x00,
+        0x7F, 0x64, 0xFF, 0x09, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A,
+        0x07, 0x00, 0x00, 0x02, 0x01, 0x00, 0xFF, 0xD7, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    public static void CopyKnownStateTo(Span<byte> destination) => KnownState.CopyTo(destination);
+
+    public static void Build(byte[] report, byte seq, byte counter, ReadOnlySpan<byte> audio64)
+    {
+        Array.Clear(report);
+        report[0] = 0x36;
+        report[1] = (byte)((seq & 0x0F) << 4);
+
+        report[2] = 0x91; // config packet 0x11 | sized
+        report[3] = 0x07;
+        report[4] = 0xFE;
+        report[5] = 0x20;
+        report[6] = 0x20;
+        report[7] = 0x20;
+        report[8] = 0x20;
+        report[9] = 0x20;
+        report[10] = counter;
+
+        report[11] = 0x90; // SetStateData packet 0x10 | sized
+        report[12] = StateBytes;
+        KnownState.CopyTo(report.AsSpan(13, StateBytes));
+
+        report[76] = 0x92; // haptics packet 0x12 | sized
+        report[77] = AudioBytes;
+        audio64.CopyTo(report.AsSpan(AudioOffset, AudioBytes));
+
+        uint crc = Crc32.Update(0xFFFFFFFF, 0xA2);
+        crc = Crc32.Update(crc, report.AsSpan(0, TotalSize - 4));
+        crc = ~crc;
+        report[TotalSize - 4] = (byte)crc;
+        report[TotalSize - 3] = (byte)(crc >> 8);
+        report[TotalSize - 2] = (byte)(crc >> 16);
+        report[TotalSize - 1] = (byte)(crc >> 24);
+    }
+}
+
+internal sealed class Report36Sender
+{
+    private readonly SafeFileHandle handle;
+    private readonly byte[] report = new byte[Haptics36Report.TotalSize];
+    private readonly Stopwatch clock = Stopwatch.StartNew();
+    private double nextDeadlineMs;
+    private byte seq;
+    private byte counter;
+
+    public long ReportsSent { get; private set; }
+    public long WriteErrors { get; private set; }
+
+    public Report36Sender(SafeFileHandle handle) => this.handle = handle;
+
+    public bool SendPaced(ReadOnlySpan<byte> audio64)
+    {
+        nextDeadlineMs += 64.0 * 500.0 / 3000.0;
+        double wait = nextDeadlineMs - clock.Elapsed.TotalMilliseconds;
+        if (wait > 2.0)
+            Thread.Sleep((int)(wait - 1.5));
+        while (clock.Elapsed.TotalMilliseconds < nextDeadlineMs)
+            Thread.SpinWait(80);
+
+        if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > 100.0)
+            nextDeadlineMs = clock.Elapsed.TotalMilliseconds;
+
+        Haptics36Report.Build(report, seq, counter, audio64);
+        seq = (byte)((seq + 1) & 0x0F);
+        counter++;
+
+        if (!NativeHid.Write(handle, report, out bool rawResult, out uint written, out int error))
+        {
+            WriteErrors++;
+            if (WriteErrors <= 3)
+                Console.Error.WriteLine($"0x36 write failed: WriteFile={rawResult}, bytesWritten={written}/{report.Length}, Win32 error {error}");
+            if (WriteErrors > 20 && WriteErrors > ReportsSent / 2)
+                return false;
+        }
+        else
+        {
+            ReportsSent++;
+        }
+
+        return true;
     }
 }
 
@@ -446,7 +673,7 @@ internal sealed class ReportSender
     }
 }
 
-/// <summary>Fixed-size byte ring for interleaved L/R u8 samples, tuned for bounded latency.</summary>
+/// <summary>Fixed-size byte ring for interleaved L/R signed-PCM bytes, tuned for bounded latency.</summary>
 internal sealed class SampleRing
 {
     private readonly byte[] buffer;

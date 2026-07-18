@@ -62,6 +62,11 @@ internal static class Program
             return UsbDescriptorFixture.RunVerify(args.Skip(1).ToArray());
         }
 
+        if (args.Length > 0 && args[0].Equals("meteraudio", StringComparison.OrdinalIgnoreCase))
+        {
+            return AudioEndpointMeter.Run(args.Skip(1).ToArray());
+        }
+
         string outDir = Path.Combine(AppContext.BaseDirectory, "probe_runs",
             DateTime.UtcNow.ToString("yyyyMMdd_HHmmss"));
         Directory.CreateDirectory(outDir);

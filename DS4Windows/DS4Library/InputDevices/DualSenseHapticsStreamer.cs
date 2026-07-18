@@ -31,9 +31,10 @@ namespace DS4Windows.InputDevices
     /// <summary>
     /// Streams haptic and listening audio to a Bluetooth-connected DualSense.
     ///
-    /// Haptics-only mode uses HID output report 0x32 carrying 3 kHz stereo PCM
-    /// for the voice-coil actuators. When listening audio is enabled, the
-    /// larger 0x39 container is used instead, carrying both the haptic PCM and
+    /// Haptics-only mode uses the self-contained HID output report 0x36 carrying
+    /// controller state plus 3 kHz stereo PCM for the voice-coil actuators. When
+    /// listening audio is enabled, the larger 0x39 container is used instead,
+    /// carrying both the haptic PCM and
     /// Opus-encoded 48 kHz stereo audio (10 ms frames, 160 kbps CBR) routed to
     /// the controller's headphone jack or internal speaker.
     ///
@@ -42,9 +43,14 @@ namespace DS4Windows.InputDevices
     /// </summary>
     public class DualSenseHapticsStreamer
     {
-        // 0x32 haptics-only report
-        private const int HAPTICS_REPORT_SIZE = 142;
-        private const byte HAPTICS_REPORT_ID = 0x32;
+        // 0x36 self-contained haptics report (state + signed 3 kHz PCM)
+        private const int HAPTICS_REPORT_SIZE = 398;
+        private const byte HAPTICS_REPORT_ID = 0x36;
+        private const byte HAPTICS_CONTROLLER_BUFFER = 0x20;
+
+        // Packetized SetStateData command used to initialize the listening-audio amp.
+        private const int STATE_SETUP_REPORT_SIZE = 142;
+        private const byte STATE_SETUP_REPORT_ID = 0x32;
 
         // 0x39 haptics + listening audio container
         private const int AUDIO_REPORT_SIZE = 547;
@@ -108,6 +114,20 @@ namespace DS4Windows.InputDevices
         private const int HAPTIC_CHUNK_BYTES = 64;     // 32 stereo frames
         private const double TICK_MS = 32 * 1000.0 / SAMPLE_RATE; // ~10.667 ms
         private const int MAX_CONSECUTIVE_WRITE_FAILURES = 50;
+
+        // Known-good advanced-haptics state used by DS5Dongle-AutoHaptics.
+        // UseRumbleNotHaptics (state byte 0 bit 1) is clear.
+        private static readonly byte[] HAPTICS_STATE = new byte[63]
+        {
+            0xFD, 0xF7, 0x00, 0x00,
+            0x7F, 0x64, 0xFF, 0x09, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A,
+            0x07, 0x00, 0x00, 0x02, 0x01, 0x00, 0xFF, 0xD7, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        };
 
         private const double HEAVY_FREQ_HZ = 62.0;
         private const double LIGHT_FREQ_HZ = 170.0;
@@ -266,7 +286,10 @@ namespace DS4Windows.InputDevices
                 {
                     // The controller's audio amp defaults to muted volume; it only
                     // plays the stream after headphone/speaker volume is set.
-                    SendAudioVolumeSetup();
+                    if (!SendAudioVolumeSetup())
+                    {
+                        AppLogger.LogToGui($"{device.MacAddress}: BT audio amplifier setup write failed", true);
+                    }
 
                     opusEncoder = OpusCodecFactory.CreateEncoder(AUDIO_SAMPLE_RATE, 2,
                         OpusApplication.OPUS_APPLICATION_AUDIO);
@@ -328,7 +351,7 @@ namespace DS4Windows.InputDevices
                     bool hapticsActive = FillHapticsChunk(chunk, hapticsRing,
                         useRumbleSynth, ref primed);
 
-                    // A continuous stream of nominally silent 0x32 packets can
+                    // A continuous stream of nominally silent haptic packets can
                     // leave the voice-coil actuators faintly energized. In the
                     // pure rumble-synth pipeline there is no audio clock to
                     // maintain, so send one final centered chunk after an effect
@@ -527,8 +550,10 @@ namespace DS4Windows.InputDevices
         }
 
         /// <summary>
-        /// Report 0x32 layout (142 bytes): see Phase 1/2 research. Config packet
-        /// 0x11 with the 0xFE haptics flags, one 64-byte audio packet 0x12.
+        /// Self-contained report 0x36 layout (398 bytes), per DS5Dongle-AutoHaptics:
+        /// config packet 0x11, SetStateData packet 0x10, then one signed 64-byte
+        /// haptic PCM packet 0x12. Embedding state in every report is required on
+        /// the Windows Bluetooth HID path used by this controller.
         /// </summary>
         private void BuildHapticsReport(byte[] report, byte[] chunk)
         {
@@ -540,12 +565,24 @@ namespace DS4Windows.InputDevices
             report[2] = 0x91; // config packet: PID 0x11 | sized
             report[3] = 0x07;
             report[4] = 0xFE;
-            report[9] = 0xFF;
+            report[5] = HAPTICS_CONTROLLER_BUFFER;
+            report[6] = HAPTICS_CONTROLLER_BUFFER;
+            report[7] = HAPTICS_CONTROLLER_BUFFER;
+            report[8] = HAPTICS_CONTROLLER_BUFFER;
+            report[9] = HAPTICS_CONTROLLER_BUFFER;
             report[10] = ++packetCounter;
 
-            report[11] = 0x92; // haptic audio packet: PID 0x12 | sized
-            report[12] = HAPTIC_CHUNK_BYTES;
-            Buffer.BlockCopy(chunk, 0, report, 13, HAPTIC_CHUNK_BYTES);
+            report[11] = 0x90; // SetStateData packet: PID 0x10 | sized
+            report[12] = (byte)HAPTICS_STATE.Length;
+            Buffer.BlockCopy(HAPTICS_STATE, 0, report, 13, HAPTICS_STATE.Length);
+
+            report[76] = 0x92; // haptic audio packet: PID 0x12 | sized
+            report[77] = HAPTIC_CHUNK_BYTES;
+            for (int i = 0; i < HAPTIC_CHUNK_BYTES; i++)
+            {
+                // The internal ring is u8 offset-binary; report 0x36 carries s8 PCM.
+                report[78 + i] = (byte)(chunk[i] ^ 0x80);
+            }
 
             ApplyCrc(report, HAPTICS_REPORT_SIZE);
         }
@@ -616,12 +653,15 @@ namespace DS4Windows.InputDevices
         /// with a mild speaker pre-gain boost. Mirrors what DS5Dongle emits when
         /// the USB host sets its volume; without this the Opus stream is silent.
         /// </summary>
-        private void SendAudioVolumeSetup()
+        private bool SendAudioVolumeSetup()
         {
-            byte[] pkt = new byte[HAPTICS_REPORT_SIZE];
-            pkt[0] = HAPTICS_REPORT_ID;
-            pkt[1] = (byte)((seq & 0x0F) << 4);
-            seq = (byte)((seq + 1) & 0x0F);
+            byte[] pkt = new byte[STATE_SETUP_REPORT_SIZE];
+            pkt[0] = STATE_SETUP_REPORT_ID;
+            // SetStateData uses a fixed command byte here, not the rolling
+            // report sequence used by 0x11/0x12 audio containers. Sending a
+            // sequence nibble causes the controller to ignore the amplifier
+            // unmute/volume state while still accepting subsequent 0x39 writes.
+            pkt[1] = 0x10;
 
             pkt[2] = 0x90; // SetStateData packet: PID 0x10 | sized
             pkt[3] = 0x3F;
@@ -634,8 +674,8 @@ namespace DS4Windows.InputDevices
             pkt[4 + 7] = 0x00;  // AudioControl: mic auto, default output path
             pkt[4 + 37] = 0x02; // AudioControl2: SpeakerCompPreGain = 2
 
-            ApplyCrc(pkt, HAPTICS_REPORT_SIZE);
-            hidDevice.WriteOutputReportViaInterrupt(pkt, 100);
+            ApplyCrc(pkt, STATE_SETUP_REPORT_SIZE);
+            return hidDevice.WriteOutputReportViaInterrupt(pkt, 100);
         }
 
         private void ApplyCrc(byte[] report, int totalSize)
