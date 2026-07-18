@@ -467,6 +467,7 @@ namespace DS4Windows.InputDevices
 
             if (useRumbleSynth)
             {
+                bool pureRumbleSynth = ring == null;
                 byte rawHeavy = device.CurrentRumbleHeavy;
                 byte rawLight = device.CurrentRumbleLight;
                 double heavyTarget = ScaleRumbleStrength(rawHeavy);
@@ -480,13 +481,28 @@ namespace DS4Windows.InputDevices
                     lightEnv += (lightTarget - lightEnv) *
                         (lightTarget > lightEnv ? ENVELOPE_ATTACK : ENVELOPE_RELEASE);
 
-                    double left = (chunk[i * 2] - 128) / 127.0 + heavyEnv * Math.Sin(heavyPhase);
-                    double right = (chunk[i * 2 + 1] - 128) / 127.0 + lightEnv * Math.Sin(lightPhase);
+                    double rumbleLeft = heavyEnv * Math.Sin(heavyPhase);
+                    double rumbleRight = lightEnv * Math.Sin(lightPhase);
+                    double left = (chunk[i * 2] - 128) / 127.0 + rumbleLeft;
+                    double right = (chunk[i * 2 + 1] - 128) / 127.0 + rumbleRight;
                     heavyPhase += heavyInc;
                     lightPhase += lightInc;
 
-                    chunk[i * 2] = SoftClipToU8(left);
-                    chunk[i * 2 + 1] = SoftClipToU8(right);
+                    if (pureRumbleSynth)
+                    {
+                        // A full XInput motor command should span the actuator's
+                        // full signed PCM range. The generic soft clipper maps a
+                        // unit peak to only 50%, making game rumble unnecessarily weak.
+                        chunk[i * 2] = UnitSampleToU8(rumbleLeft);
+                        chunk[i * 2 + 1] = UnitSampleToU8(rumbleRight);
+                    }
+                    else
+                    {
+                        // Mix mode can contain both captured PCM and synthesized
+                        // rumble, so use a smooth limiter to avoid hard clipping.
+                        chunk[i * 2] = TanhSampleToU8(left * 1.5);
+                        chunk[i * 2 + 1] = TanhSampleToU8(right * 1.5);
+                    }
                 }
             }
 
@@ -515,6 +531,16 @@ namespace DS4Windows.InputDevices
             }
 
             return false;
+        }
+
+        internal static byte UnitSampleToU8(double sample)
+        {
+            return (byte)Math.Clamp(128.0 + sample * 127.0, 1.0, 255.0);
+        }
+
+        private static byte TanhSampleToU8(double sample)
+        {
+            return (byte)Math.Clamp(128.0 + Math.Tanh(sample) * 127.0, 1.0, 255.0);
         }
 
         private void EncodeOpusFrame(IOpusEncoder encoder, short[] pcm, byte[] dest)

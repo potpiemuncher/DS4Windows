@@ -46,6 +46,15 @@ public class DualSenseHapticsStreamerTests
         Assert.IsTrue(DualSenseHapticsStreamer.HasHapticSignal(chunk));
     }
 
+    [DataTestMethod]
+    [DataRow(-1.0, (byte)1)]
+    [DataRow(0.0, (byte)128)]
+    [DataRow(1.0, (byte)255)]
+    public void UnitSampleToU8_UsesFullSignedPcmRange(double sample, byte expected)
+    {
+        Assert.AreEqual(expected, DualSenseHapticsStreamer.UnitSampleToU8(sample));
+    }
+
     [TestMethod]
     public void DownmixToStereo_PreservesStereoSamples()
     {
