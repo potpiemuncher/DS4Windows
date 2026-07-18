@@ -335,3 +335,5 @@ ASALocalRun/
 
 # Raw USB captures are large local fixtures - keep out of the repo
 utils/DSCompatProbe/usb_captures/
+utils/DSCompatProbe/fixtures/*/iso_audio_ch12.wav
+utils/DSCompatProbe/fixtures/*/iso_haptics_ch34.wav

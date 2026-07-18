@@ -29,5 +29,10 @@ Raw pcaps in utils/DSCompatProbe/usb_captures/20260718_010245 (local only,
   These blocks are byte-compatible with the BT 0x31 trigger sections ->
   Phase 4 trigger relay is a direct copy.
 - Iso OUT stream: 3840-byte URBs every 10 ms = 480 samples x 4ch x 16-bit
-  48 kHz. Channel-level waveform extraction TODO (needs a compiled parser,
-  PowerShell too slow).
+  48 kHz. Extracted with DSCompatProbe parsepcap over the 288.5 s capture
+  (28,848 URBs): ch1/2 (listening audio) rms ~585, peak ~37% FS; ch3/4
+  (haptic actuators) rms ~3770, peak **98.6% FS** - the game drives the
+  actuators near full scale, far hotter than the audio channels.
+  iso_haptics_ch34_excerpt10s.wav = committed 10 s reference; full 52 MB
+  WAVs are gitignored (regenerate via
+  `DSCompatProbe parsepcap <hub3.pcap> 9 <outdir>`).

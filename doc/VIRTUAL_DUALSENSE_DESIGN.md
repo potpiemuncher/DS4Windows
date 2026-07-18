@@ -75,6 +75,71 @@ which property (container/parent/VID-PID/name) it used to associate them.
 - **M5 — Integration extras**: mic under the same composite device, multiple
   controllers, upstream SDL association improvement.
 
+## M2 spike plan (usbip-win2 emulator) — from Codex consult 2026-07-18
+
+Mechanism confirmed: our emulator is a **local usbip protocol server** that
+*impersonates* a DualSense (not a forwarder). usbip-win2's signed VHCI driver
+attaches it over the usbip TCP protocol and materializes it as a real USB
+device; in-box `usbccgp`/`hidusb`/`usbaudio` then bind exactly as to hardware.
+Reference impls (behavioral, don't extend): VIIPER, the MIT Rust usbip server.
+Build our own C# .NET 8 server for full control over iso descriptors,
+outstanding URBs, and completion pacing.
+
+Two hard gates decide if usbip-win2 is viable:
+1. Its WHLK x64 driver (try 0.9.7.8, fall back to 0.9.7.5) installs under
+   Secure Boot + HVCI with **testsigning OFF** and adds no public test root CA.
+2. A paced synthetic UAC1 sink sustains the observed 3840 B / 10 ms stream for
+   an hour with no audio glitches and no URB-queue drift.
+If gate 2 fails, investigate usbip-win2 iso completion-clock semantics before
+abandoning the approach (our bandwidth is modest; failure would be pacing, not
+throughput).
+
+Milestones:
+- **M2.0 Freeze inputs**: from the descriptor capture, check in binary blobs +
+  decoded JSON for device/config/interface/endpoint/HID-report/string/UAC
+  descriptors and the observed enumeration control exchanges. Acceptance: a
+  descriptor parser round-trips every captured byte exactly.
+- **M2.1 Driver qualification**: install usbip-win2 on a disposable Win11,
+  Secure Boot + HVCI on, testsigning off; verify .sys/.cat signatures, no test
+  CA left behind. Gate 1 above.
+- **M2.2 Protocol core**: management ops (OP_REQ_DEVLIST/IMPORT), 48-byte URB
+  headers (CMD_SUBMIT/RET_SUBMIT), iso descriptors, exact-read transport, one
+  serialized writer, pending-request map, unlink. Golden-test vs kernel docs +
+  a localhost session. Acceptance: usbip list/attach over 100 attach/detach
+  cycles.
+- **M2.3 HID-only DualSense**: EP0 std requests, exact HID report descriptor,
+  feature reports, 250 Hz interrupt IN, interrupt OUT capture. Use serial
+  DS4WSPK-HID-001 to avoid polluting cached instance state. Acceptance: native
+  title recognizes it (no Steam), 1 h stable, all 5 trigger programs arrive on
+  interrupt OUT, clean detach.
+- **M2.4 Composite enumeration**: add exact UAC1 descriptors, no relay yet.
+  Acceptance: usbccgp/hidusb/usbaudio bind, 4ch/48k render endpoint appears,
+  MMDevice container ID matches the HID child's USB container, Windows selects
+  the streaming alt setting.
+- **M2.5 ISO timing lab** (the central gate): implement `immediate` and `paced`
+  completion modes. Virtual 1 kHz frame clock; honor URB_ISO_ASAP (0x02, start
+  frame ignored when set) else startFrame w/ wraparound; complete one response
+  per URB at its scheduled end (never Task.Delay per packet; dedicated
+  high-prio QPC scheduler + waitable timer). Measure whether Windows/usbaudio
+  paces submits or we must pace completions. Acceptance: 1 h stable 4×48k, no
+  queue growth, sample count matches elapsed time, 100 stop/start + alt
+  transitions.
+- **M2.6 Haptic relay**: UAC ch3/4 -> anti-alias -> async 3 kHz -> existing BT
+  scheduler; interrupt-OUT trigger relay independent (byte-copy to 0x31
+  sections). Never block USB completion on BT WriteFile.
+
+Key protocol traps (Codex):
+- Interrupt IN: hold pending submits, complete on real 250 Hz input; never
+  synthesize a fake poll rate; log submit/scheduled/complete QPC + seq.
+- ISO OUT URB is ~10 packets x 384 B (1/ms) but do NOT hardcode that — it's
+  app behavior, not an endpoint invariant; validate packet offsets/lengths
+  against wMaxPacketSize each submit.
+- TCP concurrency: one reader/parser -> {EP0 exec, int-IN queue, int-OUT,
+  iso scheduler, unlink} -> one serialized writer. Multiple URBs outstanding,
+  responses may complete out of seqnum order.
+- Return RET_SUBMIT for interrupt OUT promptly (status 0, actual len, non-iso
+  packet count -1) regardless of BT relay latency.
+
 ## Clock model notes (validated)
 
 The Phase 3 listening path (capture → WDL resample to measured ~45 kHz slot

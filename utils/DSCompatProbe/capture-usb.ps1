@@ -11,6 +11,7 @@
 #Requires -RunAsAdministrator
 param(
     [int]$Seconds = 180,
+    [switch]$InjectDescriptors,
     [string]$OutDir = "$PSScriptRoot\usb_captures\$(Get-Date -Format yyyyMMdd_HHmmss)"
 )
 
@@ -39,8 +40,9 @@ Write-Host "PLAY NOW: fire weapons, melee, sail storms - trigger + haptic moment
 $procs = @()
 foreach ($iface in $ifaces) {
     $n = $iface -replace ".*USBPcap", ""
-    $procs += Start-Process -FilePath $cmd -PassThru -WindowStyle Hidden `
-        -ArgumentList "-d", $iface, "-o", "$OutDir\hub$n.pcap", "-A"
+    $captureArgs = @("-d", $iface, "-o", "$OutDir\hub$n.pcap", "-A")
+    if ($InjectDescriptors) { $captureArgs += "--inject-descriptors" }
+    $procs += Start-Process -FilePath $cmd -PassThru -WindowStyle Hidden -ArgumentList $captureArgs
 }
 
 Start-Sleep -Seconds $Seconds

@@ -33,6 +33,11 @@ internal static class Program
 
     private static int Main(string[] args)
     {
+        if (args.Length > 0 && args[0].Equals("parsepcap", StringComparison.OrdinalIgnoreCase))
+        {
+            return PcapIsoExtractor.Run(args.Skip(1).ToArray());
+        }
+
         string outDir = Path.Combine(AppContext.BaseDirectory, "probe_runs",
             DateTime.UtcNow.ToString("yyyyMMdd_HHmmss"));
         Directory.CreateDirectory(outDir);
