@@ -240,7 +240,15 @@ internal static class Program
 
     private static void RunCapture(SafeFileHandle handle, double gain, double lpfHz)
     {
-        var ring = new SampleRing(capacityBytes: 1200); // ~200 ms cap keeps latency bounded
+        var ring = new SampleRing(capacityBytes: 1920); // ~320 ms hard cap on buffered haptics
+        const int prebufferBytes = 576;                 // ~96 ms cushion before draining starts
+
+        using (var mmEnum = new NAudio.CoreAudioApi.MMDeviceEnumerator())
+        {
+            var dev = mmEnum.GetDefaultAudioEndpoint(NAudio.CoreAudioApi.DataFlow.Render, NAudio.CoreAudioApi.Role.Multimedia);
+            Console.WriteLine($"Capturing loopback of default output: {dev.FriendlyName}");
+            Console.WriteLine("(If your game/music plays on a different output device, make that one the Windows default.)");
+        }
 
         using var capture = new WasapiLoopbackCapture();
         int inRate = capture.WaveFormat.SampleRate;
@@ -249,16 +257,25 @@ internal static class Program
         var lpfR = new BiquadLowPass(lpfHz, inRate);
         int decimPhase = 0;
 
+        object meterGate = new();
+        double meterSumSquares = 0;
+        long meterSamples = 0;
+
         Console.WriteLine($"Loopback format: {inRate} Hz, {inChannels} ch, {capture.WaveFormat.Encoding}");
 
         capture.DataAvailable += (_, e) =>
         {
-            // WASAPI loopback delivers IEEE float frames at the engine mix format.
+            // WASAPI shared-mode loopback delivers 32-bit float frames at the engine mix format.
             ReadOnlySpan<float> samples = MemoryMarshal.Cast<byte, float>(e.Buffer.AsSpan(0, e.BytesRecorded));
+            double sumSq = 0;
+            int frames = 0;
             for (int i = 0; i + inChannels <= samples.Length; i += inChannels)
             {
-                double l = lpfL.Process(samples[i]);
+                double rawL = samples[i];
+                double l = lpfL.Process(rawL);
                 double r = lpfR.Process(inChannels > 1 ? samples[i + 1] : samples[i]);
+                sumSq += rawL * rawL;
+                frames++;
 
                 decimPhase += HapticsSampleRate;
                 if (decimPhase < inRate)
@@ -267,7 +284,16 @@ internal static class Program
 
                 ring.Write(SoftClipToU8(l * gain), SoftClipToU8(r * gain));
             }
+
+            lock (meterGate)
+            {
+                meterSumSquares += sumSq;
+                meterSamples += frames;
+            }
         };
+
+        capture.RecordingStopped += (_, e) =>
+            Console.Error.WriteLine($"Capture stopped{(e.Exception != null ? $" with error: {e.Exception.Message}" : ".")}");
 
         var cts = new CancellationTokenSource();
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -276,28 +302,35 @@ internal static class Program
 
         var sender = new ReportSender(handle);
         byte[] audio = new byte[FramesPerReport * 2];
-        long silentSince = 0;
+        bool primed = false;
+        long ticks = 0;
 
         while (!cts.IsCancellationRequested)
         {
-            bool gotAudio = ring.Read(audio);
-            if (!gotAudio)
-            {
-                Array.Fill(audio, (byte)0x80);
-                silentSince++;
-            }
-            else
-            {
-                silentSince = 0;
-            }
+            if (!primed && ring.Count >= prebufferBytes)
+                primed = true;
+
+            int got = primed ? ring.ReadPartial(audio) : 0;
+            if (got < audio.Length)
+                Array.Fill(audio, (byte)0x80, got, audio.Length - got);
+            if (primed && got == 0)
+                primed = false; // source went quiet; rebuffer before draining again
 
             if (!sender.SendPaced(audio))
                 break;
 
-            if (sender.ReportsSent % 470 == 0) // ~every 5 s
-                Console.WriteLine($"reports={sender.ReportsSent} errors={sender.WriteErrors} ringBytes={ring.Count} underruns={ring.Underruns}");
+            if (++ticks % 94 == 0) // ~once per second
+            {
+                double rms;
+                lock (meterGate)
+                {
+                    rms = meterSamples > 0 ? Math.Sqrt(meterSumSquares / meterSamples) : 0;
+                    meterSumSquares = 0;
+                    meterSamples = 0;
+                }
 
-            _ = silentSince; // stream continues during silence; pad stays quiet on 0x80
+                Console.WriteLine($"in={rms * 100,5:0.0}% ring={ring.Count,4}B primed={(primed ? 1 : 0)} sent={sender.ReportsSent} err={sender.WriteErrors}");
+            }
         }
 
         capture.StopRecording();
@@ -444,25 +477,27 @@ internal sealed class SampleRing
         }
     }
 
-    /// <summary>Fills <paramref name="dest"/> completely, or returns false leaving it untouched (underrun).</summary>
-    public bool Read(byte[] dest)
+    /// <summary>
+    /// Copies up to dest.Length bytes (rounded down to whole L/R frames) and
+    /// returns how many were copied. The caller pads any shortfall with silence,
+    /// so a slow producer degrades gracefully instead of going all-or-nothing.
+    /// </summary>
+    public int ReadPartial(byte[] dest)
     {
         lock (gate)
         {
-            if (count < dest.Length)
-            {
+            int n = Math.Min(count, dest.Length) & ~1;
+            if (n < dest.Length)
                 Underruns++;
-                return false;
-            }
 
-            for (int i = 0; i < dest.Length; i++)
+            for (int i = 0; i < n; i++)
             {
                 dest[i] = buffer[head];
                 head = (head + 1) % buffer.Length;
             }
 
-            count -= dest.Length;
-            return true;
+            count -= n;
+            return n;
         }
     }
 }

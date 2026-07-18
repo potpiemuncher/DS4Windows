@@ -76,6 +76,9 @@ custom BT profile. This is almost certainly the same mechanism DSX v3.2 uses.
 ### Phase 2 — integrate into DS4Windows
 - New per-profile "Audio Haptics" settings: enable, intensity, low-pass cutoff,
   mix-with-rumble vs replace, source selection.
+- Source selection must include a **render-endpoint picker**, not just the default
+  device: virtual audio routers (SteelSeries Sonar, Voicemeeter, …) split game audio
+  across multiple endpoints, and loopback of the wrong one captures silence.
 - A `DualSenseHapticsStreamer` owned by `DualSenseDevice` (BT mode): dedicated output
   thread pacing 0x32 reports; coordinate with the existing input-thread-driven 0x31 writes.
 - UI page + profile persistence, following existing options-store patterns
