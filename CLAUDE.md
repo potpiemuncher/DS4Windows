@@ -390,13 +390,39 @@ USB the real mic works natively, zero work; (b) a dedicated BT-host dongle
 (c) deep Windows work (filter driver / profile driver on HidBth's territory)
 — research-grade effort, unbounded.
 
+## FULL NATIVE EXPERIENCE VALIDATED IN-GAME (2026-07-19 ~14:10, build 7259568)
+
+Assassin's Creed Black Flag Resynced, physical pad on Bluetooth, main audio
+on the user's headset: raising the sail produced the sail sound FROM THE
+CONTROLLER SPEAKER simultaneously with game haptics and adaptive triggers —
+user verdict "its all working". Telemetry: game-authored ch1/2 speaker cues
+(peaks ~31%) co-active with ch3/4 haptics (peak 50.8%) relayed in shared
+0x36 reports, zero Bluetooth errors, zero speaker underruns during streams;
+the game engine cycles the playback pin per cue cluster and the
+silence-gated stream follows cleanly. Music listening on the same build:
+0 rebuffers / 0 drops / 0 errors, user "99%".
+
+Operational notes that MUST survive into the ergonomics work:
+- **Teardown = stop the server process.** `usbip detach` livelocks whenever
+  the audio engine still holds the playback pin (CLI may even print success
+  while URBs keep flowing); server stop (peer loss) unplugs cleanly — proven
+  ~8 times today, no stuck devnodes, no bugchecks.
+- Port numbers from `usbip attach` increment across cycles; never hardcode
+  `-p 1` (use `usbip port` first) if detach is ever needed.
+- A pad power-cycle wedges synchronous writes on the dead handle; the
+  fail-fast + CancelIoEx hardening (90c916c) keeps the session and any
+  detach from freezing. Serve must be restarted after the pad reconnects.
+- The pad idle-times-out on no USER input regardless of host traffic.
+
 ## Current Limitation
 
-The native-game haptic path and native speaker-audio relay are validated end
-to end (game haptics + adaptive triggers + controller speaker audio, all over
-Bluetooth). The microphone leg is blocked by Windows Bluetooth stack behavior
-(see above) — the virtual mic endpoint serves silence until a viable mic
-source exists. The DS4Windows in-app path still lacks mic for the same reason.
+Native input, adaptive triggers, haptics, and controller-speaker audio are
+all validated end to end over Bluetooth in a real game. The microphone leg
+is blocked by Windows Bluetooth stack behavior (see above) — the virtual mic
+endpoint serves silence until a viable mic source exists (wired passthrough
+or BT-host dongle hardware). The DS4Windows in-app path still lacks mic for
+the same reason. Next milestone: fold serve+attach into DS4Windows as a
+one-click "native DualSense mode" with auto-teardown (= stop the server).
 
 The primary PC previously bugchecked at 7:24 PM during removal of
 `USB\VID_054C&PID_0CE6\DS4WSPKM26001`. The minidump reports
