@@ -235,9 +235,12 @@ namespace DS4Windows
                 $"DS4Windows-NativeDualSenseAttach-{Guid.NewGuid():N}.xml");
             try
             {
+                // schtasks /Create /XML rejects UTF-8 task files with
+                // "(1,40): unable to switch the encoding" (observed live).
+                // Task Scheduler expects UTF-16, matching its own exports.
                 File.WriteAllText(taskXmlPath,
                     BuildAttachTaskXml(usbipPath, currentUserSid),
-                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+                    Encoding.Unicode);
                 NativeModeCommandResult result = await commandRunner.RunAsync(
                     schtasksPath, BuildCreateTaskArguments(taskXmlPath),
                     elevate: true, cancellationToken).ConfigureAwait(false);
@@ -350,7 +353,7 @@ namespace DS4Windows
                         new XElement(ns + "Exec",
                             new XElement(ns + "Command", Path.GetFullPath(usbipPath)),
                             new XElement(ns + "Arguments", AttachArguments)))));
-            return $"<?xml version=\"1.0\" encoding=\"utf-8\"?>{Environment.NewLine}" +
+            return $"<?xml version=\"1.0\" encoding=\"UTF-16\"?>{Environment.NewLine}" +
                 document.Root.ToString(SaveOptions.DisableFormatting);
         }
 

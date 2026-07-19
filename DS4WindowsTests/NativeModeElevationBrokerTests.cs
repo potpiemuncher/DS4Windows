@@ -12,8 +12,10 @@ public class NativeModeElevationBrokerTests
         string usbipPath = @"C:\Program Files\USBip & Tools\usbip.exe";
         string taskXml = NativeModeElevationBroker.BuildAttachTaskXml(
             usbipPath, "S-1-5-21-1-2-3-1001");
+        // Task Scheduler rejects UTF-8 task XML ("unable to switch the
+        // encoding"); the file must be written and declared as UTF-16.
         StringAssert.StartsWith(taskXml,
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>");
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?>");
         XDocument document = XDocument.Parse(taskXml);
         XNamespace ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
 

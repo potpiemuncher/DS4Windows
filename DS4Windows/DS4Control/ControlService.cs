@@ -2108,6 +2108,8 @@ namespace DS4Windows
                 var dualSense = (InputDevices.DualSenseDevice)device;
                 string[] serverArguments = BuildNativeModeServerArguments(
                     dualSense.NativeOptionsStore);
+                serverArguments = AppendFixturesArgumentIfPackaged(serverArguments,
+                    NativeModeManager.LocateServerExecutable(), File.Exists);
                 NativeModeAttachResult attachFailure = null;
                 DS4Devices.BeginNativeModeSuppression(macAddress, devicePath);
 
@@ -2183,6 +2185,35 @@ namespace DS4Windows
                 "--speaker-audio", options.NativeModeSpeakerAudio ? "on" : "off",
                 "--route", options.NativeModeRoute.ToString().ToLowerInvariant(),
             };
+        }
+
+        /// <summary>
+        /// The packaged server cannot find the captured USB descriptor fixtures
+        /// by its development-layout relative path (observed live: the child
+        /// crashed with FileNotFoundException and the game fell back to the
+        /// X360 mapping). When the fixtures ship beside the located server
+        /// executable, pass them explicitly; otherwise leave the development
+        /// default in place.
+        /// </summary>
+        internal static string[] AppendFixturesArgumentIfPackaged(string[] arguments,
+            string serverExecutablePath, Func<string, bool> fileExists)
+        {
+            if (arguments == null)
+                throw new ArgumentNullException(nameof(arguments));
+            if (string.IsNullOrEmpty(serverExecutablePath))
+                return arguments;
+
+            string fixturesDirectory = Path.Combine(
+                Path.GetDirectoryName(serverExecutablePath) ?? string.Empty,
+                "fixtures", "dualsense_usb_0ce6");
+            if (!fileExists(Path.Combine(fixturesDirectory, "device.bin")))
+                return arguments;
+
+            string[] augmented = new string[arguments.Length + 2];
+            arguments.CopyTo(augmented, 0);
+            augmented[arguments.Length] = "--fixtures";
+            augmented[arguments.Length + 1] = fixturesDirectory;
+            return augmented;
         }
 
         public Task<NativeModeAttachResult> EnsureNativeModeAttachTaskAsync(

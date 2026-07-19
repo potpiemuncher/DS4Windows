@@ -109,4 +109,37 @@ public class NativeModeSettingsTests
         Assert.AreEqual(expected,
             DualSenseControllerOptionsWrapper.StatusForState(state, null));
     }
+
+    [TestMethod]
+    public void AppendFixturesArgument_AddsPackagedFixturesBesideServer()
+    {
+        string[] baseArguments = { "serve", "--configuration", "composite" };
+        string serverPath = @"C:\Apps\DS4Windows\native\VirtualDualSenseUsbip.exe";
+        string expectedFixtures = @"C:\Apps\DS4Windows\native\fixtures\dualsense_usb_0ce6";
+
+        string[] augmented = ControlService.AppendFixturesArgumentIfPackaged(
+            baseArguments, serverPath,
+            path => path == Path.Combine(expectedFixtures, "device.bin"));
+
+        CollectionAssert.AreEqual(
+            new[]
+            {
+                "serve", "--configuration", "composite",
+                "--fixtures", expectedFixtures,
+            },
+            augmented);
+    }
+
+    [TestMethod]
+    public void AppendFixturesArgument_LeavesDevelopmentLayoutUntouched()
+    {
+        string[] baseArguments = { "serve" };
+
+        string[] untouched = ControlService.AppendFixturesArgumentIfPackaged(
+            baseArguments,
+            @"C:\repo\utils\VirtualDualSenseUsbip\bin\Release\net8.0\VirtualDualSenseUsbip.exe",
+            _ => false);
+
+        Assert.AreSame(baseArguments, untouched);
+    }
 }

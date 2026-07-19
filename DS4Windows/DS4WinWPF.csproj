@@ -423,10 +423,21 @@
 		<ItemGroup Condition="Exists('$(NativeDualSensePublishDir)\VirtualDualSenseUsbip.exe')">
 			<NativeDualSensePublishFiles Include="$(NativeDualSensePublishDir)\**\*" />
 		</ItemGroup>
+		<!-- The server resolves its captured-descriptor fixtures relative to its
+		     own directory only in the development layout; the packaged copy must
+		     ship them and DS4Windows passes the fixtures argument explicitly. -->
+		<ItemGroup>
+			<NativeDualSenseFixtureFiles
+				Include="$(MSBuildProjectDirectory)\..\utils\DSCompatProbe\fixtures\dualsense_usb_0ce6\**\*" />
+		</ItemGroup>
 		<Warning Condition="!Exists('$(NativeDualSensePublishDir)\VirtualDualSenseUsbip.exe')"
 			Text="Native DualSense server staging output was not found at '$(NativeDualSensePublishDir)'. DS4Windows will build without native-mode packaged files." />
 		<Copy SourceFiles="@(NativeDualSensePublishFiles)"
 			DestinationFiles="@(NativeDualSensePublishFiles->'$(TargetDir)native\%(RecursiveDir)%(Filename)%(Extension)')"
+			SkipUnchangedFiles="true"
+			Condition="'@(NativeDualSensePublishFiles)' != ''" />
+		<Copy SourceFiles="@(NativeDualSenseFixtureFiles)"
+			DestinationFiles="@(NativeDualSenseFixtureFiles->'$(TargetDir)native\fixtures\dualsense_usb_0ce6\%(RecursiveDir)%(Filename)%(Extension)')"
 			SkipUnchangedFiles="true"
 			Condition="'@(NativeDualSensePublishFiles)' != ''" />
 	</Target>
