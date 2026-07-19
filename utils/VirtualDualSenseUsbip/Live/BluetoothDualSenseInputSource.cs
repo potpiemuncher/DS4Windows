@@ -857,7 +857,17 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                 {
                     Thread.SpinWait(80);
                 }
-                if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > 100)
+                // After a stall (GC pause, scheduler hiccup), haptics-only
+                // streaming catches up back-to-back: the controller's dejitter
+                // buffer absorbs the burst and rumble timing recovers. With
+                // listening audio, bursting instead drains the local Opus
+                // queue in one gulp (each overdue slot dequeues a frame) while
+                // the pad's ~341 ms buffer already bridged the pause — so skip
+                // the missed slots beyond two and stay aligned.
+                double resyncThresholdMs = audioSession
+                    ? HapticReportPeriodMs * 2
+                    : 100.0;
+                if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > resyncThresholdMs)
                 {
                     nextDeadlineMs = clock.Elapsed.TotalMilliseconds;
                 }
