@@ -226,7 +226,18 @@ internal sealed class UsbIpDeviceSession
     private const uint HidInterruptOutEndpoint = 3;
     private const uint HidInterruptInEndpoint = 4;
     private const int MaxPendingIsochronousTransfers = 64;
+    private const int MaxPendingIsochronousInTransfers = 32;
+    private const int MaxPendingIsochronousTotal = 96;
     private const int ConnectionReset = -104; // -ECONNRESET
+
+    // 48 kHz stereo signed 16-bit capture: one USB frame of audio per packet.
+    private const int MicrophoneNominalPacketBytes = 192;
+
+    // UAC feature-unit entity ids from the captured configuration: 2 sits in
+    // the playback path (IT1 -> FU2 -> OT3), 5 in the capture path
+    // (IT4 -> FU5 -> OT6).
+    private const byte PlaybackFeatureUnit = 2;
+    private const byte CaptureFeatureUnit = 5;
 
     private readonly Stream stream;
     private readonly SerializedStreamWriter writer;
@@ -237,11 +248,17 @@ internal sealed class UsbIpDeviceSession
     private readonly Action<IsochronousOutCapture> captureIsochronousOut;
     private readonly Action<string> log;
     private readonly IReadOnlyDictionary<uint, UsbEndpointDescriptorInfo> isochronousOutEndpoints;
+    private readonly IReadOnlyDictionary<uint, UsbEndpointDescriptorInfo> isochronousInEndpoints;
+    private readonly IUsbAudioRelay? audioRelay;
     private readonly ConcurrentDictionary<uint, PendingTransfer> pendingInput = new();
     private readonly ConcurrentQueue<uint> pendingInputOrder = new();
     private readonly ConcurrentDictionary<uint, PendingTransfer> pendingIsochronous = new();
     private readonly ConcurrentQueue<uint> pendingIsochronousOrder = new();
     private readonly SemaphoreSlim pendingIsochronousSignal = new(0);
+    private readonly ConcurrentDictionary<uint, PendingTransfer> pendingIsochronousIn = new();
+    private readonly ConcurrentQueue<uint> pendingIsochronousInOrder = new();
+    private readonly SemaphoreSlim pendingIsochronousInSignal = new(0);
+    private int pendingIsochronousInHighWater;
 
     public UsbIpDeviceSession(Stream stream, SerializedStreamWriter writer,
         DescriptorSet descriptors, FeatureReportSet featureReports,
@@ -253,8 +270,6 @@ internal sealed class UsbIpDeviceSession
         this.stream = stream;
         this.writer = writer;
         controlEndpoint = new ControlEndpoint(descriptors, featureReports);
-        controlEndpoint.InterfaceAltChanged += (interfaceNumber, alternateSetting) =>
-            log($"SET_INTERFACE interface {interfaceNumber} alt {alternateSetting}.");
         this.inputReports = inputReports;
         this.inputInterval = inputInterval;
         this.captureOutput = captureOutput;
@@ -264,6 +279,47 @@ internal sealed class UsbIpDeviceSession
             .Where(endpoint => (endpoint.Address & 0x80) == 0 &&
                 (endpoint.Attributes & 0x03) == 0x01)
             .ToDictionary(endpoint => (uint)(endpoint.Address & 0x0F));
+        isochronousInEndpoints = descriptors.Endpoints
+            .Where(endpoint => (endpoint.Address & 0x80) != 0 &&
+                (endpoint.Attributes & 0x03) == 0x01)
+            .ToDictionary(endpoint => (uint)(endpoint.Address & 0x0F));
+        audioRelay = inputReports as IUsbAudioRelay;
+
+        HashSet<byte> playbackInterfaces = isochronousOutEndpoints.Values
+            .Select(endpoint => endpoint.InterfaceNumber).ToHashSet();
+        HashSet<byte> captureInterfaces = isochronousInEndpoints.Values
+            .Select(endpoint => endpoint.InterfaceNumber).ToHashSet();
+        controlEndpoint.InterfaceAltChanged += (interfaceNumber, alternateSetting) =>
+        {
+            log($"SET_INTERFACE interface {interfaceNumber} alt {alternateSetting}.");
+            if (audioRelay == null)
+            {
+                return;
+            }
+            if (playbackInterfaces.Contains(interfaceNumber))
+            {
+                audioRelay.SetPlaybackInterfaceActive(alternateSetting != 0);
+            }
+            if (captureInterfaces.Contains(interfaceNumber))
+            {
+                audioRelay.SetCaptureInterfaceActive(alternateSetting != 0);
+            }
+        };
+        controlEndpoint.AudioScaleChanged += (entityId, scale) =>
+        {
+            if (audioRelay == null)
+            {
+                return;
+            }
+            if (entityId == PlaybackFeatureUnit)
+            {
+                audioRelay.SetPlaybackVolume(scale);
+            }
+            else if (entityId == CaptureFeatureUnit)
+            {
+                audioRelay.SetCaptureVolume(scale);
+            }
+        };
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -271,6 +327,7 @@ internal sealed class UsbIpDeviceSession
         using var sessionCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         Task inputPump = PumpInterruptInputAsync(sessionCancellation.Token);
         Task isochronousPump = PumpIsochronousCompletionsAsync(sessionCancellation.Token);
+        Task isochronousInPump = PumpIsochronousInCompletionsAsync(sessionCancellation.Token);
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -290,7 +347,7 @@ internal sealed class UsbIpDeviceSession
         finally
         {
             sessionCancellation.Cancel();
-            foreach (Task pump in new[] { inputPump, isochronousPump })
+            foreach (Task pump in new[] { inputPump, isochronousPump, isochronousInPump })
             {
                 try
                 {
@@ -299,6 +356,16 @@ internal sealed class UsbIpDeviceSession
                 catch (OperationCanceledException) when (sessionCancellation.IsCancellationRequested)
                 {
                 }
+            }
+
+            // The URB session is over: release the physical controller's audio
+            // paths so the microphone and the continuous 0x36 stream never
+            // outlive a detach or a dropped connection.
+            audioRelay?.SetPlaybackInterfaceActive(false);
+            audioRelay?.SetCaptureInterfaceActive(false);
+            if (pendingIsochronousInHighWater > 0)
+            {
+                log($"ISO IN pending high-water mark: {pendingIsochronousInHighWater}.");
             }
         }
     }
@@ -355,18 +422,24 @@ internal sealed class UsbIpDeviceSession
     private async Task HandleIsochronousAsync(UsbIpSubmit submit,
         CancellationToken cancellationToken)
     {
+        bool isInput = submit.Basic.Direction == UsbIpConstants.DirectionIn;
         UsbEndpointDescriptorInfo? endpoint = null;
-        bool knownPlaybackEndpoint = submit.Basic.Direction == UsbIpConstants.DirectionOut &&
-            isochronousOutEndpoints.TryGetValue(submit.Basic.Endpoint, out endpoint);
-        bool activeAlternateSetting = knownPlaybackEndpoint && endpoint != null &&
+        bool knownEndpoint = isInput
+            ? isochronousInEndpoints.TryGetValue(submit.Basic.Endpoint, out endpoint)
+            : submit.Basic.Direction == UsbIpConstants.DirectionOut &&
+              isochronousOutEndpoints.TryGetValue(submit.Basic.Endpoint, out endpoint);
+        bool activeAlternateSetting = knownEndpoint && endpoint != null &&
             controlEndpoint.GetAltSetting(endpoint.InterfaceNumber) == endpoint.AlternateSetting;
-        bool validPacketSizes = knownPlaybackEndpoint && endpoint != null &&
+        bool validPacketSizes = knownEndpoint && endpoint != null &&
             submit.IsoPackets.All(packet => packet.Length <= endpoint.MaxPacketSize);
         long describedLength = submit.IsoPackets.Sum(packet => (long)packet.Length);
-        bool validPayload = describedLength == submit.TransferBuffer.Length &&
-            submit.TransferBuffer.Length == submit.TransferBufferLength;
+        bool validPayload = isInput
+            ? submit.TransferBuffer.Length == 0 &&
+              describedLength == submit.TransferBufferLength
+            : describedLength == submit.TransferBuffer.Length &&
+              submit.TransferBuffer.Length == submit.TransferBufferLength;
 
-        if (!knownPlaybackEndpoint || !activeAlternateSetting || !validPacketSizes || !validPayload)
+        if (!knownEndpoint || !activeAlternateSetting || !validPacketSizes || !validPayload)
         {
             log($"Rejecting ISO seq {submit.Basic.SequenceNumber}: endpoint={submit.Basic.Endpoint}, " +
                 $"direction={submit.Basic.Direction}, packets={submit.NumberOfPackets}, " +
@@ -377,7 +450,27 @@ internal sealed class UsbIpDeviceSession
             return;
         }
 
+        if (isInput)
+        {
+            if (pendingIsochronousIn.Count >= MaxPendingIsochronousInTransfers ||
+                pendingIsochronousIn.Count + pendingIsochronous.Count >= MaxPendingIsochronousTotal ||
+                !pendingIsochronousIn.TryAdd(submit.Basic.SequenceNumber, new PendingTransfer(submit)))
+            {
+                log($"Rejecting ISO IN seq {submit.Basic.SequenceNumber}: pending queue limit or duplicate.");
+                await ReplyIsochronousAsync(submit, ControlResult.Stall, successful: false,
+                    cancellationToken);
+                return;
+            }
+
+            pendingIsochronousInHighWater = Math.Max(pendingIsochronousInHighWater,
+                pendingIsochronousIn.Count);
+            pendingIsochronousInOrder.Enqueue(submit.Basic.SequenceNumber);
+            pendingIsochronousInSignal.Release();
+            return;
+        }
+
         if (pendingIsochronous.Count >= MaxPendingIsochronousTransfers ||
+            pendingIsochronous.Count + pendingIsochronousIn.Count >= MaxPendingIsochronousTotal ||
             !pendingIsochronous.TryAdd(submit.Basic.SequenceNumber, new PendingTransfer(submit)))
         {
             log($"Rejecting ISO seq {submit.Basic.SequenceNumber}: pending queue limit or duplicate.");
@@ -444,6 +537,11 @@ internal sealed class UsbIpDeviceSession
         if (status == 0)
         {
             status = await UnlinkPendingAsync(pendingIsochronous, unlink.UnlinkSequenceNumber,
+                cancellationToken);
+        }
+        if (status == 0)
+        {
+            status = await UnlinkPendingAsync(pendingIsochronousIn, unlink.UnlinkSequenceNumber,
                 cancellationToken);
         }
         await writer.WriteAsync(
@@ -568,6 +666,114 @@ internal sealed class UsbIpDeviceSession
             // next URB adds its own packet duration and never bursts to catch up.
             nextCompletionTimestamp = Math.Max(completionTimestamp, now);
         }
+    }
+
+    /// <summary>
+    /// Completes isochronous IN transfers (the microphone endpoint) on one
+    /// ordered, monotonically advancing packet timeline, exactly like the OUT
+    /// pump: each URB completes after its packets' real duration, so queued
+    /// URBs can never burst-complete. Packet data comes from the audio relay
+    /// when it has microphone PCM and is silence otherwise — the capture
+    /// cadence never waits on Bluetooth.
+    /// </summary>
+    private async Task PumpIsochronousInCompletionsAsync(CancellationToken cancellationToken)
+    {
+        long nextCompletionTimestamp = 0;
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await pendingIsochronousInSignal.WaitAsync(cancellationToken);
+
+            PendingTransfer? pending = null;
+            while (pendingIsochronousInOrder.TryDequeue(out uint sequence))
+            {
+                if (pendingIsochronousIn.TryGetValue(sequence, out pending))
+                {
+                    break;
+                }
+            }
+            if (pending == null)
+            {
+                continue;
+            }
+
+            UsbIpSubmit submit = pending.Submit;
+            UsbEndpointDescriptorInfo endpoint = isochronousInEndpoints[submit.Basic.Endpoint];
+            long durationTicks = IsochronousDurationTicks(endpoint.Interval,
+                submit.NumberOfPackets);
+            long now = Stopwatch.GetTimestamp();
+            long completionTimestamp = checked(
+                Math.Max(nextCompletionTimestamp, now) + durationTicks);
+
+            await DelayUntilAsync(completionTimestamp, cancellationToken);
+            if (!pending.TryBeginCompletion())
+            {
+                continue;
+            }
+
+            try
+            {
+                await ReplyIsochronousInAsync(submit, cancellationToken);
+                pending.Complete();
+            }
+            catch (Exception ex)
+            {
+                pending.Fail(ex);
+                throw;
+            }
+            finally
+            {
+                pendingIsochronousIn.TryRemove(submit.Basic.SequenceNumber, out _);
+            }
+
+            now = Stopwatch.GetTimestamp();
+            // Store the last completion point, not the following deadline. The
+            // next URB adds its own packet duration and never bursts to catch up.
+            nextCompletionTimestamp = Math.Max(completionTimestamp, now);
+        }
+    }
+
+    /// <summary>
+    /// Builds the successful RET_SUBMIT for an isochronous IN URB. Per the
+    /// USB/IP protocol, IN data is sent compactly — each packet's actual bytes
+    /// concatenated with no inter-packet padding — followed by the descriptors,
+    /// whose offsets/lengths are echoed and only actual_length is set.
+    /// </summary>
+    private ValueTask ReplyIsochronousInAsync(UsbIpSubmit submit,
+        CancellationToken cancellationToken)
+    {
+        int packetCount = submit.IsoPackets.Count;
+        byte[] data = new byte[submit.TransferBufferLength];
+        var packets = new UsbIpIsoPacket[packetCount];
+        int filled = 0;
+        for (int i = 0; i < packetCount; i++)
+        {
+            UsbIpIsoPacket packet = submit.IsoPackets[i];
+            int capacity = (int)Math.Min(packet.Length, (uint)(data.Length - filled));
+            int written = 0;
+            if (capacity > 0)
+            {
+                int nominal = Math.Min(MicrophoneNominalPacketBytes, capacity);
+                written = audioRelay?.FillMicrophonePacket(
+                    data.AsSpan(filled, capacity), nominal) ?? 0;
+                if (written <= 0)
+                {
+                    written = nominal; // buffer is already zeroed: silence
+                }
+            }
+            packets[i] = packet with { ActualLength = (uint)written, Status = 0 };
+            filled += written;
+        }
+
+        var reply = new UsbIpSubmitReply(
+            submit.Basic.SequenceNumber,
+            Status: 0,
+            filled,
+            submit.StartFrame,
+            packetCount,
+            ErrorCount: 0,
+            data.AsSpan(0, filled).ToArray(),
+            packets);
+        return writer.WriteAsync(UsbIpCodec.Encode(reply), cancellationToken);
     }
 
     private static long IsochronousDurationTicks(byte endpointInterval, int packetCount)

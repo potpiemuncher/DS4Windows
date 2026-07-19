@@ -50,6 +50,15 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
     string? capturePath = GetOption(args, "--capture");
     string inputMode = GetOption(args, "--input") ?? "neutral";
     string configurationMode = GetOption(args, "--configuration") ?? "hid";
+    bool speakerAudio = ParseOnOff(GetOption(args, "--speaker-audio"), defaultValue: false);
+    bool microphone = ParseOnOff(GetOption(args, "--mic"), defaultValue: false);
+    SpeakerAudioRoute audioRoute = (GetOption(args, "--route") ?? "auto").ToLowerInvariant() switch
+    {
+        "auto" => SpeakerAudioRoute.Auto,
+        "speaker" => SpeakerAudioRoute.Speaker,
+        "headphone" => SpeakerAudioRoute.Headphone,
+        _ => throw new ArgumentException("--route must be 'auto', 'speaker', or 'headphone'."),
+    };
     string suggestedSerial = configurationMode.Equals("composite", StringComparison.OrdinalIgnoreCase)
         ? "DS4WSPKCOMP001"
         : "DS4WSPKHID001";
@@ -62,10 +71,16 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
         "composite" => DescriptorSet.LoadFromFixtures(fullFixturesPath),
         _ => throw new ArgumentException("--configuration must be 'hid' or 'composite'."),
     };
+    if ((speakerAudio || microphone) &&
+        !inputMode.Equals("bluetooth", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new ArgumentException("--speaker-audio/--mic require --input bluetooth.");
+    }
     using BluetoothDualSenseInputSource? bluetoothInput =
         inputMode.Equals("bluetooth", StringComparison.OrdinalIgnoreCase)
             ? BluetoothDualSenseInputSource.Open(
-                message => Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {message}"))
+                message => Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {message}"),
+                new BluetoothAudioOptions(speakerAudio, microphone, audioRoute))
             : inputMode.Equals("neutral", StringComparison.OrdinalIgnoreCase)
                 ? null
                 : throw new ArgumentException("--input must be 'neutral' or 'bluetooth'.");
@@ -249,7 +264,12 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
                 : $" bt36={bluetoothInput.RelayedHapticReportCount} " +
                   $"btq={bluetoothInput.HapticQueueBytes} " +
                   $"bt-underrun={bluetoothInput.HapticUnderrunCount} " +
-                  $"bt-errors={bluetoothInput.HapticWriteErrorCount}";
+                  $"bt-errors={bluetoothInput.HapticWriteErrorCount}" +
+                  (bluetoothInput.RelayedAudioReportCount > 0
+                      ? $" bt-audio={bluetoothInput.RelayedAudioReportCount} " +
+                        $"spkq={bluetoothInput.SpeakerQueueFrames} " +
+                        $"spk-underrun={bluetoothInput.SpeakerUnderrunCount}"
+                      : string.Empty);
             Console.WriteLine($"{capture.Timestamp.ToLocalTime():HH:mm:ss.fff} ISO OUT " +
                 $"total={count} seq={capture.SequenceNumber} ep={capture.Endpoint} " +
                 $"{rate} " +
@@ -268,10 +288,58 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
     };
     Console.CancelKeyPress += cancelHandler;
 
+    Task? audioStats = null;
+    if (bluetoothInput != null && (speakerAudio || microphone))
+    {
+        audioStats = Task.Run(async () =>
+        {
+            long lastAudio = 0;
+            long lastMicBytes = 0;
+            while (!cancellation.Token.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5), cancellation.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+
+                long audio = bluetoothInput.RelayedAudioReportCount;
+                long micBytes = bluetoothInput.MicrophoneDeliveredBytes;
+                bool audioActive = audio != lastAudio;
+                bool micActive = bluetoothInput.CaptureInterfaceActive || micBytes != lastMicBytes;
+                lastAudio = audio;
+                lastMicBytes = micBytes;
+                if (!audioActive && !micActive)
+                {
+                    continue;
+                }
+
+                Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} AUDIO " +
+                    $"bt-audio={audio} spkq={bluetoothInput.SpeakerQueueFrames} " +
+                    $"spk-underrun={bluetoothInput.SpeakerUnderrunCount} " +
+                    $"mic-rep={bluetoothInput.MicrophoneReportCount} " +
+                    $"mic-rate={bluetoothInput.MicrophoneRateDecision} " +
+                    $"micq={bluetoothInput.MicrophoneQueueFrames} " +
+                    $"mic-underrun={bluetoothInput.MicrophoneUnderrunCount} " +
+                    $"mic-KiB={micBytes / 1024.0:0.0} " +
+                    $"mic-decode-err={bluetoothInput.MicrophoneDecodeErrorCount} " +
+                    $"bt-errors={bluetoothInput.HapticWriteErrorCount}");
+            }
+        });
+    }
+
     try
     {
         server.Start();
         Console.WriteLine($"Virtual DualSense ({configurationMode} configuration) is ready for usbip-win2.");
+        if (speakerAudio || microphone)
+        {
+            Console.WriteLine($"Audio relay: speaker={(speakerAudio ? "on" : "off")} " +
+                $"mic={(microphone ? "on" : "off")} route={audioRoute.ToString().ToLowerInvariant()}");
+        }
         Console.WriteLine($"Attach from an elevated terminal:");
         Console.WriteLine($"  usbip attach -r 127.0.0.1 -b {busId} --serial {suggestedSerial} --once");
         await server.RunAsync(cancellation.Token);
@@ -279,6 +347,11 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
     finally
     {
         Console.CancelKeyPress -= cancelHandler;
+        if (audioStats != null)
+        {
+            cancellation.Cancel();
+            await audioStats;
+        }
         captureWriter?.Dispose();
     }
     return;
@@ -291,6 +364,7 @@ Console.WriteLine("  servertest [fixtures] exercise the live server over loopbac
 Console.WriteLine("  inputtest [seconds]   validate physical BT input and USB report conversion");
 Console.WriteLine("  serve [--fixtures DIR] [--port 3240] [--busid 1-1] [--capture FILE]");
 Console.WriteLine("        [--input neutral|bluetooth] [--configuration hid|composite]");
+Console.WriteLine("        [--speaker-audio on|off] [--mic on|off] [--route auto|speaker|headphone]");
 
 static string DefaultFixturesPath() => Path.Combine(AppContext.BaseDirectory,
     "..", "..", "..", "..", "DSCompatProbe", "fixtures", "dualsense_usb_0ce6");
@@ -310,6 +384,20 @@ static string? GetOption(string[] arguments, string name)
         return arguments[i + 1];
     }
     return null;
+}
+
+static bool ParseOnOff(string? value, bool defaultValue)
+{
+    if (value == null)
+    {
+        return defaultValue;
+    }
+    return value.ToLowerInvariant() switch
+    {
+        "on" or "true" or "1" => true,
+        "off" or "false" or "0" => false,
+        _ => throw new ArgumentException($"Expected 'on' or 'off', got '{value}'."),
+    };
 }
 
 static int ParsePort(string? value)

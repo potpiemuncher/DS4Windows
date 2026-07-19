@@ -8,6 +8,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Concentus" Version="2.2.2" />
     <PackageReference Include="HidSharp" Version="2.1.0" />
+    <!-- Concentus asks for System.Memory 4.5.4; pin the cached 4.5.5 so the
+         approximate-match warning (NU1603) cannot fail the warnings-as-errors build. -->
+    <PackageReference Include="System.Memory" Version="4.5.5" />
   </ItemGroup>
 </Project>

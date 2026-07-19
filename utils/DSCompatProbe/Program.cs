@@ -67,6 +67,16 @@ internal static class Program
             return AudioEndpointMeter.Run(args.Skip(1).ToArray());
         }
 
+        if (args.Length > 0 && args[0].Equals("playtone", StringComparison.OrdinalIgnoreCase))
+        {
+            return AudioEndpointExerciser.RunPlayTone(args.Skip(1).ToArray());
+        }
+
+        if (args.Length > 0 && args[0].Equals("recordmic", StringComparison.OrdinalIgnoreCase))
+        {
+            return AudioEndpointExerciser.RunRecordMicrophone(args.Skip(1).ToArray());
+        }
+
         string outDir = Path.Combine(AppContext.BaseDirectory, "probe_runs",
             DateTime.UtcNow.ToString("yyyyMMdd_HHmmss"));
         Directory.CreateDirectory(outDir);

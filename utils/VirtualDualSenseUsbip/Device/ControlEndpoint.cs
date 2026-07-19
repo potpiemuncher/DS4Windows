@@ -24,6 +24,12 @@ public sealed class ControlEndpoint
     /// isochronous streaming alt setting. (interface, altSetting).</summary>
     public event Action<byte, byte>? InterfaceAltChanged;
 
+    /// <summary>Raised when the host changes an audio feature unit's mute or
+    /// volume. Reports the combined result as (entityId, linearScale) where
+    /// linearScale is 0 while muted and otherwise 10^(dB/20) for the
+    /// UAC1 volume in 1/256 dB units.</summary>
+    public event Action<byte, float>? AudioScaleChanged;
+
     public ControlEndpoint(DescriptorSet descriptors, FeatureReportSet? featureReports = null)
     {
         this.descriptors = descriptors;
@@ -174,6 +180,7 @@ public sealed class ControlEndpoint
             if (setup.Request == SetCurrent && !setup.DeviceToHost && outData.Length >= 1)
             {
                 audioMuteStates[entityId] = (byte)(outData[0] & 0x01);
+                NotifyAudioScale(entityId);
                 return ControlResult.Ack();
             }
         }
@@ -201,11 +208,27 @@ public sealed class ControlEndpoint
             if (setup.Request == SetCurrent && !setup.DeviceToHost && outData.Length >= 2)
             {
                 audioVolumeStates[entityId] = unchecked((short)(outData[0] | (outData[1] << 8)));
+                NotifyAudioScale(entityId);
                 return ControlResult.Ack();
             }
         }
 
         return ControlResult.Stalled();
+    }
+
+    private void NotifyAudioScale(byte entityId)
+    {
+        float scale;
+        if (audioMuteStates.GetValueOrDefault(entityId) != 0)
+        {
+            scale = 0f;
+        }
+        else
+        {
+            double decibels = audioVolumeStates.GetValueOrDefault(entityId) / 256.0;
+            scale = (float)Math.Clamp(Math.Pow(10.0, decibels / 20.0), 0.0, 1.0);
+        }
+        AudioScaleChanged?.Invoke(entityId, scale);
     }
 
     private static ControlResult AudioVolumeResult(short volume) =>
