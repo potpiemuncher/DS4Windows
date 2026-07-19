@@ -156,6 +156,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     private int amplifierInitialized;
     private int bluetoothLinkDead;
     private long lastSpeakerEnergyTimestamp;
+    private long lastSpeakerRebufferTimestamp;
     private int unknownInputFlagLogged;
     private readonly byte[] silenceOpusFrame = new byte[OpusFrameBytes];
 
@@ -846,9 +847,14 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                 double pacingScale = 1.0;
                 if (audioSession)
                 {
-                    double bufferedFrames = speakerFrames!.Count +
-                        speakerPcm!.Count / (double)(OpusSamplesPerFrame * 2);
-                    double levelError = bufferedFrames - (SpeakerPrebufferFrames + 1);
+                    // Servo on the ENCODED queue, not queue+ring: only whole
+                    // encoded frames can be dequeued, so ring residue is dead
+                    // weight against a delivery bunch. Live telemetry showed a
+                    // total-level target parking the queue at 2-3 frames while
+                    // arrival gaps reached ~26 ms — one dry-out every few
+                    // seconds. Holding ~5 encoded frames (~53 ms) rides the
+                    // observed worst-case bunching.
+                    double levelError = speakerFrames!.Count - (SpeakerPrebufferFrames + 1);
                     pacingScale = 1.0 - Math.Clamp(levelError * SpeakerPacingGainPerFrame,
                         -SpeakerPacingLimit, SpeakerPacingLimit);
                 }
@@ -923,7 +929,13 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                         if (audioPrimed)
                         {
                             audioPrimed = false; // ran dry: rebuffer before resuming
-                            Interlocked.Increment(ref speakerUnderrunCount);
+                            long rebuffers = Interlocked.Increment(ref speakerUnderrunCount);
+                            double sinceLastMs = (Stopwatch.GetTimestamp() -
+                                lastSpeakerRebufferTimestamp) * 1000.0 / Stopwatch.Frequency;
+                            lastSpeakerRebufferTimestamp = Stopwatch.GetTimestamp();
+                            log($"Speaker rebuffer #{rebuffers}: ring={speakerPcm!.Count} samples, " +
+                                $"iso-age={IsochronousOutAgeMs():0.0} ms, " +
+                                $"since-last={sinceLastMs:0.0} ms.");
                         }
                         // Encode silence through the live encoder so the
                         // controller-side Opus decoder state stays continuous.
