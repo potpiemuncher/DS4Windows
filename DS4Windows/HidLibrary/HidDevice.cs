@@ -33,6 +33,7 @@ namespace DS4Windows
         private SafeFileHandle safeReadHandle;
         private bool isOpen;
         private bool isExclusive;
+        private readonly object outputReportWriteLock = new object();
         private const string BLANK_SERIAL = "00:00:00:00:00:00";
 
         internal HidDevice(string devicePath, string description = null, string parentPath = null)
@@ -191,6 +192,20 @@ namespace DS4Windows
 
         public unsafe bool WriteOutputReportViaInterrupt(byte[] outputBuffer, int timeout)
         {
+            return WriteOutputReportViaInterrupt(outputBuffer, timeout, out _);
+        }
+
+        public unsafe bool WriteOutputReportViaInterrupt(byte[] outputBuffer, int timeout,
+            out int win32Error)
+        {
+            // A DualSense has several independent producers (normal 0x31 state,
+            // streamed 0x36 haptics/audio, and amplifier setup). Windows allows
+            // overlapped I/O on the handle, but the Bluetooth HID output endpoint
+            // is a single ordered byte stream. Keep only one output write in flight
+            // so producers cannot race each other's reports.
+            lock (outputReportWriteLock)
+            {
+                win32Error = 0;
                 SafeReadHandle ??= OpenHandle(_devicePath, true, false);
                 using AutoResetEvent wait = new(false);
                 var ov = new NativeOverlapped { EventHandle = wait.SafeWaitHandle.DangerousGetHandle() };
@@ -198,12 +213,34 @@ namespace DS4Windows
                 if (PInvoke.WriteFile(SafeReadHandle, outputBuffer, null, &ov))
                     return true;
 
-                if (Marshal.GetLastWin32Error() != (uint)WIN32_ERROR.ERROR_IO_PENDING) return false;
-
-                if (!PInvoke.GetOverlappedResult(SafeReadHandle, ov, out _, true))
+                int error = Marshal.GetLastWin32Error();
+                if (error != (int)WIN32_ERROR.ERROR_IO_PENDING)
+                {
+                    win32Error = error;
                     return false;
+                }
+
+                uint waitTimeout = timeout < 0 ? uint.MaxValue : (uint)timeout;
+                if (!PInvoke.GetOverlappedResultEx(SafeReadHandle, ov, out _, waitTimeout, false))
+                {
+                    int resultError = Marshal.GetLastWin32Error();
+                    if (resultError == NativeMethods.WAIT_TIMEOUT)
+                    {
+                        // The NativeOverlapped and its event are stack-scoped, so
+                        // cancel this exact request and drain its completion before
+                        // either can be released. Never cancel the input read that
+                        // shares this HID handle.
+                        NativeMethods.CancelIoEx(SafeReadHandle.DangerousGetHandle(),
+                            (IntPtr)(&ov));
+                        PInvoke.GetOverlappedResult(SafeReadHandle, ov, out _, true);
+                    }
+
+                    win32Error = resultError;
+                    return false;
+                }
 
                 return true;
+            }
         }
 
         private SafeFileHandle OpenHandle(string devicePathName, bool isExclusive, bool enumerate)

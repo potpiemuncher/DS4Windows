@@ -146,6 +146,7 @@ namespace DS4Windows.InputDevices
 
         private readonly object stateLock = new object();
         private Thread streamThread;
+        private CancellationTokenSource streamCancellation;
         private volatile bool running;
 
         private DualSenseControllerOptions.HapticsMode mode =
@@ -233,8 +234,10 @@ namespace DS4Windows.InputDevices
 
         private void StartLocked()
         {
+            CancellationTokenSource cancellationSource = new CancellationTokenSource();
+            streamCancellation = cancellationSource;
             running = true;
-            streamThread = new Thread(StreamLoop)
+            streamThread = new Thread(() => StreamLoop(cancellationSource))
             {
                 Priority = ThreadPriority.AboveNormal,
                 IsBackground = true,
@@ -247,18 +250,30 @@ namespace DS4Windows.InputDevices
 
         private void StopLocked()
         {
+            CancellationTokenSource cancellationSource = streamCancellation;
+            Thread thread = streamThread;
+
             running = false;
-            if (streamThread != null && streamThread.IsAlive &&
-                streamThread != Thread.CurrentThread)
+            cancellationSource?.Cancel();
+            if (thread != null && thread.IsAlive && thread != Thread.CurrentThread)
             {
-                streamThread.Join(500);
+                thread.Join(500);
             }
 
-            streamThread = null;
+            if (ReferenceEquals(streamThread, thread))
+            {
+                streamThread = null;
+            }
+
+            if (ReferenceEquals(streamCancellation, cancellationSource))
+            {
+                streamCancellation = null;
+            }
         }
 
-        private void StreamLoop()
+        private void StreamLoop(CancellationTokenSource cancellationSource)
         {
+            CancellationToken cancellationToken = cancellationSource.Token;
             bool captureForHaptics = mode == DualSenseControllerOptions.HapticsMode.SystemAudio ||
                                      mode == DualSenseControllerOptions.HapticsMode.Mix;
             bool useRumbleSynth = mode == DualSenseControllerOptions.HapticsMode.RumbleToHaptics ||
@@ -285,9 +300,10 @@ namespace DS4Windows.InputDevices
                 {
                     // The controller's audio amp defaults to muted volume; it only
                     // plays the stream after headphone/speaker volume is set.
-                    if (!SendAudioVolumeSetup())
+                    if (!SendAudioVolumeSetup(out int setupError))
                     {
-                        AppLogger.LogToGui($"{device.MacAddress}: BT audio amplifier setup write failed", true);
+                        AppLogger.LogToGui($"{device.MacAddress}: BT audio amplifier setup write failed " +
+                            $"(Win32 error {setupError})", true);
                     }
 
                     opusEncoder = OpusCodecFactory.CreateEncoder(AUDIO_SAMPLE_RATE, 2,
@@ -310,13 +326,15 @@ namespace DS4Windows.InputDevices
                 long audioUnderruns = 0;
                 long lastUnderrunLogTick = 0;
                 int consecutiveFailures = 0;
+                int firstWriteError = 0;
+                int lastWriteError = 0;
                 long tick = 0;
                 bool synthStreamWasActive = false;
 
                 Stopwatch clock = Stopwatch.StartNew();
                 double nextDeadlineMs = 0.0;
 
-                while (running)
+                while (!cancellationToken.IsCancellationRequested)
                 {
                     nextDeadlineMs += TICK_MS;
                     double wait = nextDeadlineMs - clock.Elapsed.TotalMilliseconds;
@@ -325,12 +343,13 @@ namespace DS4Windows.InputDevices
                         Thread.Sleep((int)(wait - 1.5));
                     }
 
-                    while (running && clock.Elapsed.TotalMilliseconds < nextDeadlineMs)
+                    while (!cancellationToken.IsCancellationRequested &&
+                        clock.Elapsed.TotalMilliseconds < nextDeadlineMs)
                     {
                         Thread.SpinWait(80);
                     }
 
-                    if (!running)
+                    if (cancellationToken.IsCancellationRequested)
                     {
                         break;
                     }
@@ -405,14 +424,28 @@ namespace DS4Windows.InputDevices
                         BuildHapticsReport(report, chunk);
                     }
 
-                    if (hidDevice.WriteOutputReportViaInterrupt(report, 100))
+                    if (hidDevice.WriteOutputReportViaInterrupt(report, 100, out int writeError))
                     {
                         consecutiveFailures = 0;
+                        firstWriteError = 0;
+                        lastWriteError = 0;
                     }
-                    else if (++consecutiveFailures >= MAX_CONSECUTIVE_WRITE_FAILURES)
+                    else
                     {
-                        AppLogger.LogToGui($"{device.MacAddress}: BT haptics/audio stream aborted after repeated write failures", true);
-                        running = false;
+                        if (consecutiveFailures == 0)
+                        {
+                            firstWriteError = writeError;
+                        }
+
+                        lastWriteError = writeError;
+                        if (++consecutiveFailures >= MAX_CONSECUTIVE_WRITE_FAILURES)
+                        {
+                            AppLogger.LogToGui($"{device.MacAddress}: BT haptics/audio stream aborted after " +
+                                $"{consecutiveFailures} consecutive write failures " +
+                                $"(Win32 first={firstWriteError}, last={lastWriteError}, " +
+                                $"report=0x{report[0]:X2}, bytes={report.Length})", true);
+                            break;
+                        }
                     }
 
                     tick++;
@@ -421,7 +454,6 @@ namespace DS4Windows.InputDevices
             catch (Exception ex)
             {
                 AppLogger.LogToGui($"{device.MacAddress}: BT haptics/audio stream error: {ex.Message}", true);
-                running = false;
             }
             finally
             {
@@ -436,6 +468,21 @@ namespace DS4Windows.InputDevices
                 }
 
                 (opusEncoder as IDisposable)?.Dispose();
+
+                lock (stateLock)
+                {
+                    // An older generation may finish after Configure has already
+                    // started its replacement. Only the generation still published
+                    // as current may clear the shared active state.
+                    if (ReferenceEquals(streamCancellation, cancellationSource))
+                    {
+                        running = false;
+                        streamThread = null;
+                        streamCancellation = null;
+                    }
+                }
+
+                cancellationSource.Dispose();
             }
         }
 
@@ -651,7 +698,7 @@ namespace DS4Windows.InputDevices
         /// with a mild speaker pre-gain boost. Mirrors what DS5Dongle emits when
         /// the USB host sets its volume; without this the Opus stream is silent.
         /// </summary>
-        private bool SendAudioVolumeSetup()
+        private bool SendAudioVolumeSetup(out int win32Error)
         {
             byte[] pkt = new byte[STATE_SETUP_REPORT_SIZE];
             pkt[0] = STATE_SETUP_REPORT_ID;
@@ -673,7 +720,7 @@ namespace DS4Windows.InputDevices
             pkt[4 + 37] = 0x02; // AudioControl2: SpeakerCompPreGain = 2
 
             ApplyCrc(pkt, STATE_SETUP_REPORT_SIZE);
-            return hidDevice.WriteOutputReportViaInterrupt(pkt, 100);
+            return hidDevice.WriteOutputReportViaInterrupt(pkt, 100, out win32Error);
         }
 
         private void ApplyCrc(byte[] report, int totalSize)

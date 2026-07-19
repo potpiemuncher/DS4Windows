@@ -211,6 +211,7 @@ namespace DS4Windows.InputDevices
 
         private DualSenseHapticsStreamer hapticsStreamer;
         public DualSenseHapticsStreamer HapticsStreamer { get => hapticsStreamer; }
+        private volatile bool hapticsStreamerReady;
 
         // Current rumble targets for the haptics streamer's rumble-to-haptics synth
         internal byte CurrentRumbleHeavy => currentHap.rumbleState.RumbleMotorStrengthLeftHeavySlow;
@@ -481,6 +482,7 @@ namespace DS4Windows.InputDevices
 
                 if (conType == ConnectionType.BT)
                 {
+                    hapticsStreamerReady = true;
                     RefreshHapticsStreamerState();
                 }
             }
@@ -490,13 +492,22 @@ namespace DS4Windows.InputDevices
 
         private void RefreshHapticsStreamerState()
         {
-            if (conType != ConnectionType.BT || nativeOptionsStore == null)
+            if (conType != ConnectionType.BT || nativeOptionsStore == null || !hapticsStreamerReady)
             {
                 return;
             }
 
-            hapticsStreamer ??= new DualSenseHapticsStreamer(this, hDevice);
-            hapticsStreamer.Configure(nativeOptionsStore.BTHapticsMode,
+            // StartUpdate, settings loading, and option-change notifications can
+            // all refresh concurrently during discovery. Atomic publication keeps
+            // those callers on one streamer instead of leaking orphan writer threads.
+            DualSenseHapticsStreamer streamer = Volatile.Read(ref hapticsStreamer);
+            if (streamer == null)
+            {
+                DualSenseHapticsStreamer candidate = new DualSenseHapticsStreamer(this, hDevice);
+                streamer = Interlocked.CompareExchange(ref hapticsStreamer, candidate, null) ?? candidate;
+            }
+
+            streamer.Configure(nativeOptionsStore.BTHapticsMode,
                 nativeOptionsStore.BTHapticsGain,
                 nativeOptionsStore.BTHapticsLowPassHz,
                 nativeOptionsStore.BTHapticsAudioDeviceId,
@@ -1026,6 +1037,7 @@ namespace DS4Windows.InputDevices
 
         protected override void StopOutputUpdate()
         {
+            hapticsStreamerReady = false;
             hapticsStreamer?.Stop();
             SendEmptyOutputReport();
         }
