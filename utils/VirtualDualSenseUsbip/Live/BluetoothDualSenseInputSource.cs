@@ -970,8 +970,13 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                 }
 
                 Interlocked.Exchange(ref hapticStreamingRequested, 0);
+                // Mirror the wantStream conditions exactly: an open-but-silent
+                // playback pin must NOT re-arm the stream (that defeats the
+                // silence gate and streams silence for as long as Windows
+                // keeps the interface open).
                 if ((hapticPcm.Count > 0 || MicrophoneWantsStream ||
-                     (speakerPcm != null && Volatile.Read(ref playbackInterfaceActive) != 0)) &&
+                     (speakerPcm != null && Volatile.Read(ref playbackInterfaceActive) != 0 &&
+                      SpeakerEnergyAgeMs() <= SpeakerSilenceGateMs)) &&
                     Interlocked.Exchange(ref hapticStreamingRequested, 1) == 0)
                 {
                     continue;
