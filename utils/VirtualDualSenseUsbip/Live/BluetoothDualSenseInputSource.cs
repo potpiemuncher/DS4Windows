@@ -603,6 +603,11 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             {
                 int error = Marshal.GetLastWin32Error();
                 Volatile.Write(ref bluetoothLinkDead, 1);
+                // A write already in flight against the dead handle can block
+                // forever (the removal-pending devnode wedges it, which in turn
+                // wedges the USB session thread and even `usbip detach`).
+                // Cancel all outstanding I/O so any stuck writer unwinds.
+                _ = NativeMethods.CancelIoEx(handle, IntPtr.Zero);
                 hapticAvailable.Set(); // let the stream loop observe the loss
                 if (Volatile.Read(ref disposed) == 0)
                 {
@@ -1408,6 +1413,15 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
 
     private bool WriteBluetoothReport(byte[] report, out int error)
     {
+        // Fail fast once the input loop declared the link dead: a synchronous
+        // WriteFile against a removal-pending Bluetooth devnode can block
+        // indefinitely, freezing every caller behind the write gate.
+        if (Volatile.Read(ref bluetoothLinkDead) != 0)
+        {
+            error = 1167; // ERROR_DEVICE_NOT_CONNECTED
+            return false;
+        }
+
         lock (outputWriteGate)
         {
             bool result = NativeMethods.WriteFile(handle, report, (uint)report.Length,
