@@ -323,13 +323,30 @@ dotnet run --project utils/VirtualDualSenseUsbip -c Release -- serve `
 
 ## Live Validation Results (2026-07-19 afternoon, commit c372e4d)
 
-**Speaker relay: USER-VALIDATED.** The user played music through the virtual
-`Speakers (DualSense Wireless Controller)` endpoint and heard it from the
-physical pad's speaker over Bluetooth — "pretty good" quality; 42k+
-audio-bearing 0x36 reports with zero Bluetooth write errors across the
-session. The reported occasional crackle was ~1/s prebuffer underruns
-(USB/IP arrival gaps measured up to ~17 ms vs a ~21 ms prebuffer); fixed by
-deepening the Opus prebuffer to 4 frames (~43 ms), queue depth 8.
+**Speaker relay: USER-VALIDATED at "99%" quality — final state ZERO
+rebuffers/underruns/BT errors over multi-minute music sessions.** The
+audible-artifact hunt went through five real causes; keep all of these fixes:
+
+1. Prebuffer 2→4 frames, queue depth 8 (crackle from 17 ms arrival jitter).
+2. Stall-skip: with listening audio, missed slots beyond two are skipped
+   instead of burst-caught-up (a GC-pause catch-up burst dequeued that many
+   frames instantly and drained the queue; haptics-only keeps the 100 ms
+   catch-up for rumble timing).
+3. Silence gate + idle re-arm must both honor the energy condition (Windows
+   keeps an open pin primed with silence indefinitely).
+4. **THE BIG ONE: the usbip-win2 vhci's virtual frame clock delivers ISO OUT
+   at 98.7 URBs/s, not 100 — a permanent ~1.3 % deficit** (visible as
+   `urbs/s=98.7` in every session log). Completion pacing cannot fix it
+   (submissions themselves arrive at 98.7/s; the ideal-timeline completion
+   change in 9e0ff25 is still correct and keeps average completion pacing
+   exactly real-time). The fix is an adaptive resampler ratio
+   (`StereoLinearResampler.SetRateTrim`, integral servo on the encoded-queue
+   level, gain 3e-5/frame-error, authority ±2.5 %): production locks to the
+   driver's real rate within seconds. The 0x36 cadence stays fixed at
+   93.75/s (the pad's clock). Result: queue sits exactly on target (5) with
+   zero dry-outs.
+5. Rebuffer events log ring depth/ISO age/spacing (`Speaker rebuffer #N`)
+   so any future artifact names itself.
 
 **Microphone over Bluetooth: BLOCKED BY THE WINDOWS STACK — do not re-litigate
 without new evidence.** Enabling the pad mic (0x32 config packet 0x03) makes

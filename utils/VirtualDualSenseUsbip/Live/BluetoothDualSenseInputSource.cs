@@ -77,7 +77,11 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     // 2-frame (~21 ms) prebuffer underran about once per second and each
     // rebuffer was an audible crackle. Four frames (~43 ms) rides those
     // gaps out; total added latency stays imperceptible for game/media use.
-    private const int SpeakerFrameQueueDepth = 8;
+    // Depth is overflow HEADROOM, not latency: the rate servo parks the queue
+    // at prebuffer+1 frames, so raising the cap only makes transient bursts
+    // absorbable instead of dropped (34 drops = audible 10.7 ms skips were
+    // the last audible artifact at depth 8).
+    private const int SpeakerFrameQueueDepth = 12;
     private const int SpeakerPrebufferFrames = 4;
 
     // The usbip virtual frame clock delivers URBs ~1.3 % slower than true
@@ -845,13 +849,15 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                     trailingSilenceReports = 0;
                 }
 
-                if (audioSession)
+                if (audioSession && audioPrimed)
                 {
                     // Integral servo: queue below target => positive error =>
                     // raise the resampler's output ratio so each incoming URB
                     // yields more 45 kHz samples, and vice versa. Converges on
                     // the source's true rate (including the driver's ~1.3 %
                     // slow frame clock) within a few seconds and then holds.
+                    // Frozen while unprimed (rebuffer/priming transients would
+                    // wind the integral up and overshoot into overflow drops).
                     double levelError = (SpeakerPrebufferFrames + 1) - speakerFrames!.Count;
                     speakerRateTrim = Math.Clamp(
                         speakerRateTrim + levelError * SpeakerRateTrimGain,
