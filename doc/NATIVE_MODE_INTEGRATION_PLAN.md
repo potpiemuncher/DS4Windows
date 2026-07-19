@@ -1,8 +1,26 @@
 # One-Click Native DualSense Mode — Integration Plan
 
-Status: approved 2026-07-19 (Patrick). Implementer: Codex (GPT-5.6) via
-codex-bridge, reviewed by Claude. Live validation happens after the current
-gameplay session ends.
+Status: IMPLEMENTED 2026-07-19 — all five phases coded by Codex (GPT-5.6) via
+codex-bridge, each phase reviewed, independently rebuilt/retested, and pushed
+by Claude (commits 7af4df3, dc0740b, 9a2ab5e, 5459065, 0830efc; 61 NativeMode
+tests + 12 haptics tests green; whole-feature audit: no detach calls, no mic
+flags, schtasks via absolute System32 path, only the intended child-tree
+kill). LIVE VALIDATION PENDING — checklist at the bottom; also still pending:
+one `dotnet publish utils/VirtualDualSenseUsbip -c Release -o
+utils/VirtualDualSenseUsbip/obj/native-staging` run (blocked today only
+because the live gameplay session locks the emulator's bin output) followed
+by a packaged release-shaped build.
+
+Live validation checklist (Claude + Patrick, next session):
+1. Publish staging + rebuild app; confirm native\ payload lands in output.
+2. First run: Set up native mode (single UAC creates the scheduled task).
+3. Start Native Mode: pad releases, child serves, silent attach, status
+   Attached; Black Flag full-native check (input/triggers/haptics/speaker).
+4. Stop: unplug + reclaim, mapping works again. App-exit-while-active also
+   tears down. Rapid Start/Stop clicking stays sane.
+5. Pad idle-timeout: auto-stop, pad reclaims on PS press, status hint shown.
+6. Elevated-DS4Windows direct-attach bypass path.
+7. GUI log stays free of periodic ISO/AUDIO stat lines.
 
 ## Goal
 
