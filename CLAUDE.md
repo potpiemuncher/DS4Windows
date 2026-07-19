@@ -1,6 +1,6 @@
 # DS4Windows Bluetooth Audio/Haptics Project Handoff
 
-Last updated: 2026-07-19
+Last updated: 2026-07-19 (second session: native speaker audio + microphone)
 
 ## Mission
 
@@ -260,12 +260,75 @@ deeper queue to `BluetoothDualSenseInputSource`'s haptic relay so bursty content
 does not momentarily drain the relay queue. Zero write errors throughout, so this
 is a smoothing refinement, not a correctness fix.
 
+## Native Speaker Audio + Microphone (2026-07-19, commits 60ee5c6 + ee88e73)
+
+Both remaining audio paths are IMPLEMENTED and offline-validated; live
+validation is pending one interrupted run (details below).
+
+- **Speaker relay** (`serve --speaker-audio on`): ISO OUT channels 1/2 are
+  resampled 48->45 kHz (16:15 linear, `StereoLinearResampler`), Opus-encoded
+  (Concentus, 200-byte CBR frames, complexity 5), and carried in the existing
+  0x36 reports — route byte `[142]` = (0x16 headphone / 0x13 speaker) | 0x80
+  from the debounced headset-plug bit (BT report byte 55 bit 0), Opus at
+  `[144..343]`. The amplifier SetStateData init (fixed `[1]=0x10`) is sent once
+  per link before the first audio report or mic enable. A silence gate
+  (-46 dBFS, 2 s) keeps the stream off while Windows primes an open pin with
+  silence; the stream aborts after 50 consecutive write failures or when the
+  BT link dies.
+- **Microphone** (`serve --mic on`): opening capture interface 2 alt 1 sends
+  the pad the mic-enable 0x32 (config packet 0x91 len 1, payload 0x03 on /
+  0x02 off, rolling sequence starting at 2 to avoid colliding with the fixed
+  0x10 amp init). Mic input reports are 0x31 with byte 1 **bit 1** set (this
+  pad's normal gamepad reports carry byte1 low-nibble 0x1, e.g. 0xA1 — bit 0
+  set is NORMAL; only bit 1 marks mic). They are CRC-checked, filtered out of
+  the gamepad parser, Opus-decoded (71-byte mono 48 kHz frames at [3..73]),
+  duplicated to stereo, and served on ISO IN EP 0x82 as paced compact
+  RET_SUBMITs (silence when the ring is empty; 47/48/49-frame hysteresis; the
+  IN pump has its own monotonic timeline, pending cap 32, shared ceiling 96,
+  full UNLINK integration). The mic source frame rate is measured for 1 s
+  after enable; ~93.75/s (45 kHz-effective) sources are resampled to 48 kHz.
+- UAC1 feature-unit mute/volume SETs (FU2 playback, FU5 capture) now scale
+  the respective PCM paths (`ControlEndpoint.AudioScaleChanged`).
+- Windows enumerated healthy `Speakers (10- DualSense Wireless Controller)`
+  and `Headset Microphone (10- DualSense Wireless Controller)` endpoints, and
+  a 1 s WASAPI capture from the virtual mic delivered 92,160 samples of paced
+  silence through the new ISO IN path — the USB side is proven.
+- The first live run ended when the physical pad hit its idle timeout
+  (error 21 then 1167) seconds after the audio interfaces opened — the same
+  pad power-off seen at 10:50 on the stability day. Keep the pad awake with
+  occasional input during audio tests.
+- `DSCompatProbe playtone <endpointNameSubstring|id> [s] [hz] [amp]` renders a
+  sine to a specific render endpoint (never the default device);
+  `DSCompatProbe recordmic <endpointNameSubstring|id> [s] [out.wav]` captures
+  a specific mic endpoint with RMS/peak and optional WAV.
+- Codex (GPT-5.6) reviewed both commits over the codex-bridge; all High and
+  Medium findings are fixed in ee88e73 (unconditional relay teardown in the
+  session finally, first-audio preservation via TrimToNewest instead of a
+  reset, bounded per-tick encoder work, pristine silence-packet fallback for
+  any non-200-byte encode, sequence-collision fix, capture-reopen ASRC and
+  decoder resets, gapped ISO IN descriptor tolerance, clamped packet fills).
+
+Live validation recipe (flags are opt-in; both default OFF):
+
+```powershell
+# close DS4Windows first; pad awake on BT
+dotnet run --project utils/VirtualDualSenseUsbip -c Release -- serve `
+  --configuration composite --input bluetooth --speaker-audio on --mic on `
+  --route auto --capture artifacts/m3-audio/<date>.jsonl
+# elevated: usbip attach -r 127.0.0.1 -b 1-1 --serial DS4WSPKCOMP001 --once
+# speaker: utils/DSCompatProbe/... playtone "DualSense" 6 440   (user listens)
+# mic:     utils/DSCompatProbe/... recordmic "DualSense" 8 mic.wav (user speaks)
+# teardown: elevated usbip detach -p 1, stop serve, restart DS4Windows
+```
+
 ## Current Limitation
 
-The native-game haptic path is validated. Remaining spike limitations: only the
-haptic channels (3/4) are relayed — this path does not relay cable-like
-controller speaker/headphone audio (channels 1/2 are metered only); a native
-game speaker-audio relay and the microphone path (Phase 3b) are not implemented.
+The native-game haptic path is validated end to end. The native speaker-audio
+and microphone relays are implemented and pass all offline tests; their live
+controller validation (user hears the tone from the pad speaker, mic WAV
+carries speech) was interrupted by the pad idle-timeout and still needs one
+clean run. The DS4Windows in-app path still lacks mic support (Phase 3b in-app
+would reuse the same virtual-device mic endpoint, which now works).
 
 The primary PC previously bugchecked at 7:24 PM during removal of
 `USB\VID_054C&PID_0CE6\DS4WSPKM26001`. The minidump reports
@@ -301,8 +364,11 @@ game (Black Flag Resynced) was felt on the physical pad.
    DS4Windows (or a helper) so it is one action, and auto-detach on exit.
 4. **Trigger coverage**: capture the remaining trigger programs beyond the two
    Black Flag modes; test more native titles (SDL3, other libScePad games).
-5. **Optional features**: native-game speaker audio relay (channels 1/2), and the
-   microphone path (Phase 3b) which needs a virtual audio capture driver.
+5. **Optional features — DONE 2026-07-19 (offline)**: native-game speaker audio
+   relay (channels 1/2) and the microphone path are implemented in
+   `VirtualDualSenseUsbip` (no separate capture driver needed — the usbip
+   composite's own mic endpoint serves real pad audio). Live pad validation
+   pending one clean run.
 6. **Upstream**: when the user is ready, prepare the PR to ds4windowsapp/DS4Windows
    with credits (egormanga/SAxense, awalol/DS5Dongle) and the usbip-win2 BSD notice.
 
