@@ -43,6 +43,71 @@ if (args.Length >= 1 && args[0].Equals("inputtest", StringComparison.OrdinalIgno
     return;
 }
 
+if (args.Length >= 1 && args[0].Equals("mictest", StringComparison.OrdinalIgnoreCase))
+{
+    // Standalone pad-microphone probe over Bluetooth: no USB/IP, no elevation.
+    // Starts the 0x36 stream (mic bit set), enables the mic, and reports
+    // per-second frame counts and decoded RMS so the whole BT mic path can be
+    // validated (and protocol variants iterated) in isolation.
+    double seconds = args.Length >= 2 && !args[1].StartsWith('-') ? ParseSeconds(args[1]) : 10;
+    string stateMode = (GetOption(args, "--state") ?? "masked").ToLowerInvariant();
+    bool maskState = stateMode switch
+    {
+        "masked" => true,
+        "full" => false,
+        _ => throw new ArgumentException("--state must be 'masked' or 'full'."),
+    };
+    BluetoothDualSenseInputSource.TestSkipAmplifierInit = args.Contains("--no-amp");
+    BluetoothDualSenseInputSource.TestSkipMicrophoneStreamKeepAlive = args.Contains("--no-stream");
+
+    using var micSource = BluetoothDualSenseInputSource.Open(
+        message => Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {message}"),
+        new BluetoothAudioOptions(SpeakerAudio: false, Microphone: true,
+            MaskStateWhileMicrophoneActive: maskState));
+    Console.WriteLine($"mictest: state={(maskState ? "masked" : "full")}, " +
+        $"amp={(BluetoothDualSenseInputSource.TestSkipAmplifierInit ? "off" : "on")}, " +
+        $"stream={(BluetoothDualSenseInputSource.TestSkipMicrophoneStreamKeepAlive ? "off" : "on")}, " +
+        $"{seconds:0.#}s. Speak into the controller microphone.");
+    byte[] statusReport = micSource.CreateReport(64);
+    if (statusReport.Length >= 55)
+    {
+        int batteryLevel = statusReport[53] & 0x0F;
+        Console.WriteLine($"Pad status bytes [52..54]: " +
+            $"{statusReport[52]:X2} {statusReport[53]:X2} {statusReport[54]:X2} " +
+            $"(battery ~{Math.Min(batteryLevel * 10, 100)}%" +
+            $"{(((statusReport[53] >> 4) & 0x01) != 0 ? ", charging" : string.Empty)})");
+    }
+    if (args.Contains("--dongle-init"))
+    {
+        micSource.PrepareMicrophoneDongleStyle();
+    }
+    micSource.SetCaptureInterfaceActive(true);
+    long previousReports = 0;
+    bool died = false;
+    for (int elapsed = 1; elapsed <= Math.Ceiling(seconds); elapsed++)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(1));
+        long reports = micSource.MicrophoneReportCount;
+        Console.WriteLine($"  t+{elapsed}s mic-rep={reports} (+{reports - previousReports}/s) " +
+            $"rate={micSource.MicrophoneRateDecision} micq={micSource.MicrophoneQueueFrames} " +
+            $"rms%={micSource.MicrophoneLastRmsPercent:0.00} " +
+            $"decode-err={micSource.MicrophoneDecodeErrorCount} " +
+            $"link={(micSource.LinkAlive ? "alive" : "DEAD")}");
+        previousReports = reports;
+        if (!micSource.LinkAlive)
+        {
+            died = true;
+            break;
+        }
+    }
+    micSource.SetCaptureInterfaceActive(false);
+    Console.WriteLine(died
+        ? "RESULT: LINK DIED — this state variant does not keep the pad alive."
+        : $"RESULT: SURVIVED {seconds:0.#}s with {previousReports} mic frames.");
+    Environment.ExitCode = died ? 1 : 0;
+    return;
+}
+
 if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCase))
 {
     string fixtures = GetOption(args, "--fixtures") ?? DefaultFixturesPath();
@@ -51,7 +116,19 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
     string inputMode = GetOption(args, "--input") ?? "neutral";
     string configurationMode = GetOption(args, "--configuration") ?? "hid";
     bool speakerAudio = ParseOnOff(GetOption(args, "--speaker-audio"), defaultValue: false);
-    bool microphone = ParseOnOff(GetOption(args, "--mic"), defaultValue: false);
+    string microphoneMode = (GetOption(args, "--mic") ?? "off").ToLowerInvariant();
+    bool microphone = microphoneMode switch
+    {
+        "off" or "false" or "0" => false,
+        "force" => true,
+        "on" or "true" or "1" => throw new ArgumentException(
+            "--mic on is disabled: enabling the pad microphone makes the Windows " +
+            "Bluetooth stack terminate the whole link ~1.3 s later (host-initiated " +
+            "HCI Disconnect; see doc/BT_AUDIO_HAPTICS_RESEARCH.md). The virtual mic " +
+            "endpoint still enumerates and serves silence. Use --mic force only for " +
+            "protocol experiments."),
+        _ => throw new ArgumentException("--mic must be 'off' or 'force'."),
+    };
     SpeakerAudioRoute audioRoute = (GetOption(args, "--route") ?? "auto").ToLowerInvariant() switch
     {
         "auto" => SpeakerAudioRoute.Auto,
@@ -362,9 +439,10 @@ Console.WriteLine("  selftest              USB/IP protocol golden vectors + frag
 Console.WriteLine("  devicetest [fixtures] replay captured EP0 enumeration byte-exact");
 Console.WriteLine("  servertest [fixtures] exercise the live server over loopback TCP");
 Console.WriteLine("  inputtest [seconds]   validate physical BT input and USB report conversion");
+Console.WriteLine("  mictest [seconds] [--state masked|full]  standalone pad-mic probe (no USB/IP)");
 Console.WriteLine("  serve [--fixtures DIR] [--port 3240] [--busid 1-1] [--capture FILE]");
 Console.WriteLine("        [--input neutral|bluetooth] [--configuration hid|composite]");
-Console.WriteLine("        [--speaker-audio on|off] [--mic on|off] [--route auto|speaker|headphone]");
+Console.WriteLine("        [--speaker-audio on|off] [--mic off|force] [--route auto|speaker|headphone]");
 
 static string DefaultFixturesPath() => Path.Combine(AppContext.BaseDirectory,
     "..", "..", "..", "..", "DSCompatProbe", "fixtures", "dualsense_usb_0ce6");

@@ -23,7 +23,8 @@ public enum SpeakerAudioRoute
 public sealed record BluetoothAudioOptions(
     bool SpeakerAudio = false,
     bool Microphone = false,
-    SpeakerAudioRoute Route = SpeakerAudioRoute.Auto)
+    SpeakerAudioRoute Route = SpeakerAudioRoute.Auto,
+    bool MaskStateWhileMicrophoneActive = true)
 {
     public static BluetoothAudioOptions Disabled { get; } = new();
 }
@@ -72,8 +73,12 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     private const int OpusSamplesPerFrame = 480;
     private const int OpusSampleRate = 48000;
     private const int AudioDeliveryRate = 45000;
-    private const int SpeakerFrameQueueDepth = 4;
-    private const int SpeakerPrebufferFrames = 2;
+    // Live music listening measured USB/IP arrival gaps up to ~17 ms; a
+    // 2-frame (~21 ms) prebuffer underran about once per second and each
+    // rebuffer was an audible crackle. Four frames (~43 ms) rides those
+    // gaps out; total added latency stays imperceptible for game/media use.
+    private const int SpeakerFrameQueueDepth = 8;
+    private const int SpeakerPrebufferFrames = 4;
     private const double IsochronousKeepAliveMs = 1000.0;
     private const double HeadsetDebounceMs = 250.0;
     private const int MaxConsecutiveStreamWriteFailures = 50;
@@ -165,6 +170,12 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     private long microphoneUnderrunCount;
     private int microphonePacketFrames = 48;
 
+    // Diagnostic overrides used only by the standalone mictest command to
+    // bisect which outbound traffic interacts with microphone streaming.
+    // Never set these in serve mode.
+    internal static bool TestSkipAmplifierInit;
+    internal static bool TestSkipMicrophoneStreamKeepAlive;
+
     public string Description { get; }
     public byte[]? CalibrationFeatureReport { get; }
     public long ValidReportCount => Interlocked.Read(ref validReportCount);
@@ -185,6 +196,12 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     public int MicrophoneRateDecision => Volatile.Read(ref microphoneRateDecision);
     public bool PlaybackInterfaceActive => Volatile.Read(ref playbackInterfaceActive) != 0;
     public bool CaptureInterfaceActive => Volatile.Read(ref captureInterfaceActive) != 0;
+    public bool LinkAlive => Volatile.Read(ref bluetoothLinkDead) == 0;
+
+    /// <summary>RMS of the most recent decoded microphone frame, 0..100.</summary>
+    public double MicrophoneLastRmsPercent =>
+        Interlocked.Read(ref microphoneLastRmsMilli) / 1000.0;
+    private long microphoneLastRmsMilli;
 
     private float PlaybackVolume => BitConverter.Int32BitsToSingle(Volatile.Read(ref playbackVolumeBits));
     private float CaptureVolume => BitConverter.Int32BitsToSingle(Volatile.Read(ref captureVolumeBits));
@@ -197,6 +214,14 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         this.log = log;
         this.audioOptions = audioOptions;
         Description = $"Bluetooth DualSense (PID 0x{device.ProductID:X4})";
+        // The pad streams ~750 input reports/s (plus ~100/s more with the mic
+        // on). Deepen HIDCLASS's default 32-report ring so bursts can never
+        // overflow it while this process is briefly descheduled.
+        if (!NativeMethods.HidD_SetNumInputBuffers(handle, 512))
+        {
+            log($"HidD_SetNumInputBuffers(512) failed " +
+                $"(Win32 error {Marshal.GetLastWin32Error()}); using driver default.");
+        }
         CalibrationFeatureReport = ReadUsbCalibrationFeature(handle, log);
 
         if (audioOptions.SpeakerAudio)
@@ -390,7 +415,9 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         // Stream while real speaker energy is recent (the silence gate) or
         // when haptic energy arrives; otherwise stay idle so silent packets
         // cannot keep the voice coils energized or burn Bluetooth bandwidth.
-        bool wantStream = hasEnergy ||
+        // An active microphone always keeps the stream running: the pad needs
+        // the outbound container's mic bit or it drops the link.
+        bool wantStream = hasEnergy || MicrophoneWantsStream ||
             (speakerRelay && Volatile.Read(ref playbackInterfaceActive) != 0 &&
              SpeakerEnergyAgeMs() <= SpeakerSilenceGateMs);
         if (wantStream && Interlocked.Exchange(ref hapticStreamingRequested, 1) == 0)
@@ -436,6 +463,10 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             Interlocked.Exchange(ref lastSpeakerEnergyTimestamp, Stopwatch.GetTimestamp());
         }
     }
+
+    private bool MicrophoneWantsStream =>
+        !TestSkipMicrophoneStreamKeepAlive && microphonePcm != null &&
+        Volatile.Read(ref captureInterfaceActive) != 0;
 
     private double SpeakerEnergyAgeMs()
     {
@@ -674,12 +705,16 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         }
 
         float volume = CaptureVolume;
+        double sumSquares = 0;
         for (int i = 0; i < samples; i++)
         {
             short value = ScaleSample(microphoneMonoScratch[i], volume);
             microphoneStereoScratch[i * 2] = value;
             microphoneStereoScratch[i * 2 + 1] = value;
+            sumSquares += (double)value * value;
         }
+        Interlocked.Exchange(ref microphoneLastRmsMilli,
+            (long)(Math.Sqrt(sumSquares / samples) / 32768.0 * 100_000.0));
 
         StereoLinearResampler? resampler = microphoneResampler;
         if (resampler != null)
@@ -808,6 +843,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                     nextDeadlineMs = clock.Elapsed.TotalMilliseconds;
                 }
 
+                bool microphoneKeepAlive = MicrophoneWantsStream;
                 bool audioKeepAlive = speakerPcm != null &&
                     (Volatile.Read(ref playbackInterfaceActive) != 0 ||
                      IsochronousOutAgeMs() <= IsochronousKeepAliveMs) &&
@@ -862,11 +898,13 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                     }
 
                     BuildBluetoothAudioReport(report, sequence, packetCounter, chunk,
-                        opusFrame, UseHeadphoneRoute());
+                        opusFrame, UseHeadphoneRoute(), microphoneKeepAlive,
+                        audioOptions.MaskStateWhileMicrophoneActive);
                 }
                 else
                 {
-                    BuildBluetoothHapticReport(report, sequence, packetCounter, chunk);
+                    BuildBluetoothHapticReport(report, sequence, packetCounter, chunk,
+                        microphoneKeepAlive, audioOptions.MaskStateWhileMicrophoneActive);
                 }
 
                 sequence = (byte)((sequence + 1) & 0x0F);
@@ -907,13 +945,13 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                     }
                 }
 
-                if (trailingSilenceReports < 6 || audioKeepAlive)
+                if (trailingSilenceReports < 6 || audioKeepAlive || microphoneKeepAlive)
                 {
                     continue;
                 }
 
                 Interlocked.Exchange(ref hapticStreamingRequested, 0);
-                if ((hapticPcm.Count > 0 ||
+                if ((hapticPcm.Count > 0 || MicrophoneWantsStream ||
                      (speakerPcm != null && Volatile.Read(ref playbackInterfaceActive) != 0)) &&
                     Interlocked.Exchange(ref hapticStreamingRequested, 1) == 0)
                 {
@@ -973,10 +1011,12 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     }
 
     internal static void BuildBluetoothHapticReport(Span<byte> report, byte sequence,
-        byte packetCounter, ReadOnlySpan<byte> signedStereoPcm8)
+        byte packetCounter, ReadOnlySpan<byte> signedStereoPcm8,
+        bool microphoneActive = false, bool maskStateForMicrophone = true)
     {
         BuildBluetoothStreamReport(report, sequence, packetCounter, signedStereoPcm8,
-            ReadOnlySpan<byte>.Empty, headphoneRoute: false);
+            ReadOnlySpan<byte>.Empty, headphoneRoute: false, microphoneActive,
+            maskStateForMicrophone);
     }
 
     /// <summary>
@@ -986,19 +1026,20 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     /// </summary>
     internal static void BuildBluetoothAudioReport(Span<byte> report, byte sequence,
         byte packetCounter, ReadOnlySpan<byte> signedStereoPcm8, ReadOnlySpan<byte> opusFrame,
-        bool headphoneRoute)
+        bool headphoneRoute, bool microphoneActive = false, bool maskStateForMicrophone = true)
     {
         if (opusFrame.Length < OpusFrameBytes)
         {
             throw new ArgumentException("Opus frame buffer is too short.");
         }
         BuildBluetoothStreamReport(report, sequence, packetCounter, signedStereoPcm8,
-            opusFrame[..OpusFrameBytes], headphoneRoute);
+            opusFrame[..OpusFrameBytes], headphoneRoute, microphoneActive,
+            maskStateForMicrophone);
     }
 
     private static void BuildBluetoothStreamReport(Span<byte> report, byte sequence,
         byte packetCounter, ReadOnlySpan<byte> signedStereoPcm8, ReadOnlySpan<byte> opusFrame,
-        bool headphoneRoute)
+        bool headphoneRoute, bool microphoneActive, bool maskStateForMicrophone = true)
     {
         if (report.Length < BluetoothHapticOutputLength ||
             signedStereoPcm8.Length < HapticBytesPerReport)
@@ -1011,7 +1052,11 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         report[1] = (byte)((sequence & 0x0F) << 4);
         report[2] = 0x91;
         report[3] = 0x07;
-        report[4] = 0xFE;
+        // Bit 0 of the config byte acknowledges an active microphone stream
+        // (DS5Dongle flips 0x7E -> 0x7F in its container while the mic runs).
+        // The pad drops the whole Bluetooth link ~300 ms after mic enable if
+        // the host stream does not carry this bit — observed live twice.
+        report[4] = (byte)(microphoneActive ? 0xFF : 0xFE);
         report[5] = 0x20;
         report[6] = 0x20;
         report[7] = 0x20;
@@ -1021,6 +1066,17 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         report[11] = 0x90;
         report[12] = (byte)KnownHapticState.Length;
         KnownHapticState.CopyTo(report.Slice(13, KnownHapticState.Length));
+        if (microphoneActive && maskStateForMicrophone)
+        {
+            // While the microphone streams, stop re-asserting the audio-control
+            // allow flags (headphone/speaker/mic volume, AudioControl,
+            // AudioMute, AudioControl2) in every report — reapplying mic
+            // configuration ~94x/s while its encoder runs is the suspected
+            // trigger for the pad dropping the link. Volumes persist from the
+            // one-shot amplifier init.
+            report[13] &= 0x0D; // flags1: keep trigger-FFB/rumble bits only
+            report[14] &= 0x75; // flags2: clear AllowAudioMute + AllowAudioControl2
+        }
         report[76] = 0x92;
         report[77] = HapticBytesPerReport;
         signedStereoPcm8[..HapticBytesPerReport].CopyTo(
@@ -1084,6 +1140,54 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     }
 
     /// <summary>
+    /// Mirrors the DS5Dongle connect-time initialization before a microphone
+    /// enable: read the standard feature reports, then send one SetStateData
+    /// that explicitly selects the internal microphone with a sane volume and
+    /// unmuted state. Diagnostic path used by mictest --dongle-init.
+    /// </summary>
+    public void PrepareMicrophoneDongleStyle()
+    {
+        Span<byte> featureIds = stackalloc byte[] { 0x09, 0x20, 0x22, 0x05, 0x70 };
+        foreach (byte reportId in featureIds)
+        {
+            bool got = false;
+            foreach (int length in new[] { 64, 41, 20 })
+            {
+                byte[] buffer = new byte[length];
+                buffer[0] = reportId;
+                if (NativeMethods.HidD_GetFeature(handle, buffer, (uint)buffer.Length))
+                {
+                    got = true;
+                    break;
+                }
+            }
+            log($"Feature 0x{reportId:X2}: {(got ? "read" : "unavailable")}.");
+        }
+
+        byte[] pkt = new byte[BluetoothControlOutputLength];
+        pkt[0] = 0x32;
+        pkt[1] = 0x10;
+        pkt[2] = 0x90; // SetStateData packet: PID 0x10 | sized
+        pkt[3] = 0x3F;
+        pkt[4] = 0xC0; // AllowMicVolume | AllowAudioControl
+        pkt[5] = 0x02; // AllowAudioMute
+        pkt[10] = 0x40; // VolumeMic (sane mid value)
+        pkt[11] = 0x01; // AudioControl: MicSelect = 1 (internal microphone)
+        pkt[13] = 0x00; // mute control byte: unmuted
+        uint crc = ComputeBluetoothCrc(BluetoothOutputCrcSeed,
+            pkt.AsSpan(0, BluetoothControlOutputLength - 4));
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            pkt.AsSpan(BluetoothControlOutputLength - 4), crc);
+        if (!WriteBluetoothReport(pkt, out int error))
+        {
+            log($"Dongle-style microphone SetStateData failed (Win32 error {error}).");
+            return;
+        }
+        log("Dongle-style microphone init sent (MicSelect=internal, volume 0x40, unmuted).");
+        Thread.Sleep(150);
+    }
+
+    /// <summary>
     /// Sends the SetStateData amplifier/audio-control initialization exactly
     /// once per link, before the first audio-bearing report or microphone
     /// enable. The reference dongle always initializes controller audio state
@@ -1091,7 +1195,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     /// </summary>
     private void EnsureAmplifierInitialized()
     {
-        if (Interlocked.Exchange(ref amplifierInitialized, 1) != 0)
+        if (TestSkipAmplifierInit || Interlocked.Exchange(ref amplifierInitialized, 1) != 0)
         {
             return;
         }
@@ -1165,6 +1269,14 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             microphoneResampler = null;
             microphoneDecoder?.ResetState();
             EnsureAmplifierInitialized();
+            // Start the 0x36 stream before the enable goes out: the pad needs
+            // to see containers carrying the mic bit within ~300 ms of the
+            // enable or it drops the Bluetooth link.
+            if (MicrophoneWantsStream &&
+                Interlocked.Exchange(ref hapticStreamingRequested, 1) == 0)
+            {
+                hapticAvailable.Set();
+            }
         }
 
         byte sequence = (byte)(Interlocked.Increment(ref controlSequence) & 0x0F);
@@ -1702,6 +1814,10 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         [DllImport("hid.dll", SetLastError = true)]
         internal static extern bool HidD_GetFeature(SafeFileHandle hidDeviceObject,
             byte[] reportBuffer, uint reportBufferLength);
+
+        [DllImport("hid.dll", SetLastError = true)]
+        internal static extern bool HidD_SetNumInputBuffers(SafeFileHandle hidDeviceObject,
+            uint numberBuffers);
 
         internal static SafeFileHandle OpenDevice(string devicePath) =>
             CreateFile(devicePath, GenericRead | GenericWrite, ShareReadWrite,

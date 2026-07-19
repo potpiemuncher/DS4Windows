@@ -191,6 +191,15 @@ public static class LiveServerSelfTest
             headphoneRoute: true);
         Require(audioReport[142] == 0x96,
             "headphone route byte mismatch");
+        Require(hapticReport[4] == 0xFE && audioReport[4] == 0xFE,
+            "config byte must be 0xFE while the microphone is off");
+        BluetoothDualSenseInputSource.BuildBluetoothHapticReport(
+            audioReport, sequence: 3, packetCounter: 9, hapticChunk,
+            microphoneActive: true);
+        Require(audioReport[4] == 0xFF &&
+                BinaryPrimitives.ReadUInt32LittleEndian(audioReport.AsSpan(394, 4)) ==
+                    ComputeBluetoothCrc(0xA2, audioReport.AsSpan(0, 394)),
+            "config byte must acknowledge an active microphone (0xFF)");
 
         Console.WriteLine("servertest: amplifier and microphone control reports");
         byte[] ampSetup = BluetoothDualSenseInputSource.BuildAmplifierSetupReport();
