@@ -80,14 +80,14 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     private const int SpeakerFrameQueueDepth = 8;
     private const int SpeakerPrebufferFrames = 4;
 
-    // Consuming at exactly the theoretical rate makes the buffer level a
-    // random walk that inevitably drifts dry (an audible rebuffer every few
-    // seconds). A small pacing servo instead slaves the 0x36 cadence to the
-    // buffered level: up to ±0.2 % period adjustment — inaudible, absorbed by
-    // the controller's dejitter buffer — locks consumption to the source's
-    // real rate. Level is measured in Opus-frame units (queue + PCM ring).
-    private const double SpeakerPacingGainPerFrame = 0.0004;
-    private const double SpeakerPacingLimit = 0.002;
+    // The usbip virtual frame clock delivers URBs ~1.3 % slower than true
+    // 48 kHz (measured 98.7/s all day), and the audio engine follows it. The
+    // Bluetooth cadence is fixed by the pad's 3 kHz clock, so the only place
+    // the rates can meet is the resampler: an integral servo trims its ratio
+    // (authority ±2.5 %) until production matches consumption, using the
+    // encoded-queue level as the error signal.
+    private const double SpeakerRateTrimGain = 0.00003;
+    private const double SpeakerRateTrimLimit = 0.025;
     private const double IsochronousKeepAliveMs = 1000.0;
     private const double HeadsetDebounceMs = 250.0;
     private const int MaxConsecutiveStreamWriteFailures = 50;
@@ -157,6 +157,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     private int bluetoothLinkDead;
     private long lastSpeakerEnergyTimestamp;
     private long lastSpeakerRebufferTimestamp;
+    private double speakerRateTrim;
     private int unknownInputFlagLogged;
     private readonly byte[] silenceOpusFrame = new byte[OpusFrameBytes];
 
@@ -844,21 +845,20 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                     trailingSilenceReports = 0;
                 }
 
-                double pacingScale = 1.0;
                 if (audioSession)
                 {
-                    // Servo on the ENCODED queue, not queue+ring: only whole
-                    // encoded frames can be dequeued, so ring residue is dead
-                    // weight against a delivery bunch. Live telemetry showed a
-                    // total-level target parking the queue at 2-3 frames while
-                    // arrival gaps reached ~26 ms — one dry-out every few
-                    // seconds. Holding ~5 encoded frames (~53 ms) rides the
-                    // observed worst-case bunching.
-                    double levelError = speakerFrames!.Count - (SpeakerPrebufferFrames + 1);
-                    pacingScale = 1.0 - Math.Clamp(levelError * SpeakerPacingGainPerFrame,
-                        -SpeakerPacingLimit, SpeakerPacingLimit);
+                    // Integral servo: queue below target => positive error =>
+                    // raise the resampler's output ratio so each incoming URB
+                    // yields more 45 kHz samples, and vice versa. Converges on
+                    // the source's true rate (including the driver's ~1.3 %
+                    // slow frame clock) within a few seconds and then holds.
+                    double levelError = (SpeakerPrebufferFrames + 1) - speakerFrames!.Count;
+                    speakerRateTrim = Math.Clamp(
+                        speakerRateTrim + levelError * SpeakerRateTrimGain,
+                        -SpeakerRateTrimLimit, SpeakerRateTrimLimit);
+                    speakerResampler!.SetRateTrim(speakerRateTrim);
                 }
-                nextDeadlineMs += HapticReportPeriodMs * pacingScale;
+                nextDeadlineMs += HapticReportPeriodMs;
                 double waitMs = nextDeadlineMs - clock.Elapsed.TotalMilliseconds;
                 if (waitMs > 2)
                 {
@@ -1788,10 +1788,11 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     internal sealed class StereoLinearResampler
     {
         private const int ChunkFrames = 64;
-        private readonly double step;
+        private readonly double baseStep;
         private readonly short[] window = new short[(ChunkFrames + 1) * 2];
         private double phase;
         private bool primed;
+        private long rateTrimBits; // double bits; writer and reader are different threads
 
         public StereoLinearResampler(int sourceRate, int destinationRate)
         {
@@ -1799,8 +1800,23 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             {
                 throw new ArgumentOutOfRangeException(nameof(sourceRate));
             }
-            step = (double)sourceRate / destinationRate;
+            baseStep = (double)sourceRate / destinationRate;
         }
+
+        /// <summary>
+        /// Adjusts the conversion ratio: positive trim yields proportionally
+        /// more output per input (used by the rate servo to match a source
+        /// whose real rate differs from nominal). Safe to call concurrently
+        /// with <see cref="Resample"/>.
+        /// </summary>
+        public void SetRateTrim(double trim)
+        {
+            Interlocked.Exchange(ref rateTrimBits,
+                BitConverter.DoubleToInt64Bits(Math.Clamp(trim, -0.05, 0.05)));
+        }
+
+        private double Step => baseStep /
+            (1.0 + BitConverter.Int64BitsToDouble(Interlocked.Read(ref rateTrimBits)));
 
         /// <summary>Resamples interleaved stereo samples; returns samples written.</summary>
         public int Resample(ReadOnlySpan<short> input, Span<short> output)
@@ -1827,6 +1843,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             }
 
             input.CopyTo(window.AsSpan(2, input.Length));
+            double step = Step; // stable within the chunk
             // window now holds inFrames + 1 frames: [0] carried, [1..inFrames] new.
             int written = 0;
             while (phase < inFrames)
