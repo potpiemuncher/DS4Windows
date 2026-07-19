@@ -79,6 +79,15 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     // gaps out; total added latency stays imperceptible for game/media use.
     private const int SpeakerFrameQueueDepth = 8;
     private const int SpeakerPrebufferFrames = 4;
+
+    // Consuming at exactly the theoretical rate makes the buffer level a
+    // random walk that inevitably drifts dry (an audible rebuffer every few
+    // seconds). A small pacing servo instead slaves the 0x36 cadence to the
+    // buffered level: up to ±0.2 % period adjustment — inaudible, absorbed by
+    // the controller's dejitter buffer — locks consumption to the source's
+    // real rate. Level is measured in Opus-frame units (queue + PCM ring).
+    private const double SpeakerPacingGainPerFrame = 0.0004;
+    private const double SpeakerPacingLimit = 0.002;
     private const double IsochronousKeepAliveMs = 1000.0;
     private const double HeadsetDebounceMs = 250.0;
     private const int MaxConsecutiveStreamWriteFailures = 50;
@@ -186,6 +195,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     public long HapticWriteErrorCount => Interlocked.Read(ref hapticWriteErrorCount);
     public long HapticUnderrunCount => Interlocked.Read(ref hapticUnderrunCount);
     public long SpeakerUnderrunCount => Interlocked.Read(ref speakerUnderrunCount);
+    public long SpeakerDroppedFrames => speakerFrames?.DroppedFrames ?? 0;
     public int HapticQueueBytes => hapticPcm.Count;
     public int SpeakerQueueFrames => speakerFrames?.Count ?? 0;
     public long MicrophoneReportCount => Interlocked.Read(ref microphoneReportCount);
@@ -828,7 +838,16 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                     trailingSilenceReports = 0;
                 }
 
-                nextDeadlineMs += HapticReportPeriodMs;
+                double pacingScale = 1.0;
+                if (audioSession)
+                {
+                    double bufferedFrames = speakerFrames!.Count +
+                        speakerPcm!.Count / (double)(OpusSamplesPerFrame * 2);
+                    double levelError = bufferedFrames - (SpeakerPrebufferFrames + 1);
+                    pacingScale = 1.0 - Math.Clamp(levelError * SpeakerPacingGainPerFrame,
+                        -SpeakerPacingLimit, SpeakerPacingLimit);
+                }
+                nextDeadlineMs += HapticReportPeriodMs * pacingScale;
                 double waitMs = nextDeadlineMs - clock.Elapsed.TotalMilliseconds;
                 if (waitMs > 2)
                 {
@@ -1650,8 +1669,10 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         private readonly object gate = new();
         private int head;
         private int count;
+        private long dropped;
 
         public int Count { get { lock (gate) return count; } }
+        public long DroppedFrames { get { lock (gate) return dropped; } }
 
         public OpusFrameQueue(int depth, int frameBytes)
         {
@@ -1680,6 +1701,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                 {
                     head = (head + 1) % slots.Length; // drop oldest
                     count--;
+                    dropped++;
                 }
 
                 return slots[(head + count) % slots.Length];

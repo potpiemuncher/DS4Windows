@@ -397,6 +397,7 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
                 Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} AUDIO " +
                     $"bt-audio={audio} spkq={bluetoothInput.SpeakerQueueFrames} " +
                     $"spk-underrun={bluetoothInput.SpeakerUnderrunCount} " +
+                    $"spk-dropped={bluetoothInput.SpeakerDroppedFrames} " +
                     $"mic-rep={bluetoothInput.MicrophoneReportCount} " +
                     $"mic-rate={bluetoothInput.MicrophoneRateDecision} " +
                     $"micq={bluetoothInput.MicrophoneQueueFrames} " +
