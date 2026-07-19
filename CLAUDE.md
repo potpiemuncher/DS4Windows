@@ -321,14 +321,65 @@ dotnet run --project utils/VirtualDualSenseUsbip -c Release -- serve `
 # teardown: elevated usbip detach -p 1, stop serve, restart DS4Windows
 ```
 
+## Live Validation Results (2026-07-19 afternoon, commit c372e4d)
+
+**Speaker relay: USER-VALIDATED.** The user played music through the virtual
+`Speakers (DualSense Wireless Controller)` endpoint and heard it from the
+physical pad's speaker over Bluetooth — "pretty good" quality; 42k+
+audio-bearing 0x36 reports with zero Bluetooth write errors across the
+session. The reported occasional crackle was ~1/s prebuffer underruns
+(USB/IP arrival gaps measured up to ~17 ms vs a ~21 ms prebuffer); fixed by
+deepening the Opus prebuffer to 4 frames (~43 ms), queue depth 8.
+
+**Microphone over Bluetooth: BLOCKED BY THE WINDOWS STACK — do not re-litigate
+without new evidence.** Enabling the pad mic (0x32 config packet 0x03) makes
+Windows itself terminate the entire Bluetooth link. Proof
+(artifacts/m3-audio/bt-micdrop.etl, BTHPORT HCIRAW trace): host-initiated
+`HCI_Disconnect` (opcode 0x0406, handle, reason 0x13) with completion reason
+0x16 ("terminated by local host"), 0.25–1.3 s after mic streaming starts;
+HidBth logs event 2 ("unresponsive") at the same instant. No L2CAP signaling,
+no config/QoS/mode-change, no eSCO attempt, no protocol anomaly precedes it.
+The pad behaves perfectly: valid CRC'd 71-byte Opus mono frames at 100.2/s
+(true 48 kHz — no 45 kHz slot slaving on input; ASRC unnecessary), decoded
+speech RMS confirmed in userspace right up to the drop. Died identically
+under every variant tried: bare enable with zero outbound traffic; 0x36
+stream carrying the mic-presence config bit (0xFE→0xFF, mirroring the
+dongle's 0x7E→0x7F); SetStateData audio-allow bits masked while mic active;
+dongle-exact init order (feature reads 0x09/0x20/0x22/0x05/0x70 +
+MicSelect=1 SetStateData, 150 ms, then enable); HidD_SetNumInputBuffers(512).
+More outbound traffic correlates with a faster kill (~0.3 s vs ~1.3 s bare).
+Consistent with the ecosystem: no shipped tool captures the DualSense mic
+over stock Windows Bluetooth (Codex could find none), and awalol/DS5Dongle
+exists precisely to be its own Bluetooth host hardware.
+
+`serve --mic on` now refuses with an explanatory error (`--mic force` for
+protocol experiments only). The virtual mic endpoint still enumerates and
+serves paced silence — the full ISO IN pipeline is implemented, tested, and
+proven live (92,160 samples captured via WASAPI), so a future mic SOURCE
+(wired-pad passthrough, dedicated BT-host dongle, or a Windows-stack
+workaround) plugs straight in.
+
+Diagnostics added: `VirtualDualSenseUsbip mictest [s] [--state masked|full]
+[--no-amp] [--no-stream] [--dongle-init]` (standalone BT mic probe, no
+USB/IP/elevation, per-second frame counts + decoded RMS + link verdict) and
+`artifacts/m3-audio/trace-bt.ps1` (elevated 40 s BTHPORT/BTHUSB HCI trace;
+parse with `tracerpt <etl> -o out.xml -of XML -lr -y`, then look for
+`BIP_Data` `0x0604..` host Disconnect commands and `0x0504..` completion
+events — BIP_Type 1=HCI cmd, 2=HCI event, 3=ACL in, 4=ACL out).
+
+Mic-path options going forward: (a) wired passthrough — when the pad is on
+USB the real mic works natively, zero work; (b) a dedicated BT-host dongle
+(awalol/DS5Dongle, RP2350-based, open source) — mic works there today;
+(c) deep Windows work (filter driver / profile driver on HidBth's territory)
+— research-grade effort, unbounded.
+
 ## Current Limitation
 
-The native-game haptic path is validated end to end. The native speaker-audio
-and microphone relays are implemented and pass all offline tests; their live
-controller validation (user hears the tone from the pad speaker, mic WAV
-carries speech) was interrupted by the pad idle-timeout and still needs one
-clean run. The DS4Windows in-app path still lacks mic support (Phase 3b in-app
-would reuse the same virtual-device mic endpoint, which now works).
+The native-game haptic path and native speaker-audio relay are validated end
+to end (game haptics + adaptive triggers + controller speaker audio, all over
+Bluetooth). The microphone leg is blocked by Windows Bluetooth stack behavior
+(see above) — the virtual mic endpoint serves silence until a viable mic
+source exists. The DS4Windows in-app path still lacks mic for the same reason.
 
 The primary PC previously bugchecked at 7:24 PM during removal of
 `USB\VID_054C&PID_0CE6\DS4WSPKM26001`. The minidump reports
