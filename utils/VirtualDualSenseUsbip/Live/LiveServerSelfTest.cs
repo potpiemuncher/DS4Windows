@@ -72,7 +72,8 @@ public static class LiveServerSelfTest
             }
         }
 
-        Console.WriteLine("PASS: live USB/IP management, HID-only EP0, interrupt IN/OUT, and UNLINK.");
+        Console.WriteLine("PASS: live USB/IP management, HID-only EP0, interrupt IN/OUT, " +
+            "packet-preserving ISO OUT, and UNLINK.");
     }
 
     private static void TestBluetoothInputConversion()
@@ -120,6 +121,30 @@ public static class LiveServerSelfTest
         Require(!BluetoothDualSenseInputSource.TryBuildBluetoothTriggerReport(
                 usbOutput, out _),
             "output without adaptive-trigger update flags must not alter trigger state");
+
+        byte[] usbAudio = new byte[16 * 8];
+        for (int frame = 0; frame < 16; frame++)
+        {
+            BinaryPrimitives.WriteInt16LittleEndian(usbAudio.AsSpan(frame * 8 + 4, 2), 16384);
+            BinaryPrimitives.WriteInt16LittleEndian(usbAudio.AsSpan(frame * 8 + 6, 2), -16384);
+        }
+        byte[] bluetoothPcm = new byte[2];
+        Require(BluetoothDualSenseInputSource.ConvertUsbHapticPcm(usbAudio, bluetoothPcm) == 2 &&
+                bluetoothPcm[0] == 0x40 && bluetoothPcm[1] == 0xC0,
+            "USB 48 kHz channels 3/4 did not decimate to signed 3 kHz stereo PCM");
+
+        byte[] hapticChunk = Enumerable.Range(0, 64).Select(value => (byte)value).ToArray();
+        byte[] hapticReport = new byte[398];
+        BluetoothDualSenseInputSource.BuildBluetoothHapticReport(
+            hapticReport, sequence: 3, packetCounter: 9, hapticChunk);
+        Require(hapticReport[0] == 0x36 && hapticReport[1] == 0x30 &&
+                hapticReport[2] == 0x91 && hapticReport[10] == 9 &&
+                hapticReport[11] == 0x90 && hapticReport[12] == 63 &&
+                hapticReport[76] == 0x92 && hapticReport[77] == 64 &&
+                hapticReport.AsSpan(78, 64).SequenceEqual(hapticChunk) &&
+                BinaryPrimitives.ReadUInt32LittleEndian(hapticReport.AsSpan(394, 4)) ==
+                    ComputeBluetoothCrc(0xA2, hapticReport.AsSpan(0, 394)),
+            "Bluetooth report 0x36 native-haptic container or CRC mismatch");
     }
 
     private static uint ComputeBluetoothCrc(byte seed, ReadOnlySpan<byte> data)
@@ -147,12 +172,17 @@ public static class LiveServerSelfTest
         using var server = new VirtualDualSenseServer(descriptors,
             new VirtualDualSenseServerOptions(Port: 0,
                 InputInterval: TimeSpan.FromMilliseconds(200)));
+        var captured = new TaskCompletionSource<IsochronousOutCapture>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        server.IsochronousOutReceived += output => captured.TrySetResult(output);
         server.Start();
         using var cancellation = new CancellationTokenSource();
         Task serverTask = server.RunAsync(cancellation.Token);
         try
         {
             await TestDeviceListAsync(server.Port, descriptors.Interfaces);
+            Console.WriteLine("servertest: composite isochronous OUT completion");
+            await TestCompositeIsoOutAsync(server.Port, captured.Task);
         }
         finally
         {
@@ -164,6 +194,82 @@ public static class LiveServerSelfTest
             catch (OperationCanceledException)
             {
             }
+        }
+    }
+
+    private static async Task TestCompositeIsoOutAsync(int port,
+        Task<IsochronousOutCapture> captureTask)
+    {
+        using var client = new TcpClient { NoDelay = true };
+        await client.ConnectAsync("127.0.0.1", port);
+        NetworkStream stream = client.GetStream();
+        await stream.WriteAsync(EncodeOperation(UsbIpConstants.OpReqImport, "1-1"));
+        byte[] importReply = await UsbIpCodec.ReadExactlyAsync(stream, 8 + 312);
+        Require(U16(importReply, 2) == UsbIpConstants.OpRepImport && U32(importReply, 4) == 0,
+            "composite ISO import failed");
+
+        byte[] setConfiguration = Setup(0x00, UsbStandardRequest.SetConfiguration,
+            value: 1, index: 0, length: 0);
+        await stream.WriteAsync(EncodeSubmit(1, UsbIpConstants.DirectionOut,
+            endpoint: 0, transferLength: 0, setConfiguration));
+        SubmitReply configurationReply = await ReadSubmitReplyAsync(stream, hasInputPayload: false);
+        Require(configurationReply.Status == 0, "composite SET_CONFIGURATION failed");
+
+        byte[] setPlaybackInterface = Setup(0x01, UsbStandardRequest.SetInterface,
+            value: 1, index: 1, length: 0);
+        await stream.WriteAsync(EncodeSubmit(2, UsbIpConstants.DirectionOut,
+            endpoint: 0, transferLength: 0, setPlaybackInterface));
+        SubmitReply interfaceReply = await ReadSubmitReplyAsync(stream, hasInputPayload: false);
+        Require(interfaceReply.Status == 0, "playback SET_INTERFACE alt 1 failed");
+
+        byte[] audio = new byte[768];
+        for (int i = 0; i < audio.Length; i++)
+        {
+            audio[i] = (byte)(i * 17);
+        }
+        var packets = new[]
+        {
+            new UsbIpIsoPacket(0, 384, 0, 0),
+            new UsbIpIsoPacket(384, 384, 0, 0),
+        };
+        await stream.WriteAsync(EncodeIsoSubmit(3, endpoint: 1, startFrame: 1234,
+            interval: 1, audio, packets));
+        IsoSubmitReply isoReply = await ReadIsoSubmitReplyAsync(stream);
+        IsochronousOutCapture capture = await captureTask.WaitAsync(TimeSpan.FromSeconds(2));
+        Require(isoReply.SequenceNumber == 3 && isoReply.Status == 0 &&
+                isoReply.ActualLength == audio.Length && isoReply.StartFrame == 1234 &&
+                isoReply.Packets.Count == 2 &&
+                isoReply.Packets.All(packet => packet.ActualLength == 384 && packet.Status == 0) &&
+                capture.Endpoint == 1 && capture.StartFrame == 1234 &&
+                capture.Data.AsSpan().SequenceEqual(audio),
+            "ISO OUT capture or packet-preserving completion mismatch");
+
+        Console.WriteLine("servertest: ISO UNLINK wins pacing race without late RET_SUBMIT");
+        byte[] pacedAudio = new byte[38400];
+        var pacedPackets = Enumerable.Range(0, 100)
+            .Select(index => new UsbIpIsoPacket(checked((uint)(index * 384)), 384, 0, 0))
+            .ToArray();
+        await stream.WriteAsync(EncodeIsoSubmit(4, endpoint: 1, startFrame: 1236,
+            interval: 4, pacedAudio, pacedPackets));
+        await Task.Delay(TimeSpan.FromMilliseconds(2));
+        await stream.WriteAsync(EncodeUnlink(5, unlinkSequence: 4));
+        byte[] unlinkReply = await UsbIpCodec.ReadExactlyAsync(stream,
+            UsbIpConstants.UrbHeaderLength);
+        Require(U32(unlinkReply, 0) == UsbIpConstants.RetUnlink &&
+                U32(unlinkReply, 4) == 5 && I32(unlinkReply, 20) == -104,
+            "paced ISO UNLINK did not cancel the pending completion");
+
+        using var noLateCompletion = new CancellationTokenSource(
+            TimeSpan.FromMilliseconds(120));
+        try
+        {
+            await UsbIpCodec.ReadExactlyAsync(stream, UsbIpConstants.UrbHeaderLength,
+                noLateCompletion.Token);
+            throw new InvalidOperationException(
+                "canceled ISO transfer emitted a late RET_SUBMIT");
+        }
+        catch (OperationCanceledException) when (noLateCompletion.IsCancellationRequested)
+        {
         }
     }
 
@@ -328,6 +434,34 @@ public static class LiveServerSelfTest
         return bytes;
     }
 
+    private static byte[] EncodeIsoSubmit(uint sequence, uint endpoint, int startFrame,
+        int interval, byte[] outputData, IReadOnlyList<UsbIpIsoPacket> packets)
+    {
+        byte[] bytes = new byte[UsbIpConstants.UrbHeaderLength + outputData.Length +
+            packets.Count * UsbIpConstants.IsoDescriptorLength];
+        WriteU32(bytes, 0, UsbIpConstants.CmdSubmit);
+        WriteU32(bytes, 4, sequence);
+        WriteU32(bytes, 8, DeviceId);
+        WriteU32(bytes, 12, UsbIpConstants.DirectionOut);
+        WriteU32(bytes, 16, endpoint);
+        WriteI32(bytes, 24, outputData.Length);
+        WriteI32(bytes, 28, startFrame);
+        WriteI32(bytes, 32, packets.Count);
+        WriteI32(bytes, 36, interval);
+        outputData.CopyTo(bytes, UsbIpConstants.UrbHeaderLength);
+        int descriptorOffset = UsbIpConstants.UrbHeaderLength + outputData.Length;
+        for (int i = 0; i < packets.Count; i++)
+        {
+            UsbIpIsoPacket packet = packets[i];
+            int offset = descriptorOffset + i * UsbIpConstants.IsoDescriptorLength;
+            WriteU32(bytes, offset, packet.Offset);
+            WriteU32(bytes, offset + 4, packet.Length);
+            WriteU32(bytes, offset + 8, packet.ActualLength);
+            WriteI32(bytes, offset + 12, packet.Status);
+        }
+        return bytes;
+    }
+
     private static byte[] EncodeUnlink(uint sequence, uint unlinkSequence)
     {
         byte[] bytes = new byte[UsbIpConstants.UrbHeaderLength];
@@ -361,6 +495,32 @@ public static class LiveServerSelfTest
         return new SubmitReply(U32(header, 4), I32(header, 20), actualLength, data);
     }
 
+    private static async Task<IsoSubmitReply> ReadIsoSubmitReplyAsync(Stream stream)
+    {
+        byte[] header = await UsbIpCodec.ReadExactlyAsync(stream, UsbIpConstants.UrbHeaderLength);
+        Require(U32(header, 0) == UsbIpConstants.RetSubmit, "ISO RET_SUBMIT command mismatch");
+        int numberOfPackets = I32(header, 32);
+        byte[] descriptors = await UsbIpCodec.ReadExactlyAsync(stream,
+            numberOfPackets * UsbIpConstants.IsoDescriptorLength);
+        var packets = new UsbIpIsoPacket[numberOfPackets];
+        for (int i = 0; i < packets.Length; i++)
+        {
+            int offset = i * UsbIpConstants.IsoDescriptorLength;
+            packets[i] = new UsbIpIsoPacket(
+                U32(descriptors, offset),
+                U32(descriptors, offset + 4),
+                U32(descriptors, offset + 8),
+                I32(descriptors, offset + 12));
+        }
+        return new IsoSubmitReply(
+            U32(header, 4),
+            I32(header, 20),
+            I32(header, 24),
+            I32(header, 28),
+            I32(header, 36),
+            packets);
+    }
+
     private static ushort U16(byte[] bytes, int offset) =>
         BinaryPrimitives.ReadUInt16BigEndian(bytes.AsSpan(offset, 2));
     private static uint U32(byte[] bytes, int offset) =>
@@ -387,4 +547,12 @@ public static class LiveServerSelfTest
         int Status,
         int ActualLength,
         byte[] Data);
+
+    private sealed record IsoSubmitReply(
+        uint SequenceNumber,
+        int Status,
+        int ActualLength,
+        int StartFrame,
+        int ErrorCount,
+        IReadOnlyList<UsbIpIsoPacket> Packets);
 }

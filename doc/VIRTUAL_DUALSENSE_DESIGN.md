@@ -263,7 +263,80 @@ currently emulated volume range is -100..0 dB in 1 dB steps; capture the real
 wired control responses before treating those three range values as Sony-exact.
 
 The Windows audio engine selects interface 1 alt 1 and immediately submits
-isochronous OUT URBs. Those transfers are still rejected by the explicit M2.5
-gate, so no native haptic audio is expected yet. M2.5 is next: preserve each
-packet descriptor, accept the 4-channel 48 kHz stream at USB frame cadence,
-measure underrun/jitter behavior, and only then feed channels 3/4 into M2.6.
+isochronous OUT URBs. M2.5 and the controlled part of M2.6 have since passed as
+described below.
+
+## M2.5 ISO timing result (2026-07-18) -- controlled pass
+
+Immediate RET_SUBMIT completion created a runaway feedback loop of roughly
+11,000 URBs/s and 41 MiB/s, so it is invalid and must not return. The accepted
+design keeps ISO completions asynchronous and paces them from the captured
+endpoint interval:
+
+- Each Windows URB contains ten 384-byte packets.
+- Each packet represents 1 ms of four-channel, 48 kHz, signed 16-bit PCM.
+- One URB completes every 10 ms, yielding 100.0 URBs/s and 375.1 KiB/s.
+- Packet descriptors, start frame, actual lengths, and statuses are preserved
+  in RET_SUBMIT.
+- The live stream held the exact long-term rate for at least 105 seconds without
+  a disconnect. Observed arrival gaps ranged from 2.111 to 17.118 ms while the
+  long-term completion clock remained exact.
+- The pending queue is bounded at 64 transfers and supports CMD_UNLINK.
+
+## M2.6 native haptic-channel relay (2026-07-18) -- controlled pass
+
+Playback PCM channels 3/4 now feed the physical Bluetooth controller without
+changing the user's default headset:
+
+- Sixteen 48 kHz USB frames are averaged into one 3 kHz signed 8-bit stereo
+  haptic frame. Audible channels 1/2 are intentionally ignored by this relay.
+- A dedicated above-normal-priority worker sends 64 haptic bytes every
+  approximately 10.667 ms in the proven authenticated 398-byte Bluetooth report
+  `0x36`.
+- The path uses a 30 ms prebuffer, a bounded 1,200-byte overwrite-oldest ring,
+  serialized HID writes, and a six-report silence tail before idling.
+- `DSHapticsProto audiotest` opens the active virtual DualSense render endpoint
+  directly in its exact 48 kHz, four-channel, 32-bit-float mix format and writes
+  tone only to channels 3/4.
+- During the decisive controlled run, channels 3/4 measured 9.56-10.61% RMS
+  with 15% peaks, Bluetooth report `0x36` writes had zero errors, and the user
+  confirmed feeling the haptic at about 7:20 PM. A second 120 Hz / 25% run sent
+  503 haptic reports with zero write errors.
+
+This proves virtual USB audio -> native haptic channels -> Bluetooth actuators.
+It does not yet prove that a real game emits nonzero channels 3/4 in a tested
+scene, and it does not forward audible USB channels 1/2 to the controller
+speaker or headphone jack.
+
+## Composite teardown crash and safety hold (2026-07-18)
+
+At approximately 7:24 PM, removal of composite instance
+`USB\VID_054C&PID_0CE6\DS4WSPKM26001` coincided with bugcheck
+`0xA IRQL_NOT_LESS_OR_EQUAL`. WinDbg identified
+`AV_nt!RtlpHpVsChunkFree` while `IoFreeIrp` ran from
+`IopUserCompletion`, which is consistent with an already-corrupted or
+double-completed IRP. PnP black-box data names the exact virtual instance with
+problem code 24. The five-megabyte triage dump does not retain the IRP body or
+KMDF flight recorder, so it cannot conclusively name `usbip2_ude.sys` or
+`usbip2_filter.sys` as the corruptor.
+
+Code audit found a credible emulator-side trigger: the paced ISO worker removed
+a submit from the pending dictionary before its delay and RET_SUBMIT. UNLINK in
+that window therefore returned status 0 (meaning completion had already won)
+even though a late RET_SUBMIT could still follow. Pending interrupt and ISO
+transfers now use an atomic pending/completing/canceled state machine:
+
+- UNLINK that wins returns `-ECONNRESET` and permanently suppresses RET_SUBMIT.
+- Completion that wins writes RET_SUBMIT first; only then may UNLINK return 0.
+- A loopback regression test unlinks a synthetic 100-packet transfer during its pacing
+  window and verifies both `-ECONNRESET` and the absence of a late RET_SUBMIT.
+
+The fix builds with zero warnings and all offline protocol, descriptor, UAC1,
+conversion, and live-loopback tests pass. It has deliberately not been
+revalidated against usbip-win2 on the primary PC; 50 consecutive loopback
+servertest runs passed offline. The upstream project itself
+recommends restore points, WPP driver tracing, kernel dumps, and Driver Verifier
+for crash diagnosis. Resume live work only on a disposable Windows machine or
+VM configured for those captures; require repeated composite attach, active
+ISO, UNLINK, detach, server-loss, and surprise-removal stress before lifting the
+primary-PC hold.

@@ -35,6 +35,10 @@ Usage:
   DSHapticsProto watchusb [seconds=10]
       Measures virtual USB stick/trigger ranges and counts Cross-button presses.
 
+  DSHapticsProto audiotest [seconds=10] [freqHz=120] [amp=0.15]
+      Opens the active virtual DualSense render endpoint directly and writes a
+      four-channel 48 kHz stream with tone only on haptic channels 3/4.
+
 Run while the pad is connected over Bluetooth. Close DS4Windows/DSX/Steam
 first so nothing else is holding or rewriting controller output state.
 */
@@ -60,6 +64,11 @@ internal static class Program
     private static int Main(string[] args)
     {
         string mode = args.Length > 0 ? args[0].ToLowerInvariant() : "test";
+
+        if (mode == "audiotest")
+        {
+            return RunVirtualUsbAudioTest(args);
+        }
 
         HidDevice device = mode is "featuresusb" or "readusb" or "watchusb"
             ? FindUsbDualSense()
@@ -150,7 +159,7 @@ internal static class Program
                     return 0;
                 }
                 default:
-                    Console.Error.WriteLine($"Unknown mode '{mode}'. Use 'test36', 'test', 'rumble', 'capture', 'features', 'featuresusb', 'readusb', 'watchusb', or 'probe'.");
+                    Console.Error.WriteLine($"Unknown mode '{mode}'. Use 'test36', 'test', 'rumble', 'capture', 'features', 'featuresusb', 'readusb', 'watchusb', 'audiotest', or 'probe'.");
                     return 2;
             }
         }
@@ -158,6 +167,54 @@ internal static class Program
         {
             NativeHid.TimeEndPeriod(1);
         }
+    }
+
+    private static int RunVirtualUsbAudioTest(string[] args)
+    {
+        double seconds = args.Length > 1 ? double.Parse(args[1]) : 10.0;
+        double frequency = args.Length > 2 ? double.Parse(args[2]) : 120.0;
+        double amplitude = args.Length > 3 ? double.Parse(args[3]) : 0.15;
+        if (!double.IsFinite(seconds) || seconds <= 0 ||
+            !double.IsFinite(frequency) || frequency <= 0 ||
+            !double.IsFinite(amplitude) || amplitude is < 0 or > 1)
+        {
+            Console.Error.WriteLine("audiotest requires positive seconds/frequency and amplitude 0..1.");
+            return 2;
+        }
+
+        using var enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
+        using NAudio.CoreAudioApi.MMDevice endpoint = enumerator
+            .EnumerateAudioEndPoints(NAudio.CoreAudioApi.DataFlow.Render,
+                NAudio.CoreAudioApi.DeviceState.Active)
+            .FirstOrDefault(device => device.FriendlyName.Contains(
+                "DualSense Wireless Controller", StringComparison.OrdinalIgnoreCase));
+        if (endpoint == null)
+        {
+            Console.Error.WriteLine("No active virtual DualSense render endpoint was found.");
+            return 1;
+        }
+
+        Console.WriteLine($"Opening explicit endpoint: {endpoint.FriendlyName}");
+        Console.WriteLine($"Four-channel PCM: {seconds:0.###} s @ {frequency:0.###} Hz, " +
+            $"amplitude {amplitude:0.###}; channels 1/2 silent, 3/4 active.");
+        using NAudio.CoreAudioApi.AudioClient audioClient = endpoint.AudioClient;
+        WaveFormat mixFormat = audioClient.MixFormat;
+        string subFormat = mixFormat is WaveFormatExtensible extensible
+            ? $", subformat {extensible.SubFormat}"
+            : string.Empty;
+        Console.WriteLine($"Endpoint mix format: {mixFormat.SampleRate} Hz, " +
+            $"{mixFormat.Channels} ch, {mixFormat.BitsPerSample} bit, {mixFormat.Encoding}{subFormat}");
+        using var output = new WasapiOut(endpoint,
+            NAudio.CoreAudioApi.AudioClientShareMode.Shared,
+            useEventSync: true,
+            latency: 20);
+        var source = new FourChannelToneProvider(mixFormat, frequency, amplitude);
+        output.Init(source);
+        output.Play();
+        Thread.Sleep(TimeSpan.FromSeconds(seconds));
+        output.Stop();
+        Console.WriteLine("Audio endpoint test complete.");
+        return 0;
     }
 
     private static void RunFeatureDump(SafeFileHandle handle)
@@ -602,6 +659,77 @@ internal static class Program
         double y = x / (1.0 + Math.Abs(x)); // smooth limiter, no hard clipping artifacts
         sbyte signedSample = (sbyte)Math.Clamp(y * 127.0, -127.0, 127.0);
         return unchecked((byte)signedSample);
+    }
+}
+
+internal sealed class FourChannelToneProvider : IWaveProvider
+{
+    private static readonly Guid IeeeFloatSubFormat =
+        new("00000003-0000-0010-8000-00AA00389B71");
+    private readonly double amplitude;
+    private readonly double phaseIncrement;
+    private readonly bool floatingPoint;
+    private readonly int bytesPerSample;
+    private double phase;
+
+    public WaveFormat WaveFormat { get; }
+
+    public FourChannelToneProvider(WaveFormat waveFormat, double frequency, double amplitude)
+    {
+        if (waveFormat.Channels < 4)
+        {
+            throw new ArgumentException("The DualSense endpoint mix format has fewer than four channels.");
+        }
+        floatingPoint = waveFormat.Encoding == WaveFormatEncoding.IeeeFloat ||
+            waveFormat is WaveFormatExtensible extensible && extensible.SubFormat == IeeeFloatSubFormat;
+        bytesPerSample = waveFormat.BitsPerSample / 8;
+        if ((!floatingPoint || bytesPerSample != 4) &&
+            (floatingPoint || bytesPerSample != 2))
+        {
+            throw new NotSupportedException(
+                $"Unsupported endpoint sample format: {waveFormat.Encoding}, {waveFormat.BitsPerSample} bit.");
+        }
+
+        WaveFormat = waveFormat;
+        this.amplitude = amplitude;
+        phaseIncrement = 2.0 * Math.PI * frequency / waveFormat.SampleRate;
+    }
+
+    public int Read(byte[] buffer, int offset, int count)
+    {
+        int blockAlign = WaveFormat.BlockAlign;
+        int bytes = count - count % blockAlign;
+        Span<byte> destination = buffer.AsSpan(offset, bytes);
+        destination.Clear();
+        for (int frame = 0; frame < bytes / blockAlign; frame++)
+        {
+            double haptic = Math.Sin(phase) * amplitude;
+            phase += phaseIncrement;
+            if (phase >= Math.PI * 2.0)
+            {
+                phase -= Math.PI * 2.0;
+            }
+
+            Span<byte> sampleFrame = destination.Slice(frame * blockAlign, blockAlign);
+            if (floatingPoint)
+            {
+                int bits = BitConverter.SingleToInt32Bits((float)haptic);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                    sampleFrame.Slice(2 * bytesPerSample, bytesPerSample), bits);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                    sampleFrame.Slice(3 * bytesPerSample, bytesPerSample), bits);
+            }
+            else
+            {
+                short sample = (short)Math.Clamp(
+                    haptic * short.MaxValue, short.MinValue, short.MaxValue);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(
+                    sampleFrame.Slice(2 * bytesPerSample, bytesPerSample), sample);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(
+                    sampleFrame.Slice(3 * bytesPerSample, bytesPerSample), sample);
+            }
+        }
+        return bytes;
     }
 }
 

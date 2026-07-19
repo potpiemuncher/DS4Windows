@@ -2,8 +2,10 @@
 
 User-space USB/IP device emulator for DS4Windows Phase 4. It exposes a wired
 DualSense through usbip-win2's signed VHCI driver. The exact composite mode now
-materializes Windows audio endpoints; the next milestone accepts isochronous
-playback and relays native haptic audio to the real Bluetooth controller.
+materializes Windows audio endpoints, accepts paced isochronous playback, and
+relays native haptic channels 3/4 to the real Bluetooth controller. Controlled
+M2.6 haptics work, but live USB/IP testing is on safety hold after a teardown
+bugcheck on the primary PC.
 
 ## Status
 
@@ -33,13 +35,23 @@ primary Windows 11 PC:
   configuration. Windows starts the MEDIA child and creates healthy Speakers
   and Headset Microphone endpoints. The audio engine reaches playback
   interface 1 alt 1 and submits ISO OUT traffic.
+- ISO completion is paced at ten 384-byte packets every 10 ms. A 105-second
+  live run held 100.0 URBs/s and 375.1 KiB/s without disconnecting.
+- Four-channel 48 kHz signed 16-bit playback is converted from channels 3/4 to
+  3 kHz signed 8-bit stereo and sent in authenticated Bluetooth report `0x36`
+  frames. The user felt the controlled haptic tone at about 7:20 PM.
 - In neutral-input mode, feature report `0x05` intentionally stalls rather
   than returning invented sensor calibration.
 
-Capturing the other planned adaptive-trigger programs, one-hour stability,
-graceful server shutdown, and repeated clean attach/detach remain M2.3
-durability work. ISO playback remains gated until M2.5, so native cable-like
-haptic audio is not expected yet.
+Real game-authored channels 3/4, one-hour stability, and safe teardown still
+need validation. Audible USB channels 1/2 are not forwarded by this spike.
+
+**Safety hold:** do not attach this device through usbip-win2 on the primary PC.
+A composite removal at 7:24 PM on 2026-07-18 produced bugcheck `0xA` while
+Windows freed an IRP; PnP black-box data named the exact virtual instance. An
+UNLINK/late-RET_SUBMIT race was found and fixed offline, but the fix must first
+survive trace-enabled attach/detach stress on a disposable Windows machine or
+VM.
 
 ## Build and test
 
@@ -50,14 +62,22 @@ dotnet run --project .\utils\VirtualDualSenseUsbip -- devicetest
 dotnet run --project .\utils\VirtualDualSenseUsbip -- servertest
 dotnet run --project .\utils\VirtualDualSenseUsbip -- inputtest 5
 dotnet run --project .\utils\DSHapticsProto -- watchusb 12
+dotnet run --project .\utils\DSHapticsProto -- audiotest 5 120 0.15
 ```
 
 The tests cover USB/IP golden vectors and fragmentation, byte-exact replay of
 the captured composite EP0 fixture, UAC1 mute/volume state and range controls,
 exact composite topology, and a loopback live-server session with management,
-HID-only EP0, feature, interrupt-IN/OUT, and UNLINK traffic.
+HID-only EP0, feature, interrupt-IN/OUT, packet-preserving paced ISO, and
+UNLINK traffic. The teardown regression unlinks a synthetic 100-packet ISO transfer
+during its pacing window and verifies that no late RET_SUBMIT follows. The
+complete loopback suite passed 50 consecutive runs after the fix.
 
-## Live attach
+## Live attach (disposable test systems only)
+
+Do not run these commands on the primary PC while the safety hold above is
+active. Configure USB/IP WPP tracing and kernel dumps before testing on a
+disposable machine.
 
 Close DS4Windows for the first clean enumeration. Start the server from a
 normal terminal:

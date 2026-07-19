@@ -14,7 +14,7 @@ Repository state:
 - Fork: `https://github.com/potpiemuncher/DS4Windows.git`
 - Upstream: `https://github.com/ds4windowsapp/DS4Windows.git`
 - Active branch: `feature/bt-audio-haptics`
-- Latest pushed checkpoint before M2.4: `860014d`
+- Latest pushed checkpoint before the current M2.5-M2.6 work: `587e458`
 
 Read `doc/BT_AUDIO_HAPTICS_RESEARCH.md` and
 `doc/VIRTUAL_DUALSENSE_DESIGN.md` before changing the protocol or Phase 4
@@ -33,6 +33,10 @@ DualSense:
 - A controlled three-pulse XInput test produced exactly three pulses: heavy,
   light, then both. After `d5046ed`, those pulses were noticeably stronger.
 - The 7.1-to-stereo downmix fix made controller audio sound materially better.
+- Black Flag Resynced authored adaptive-trigger output and the user felt R2
+  resistance while firing.
+- A controlled virtual-USB four-channel tone reached native haptic channels 3/4
+  and the user felt it at about 7:20 PM on 2026-07-18.
 
 `System Audio + Rumble` means audio-derived haptic PCM and synthesized XInput
 rumble are mixed into the same voice-coil haptic stream. It does not itself
@@ -99,6 +103,8 @@ Phase 4/native-game foundation:
 - `bc21906` bridges authenticated physical Bluetooth input at 250 Hz.
 - `860014d` relays native game-authored adaptive-trigger programs over
   Bluetooth without blocking USB output completion.
+- `587e458` adds the exact four-interface UAC1 composite configuration and
+  healthy Windows speaker/microphone endpoint enumeration.
 
 Latest user-validated fixes:
 
@@ -157,11 +163,21 @@ Do not rely on an old process ID; check the current process and binary path.
 
 ## Current Limitation
 
-The virtual wired DualSense now exposes the exact four-interface composite
-descriptor, and Windows creates healthy speaker and microphone endpoints.
-Native game haptic audio is not available yet because USB/IP isochronous
-transfers remain deliberately gated. Do not claim native haptic-audio support
-until M2.5-M2.6 qualify ISO timing and relay channels 3/4 successfully.
+M2.5 ISO pacing and the controlled M2.6 haptic relay now work, but a native game
+has not yet been shown to emit nonzero channels 3/4 through this path. Audible
+USB channels 1/2 are metered only; this spike does not relay cable-like
+controller speaker/headphone audio.
+
+More importantly, the primary PC bugchecked at 7:24 PM during removal of
+`USB\VID_054C&PID_0CE6\DS4WSPKM26001`. The minidump reports
+`0xA IRQL_NOT_LESS_OR_EQUAL`, `AV_nt!RtlpHpVsChunkFree`, and
+`IoFreeIrp -> IopUserCompletion`; PnP black-box data names that exact virtual
+device with problem code 24. The small dump cannot prove the responsible
+driver, but an emulator race was found where paced ISO work left the pending
+table before RET_SUBMIT, allowing UNLINK status 0 to precede a late RET_SUBMIT.
+The race is fixed and covered offline. Do not attach this USB/IP device again
+on the primary PC until the fix passes trace-enabled attach/detach stress on a
+disposable Windows machine or VM.
 
 ## Next Milestone: Native DualSense Game Compatibility
 
@@ -220,9 +236,26 @@ Status and order:
    speaker mute/volume GET/SET controls and volume range queries required by
    Windows. The provisional -100..0 dB / 1 dB range must be replaced if a
    future wired control capture proves Sony uses different values.
-6. **M2.5 in progress**: accept, time, and qualify isochronous playback URBs.
-7. **M2.6**: relay UAC haptic channels 3/4 to 3 kHz Bluetooth haptic PCM. The
-   native 11-byte adaptive-trigger relay is already proven in M2.3.
+6. **M2.5 controlled timing PASSED (2026-07-18)**: playback uses ten 384-byte
+   packets per URB and paced asynchronous completion at 100.0 URBs/s
+   (375.1 KiB/s). A 105-second run stayed connected at the exact long-term rate.
+   The first immediate-completion experiment produced an invalid approximately
+   11,000 URBs/s / 41 MiB/s loop; never restore immediate ISO completion.
+7. **M2.6 controlled relay PASSED; game validation pending (2026-07-18)**:
+   48 kHz signed 16-bit channels 3/4 are reduced to 3 kHz signed 8-bit stereo
+   and sent in authenticated 398-byte Bluetooth report `0x36` frames. The
+   controlled tone measured 9.56-10.61% RMS and 15% peaks on channels 3/4,
+   produced zero Bluetooth write errors, and the user felt it at about 7:20 PM.
+   A separate 120 Hz / 25% run sent 503 haptic reports with zero write errors.
+   Silence suppression drains a six-report tail and then idles. The native
+   11-byte adaptive-trigger relay remains proven in M2.3.
+8. **Live teardown safety BLOCKED**: the 7:24 PM bugcheck happened while this
+   composite instance was being removed. The emulator's UNLINK/completion race
+   is fixed with an atomic pending/completing/canceled state machine and a
+   regression test that forbids late RET_SUBMIT after successful UNLINK. All
+   offline builds and selftest/devicetest/servertest pass; 50 consecutive
+   servertest runs also passed. Live revalidation must happen off the primary PC
+   with USB/IP WPP tracing and a kernel dump configured.
 
 Installing the VHCI kernel driver is a material system change and briefly
 restarts USB 3.0 hubs/devices. Before doing it, get explicit user approval,
@@ -231,14 +264,16 @@ Boot/HVCI/testsigning state, create a restore point if available, and verify the
 downloaded package/signatures. Do not weaken Windows security to make the
 driver load.
 
-The primary PC has already completed this installation and qualification. Do
-not reinstall or cycle its USB hubs for ordinary M2.3 server work. For live
-tests, use the already installed CLI and the alphanumeric serial
-`DS4WSPKHID001`; usbip-win2 rejects the older hyphenated serial.
+The primary PC has already completed installation and qualification, but the
+later teardown crash supersedes the earlier live-test permission. Do not
+reinstall, attach, detach, or cycle its USB hubs for this spike. The installed
+driver may remain idle while offline work continues.
 
 ## Working Rules for the Next Agent
 
 - Inspect `git status` before editing and preserve unrelated user work.
+- Keep USB/IP detached on the primary PC. Do not treat the offline UNLINK fix as
+  permission to reproduce a kernel crash there.
 - Keep report `0x36` as the known-good Bluetooth transport unless new hardware
   evidence proves another report works.
 - Keep listening audio and audible system output independent via WASAPI

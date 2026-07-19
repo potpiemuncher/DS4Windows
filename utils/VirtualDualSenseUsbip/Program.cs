@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Text.Json;
 using VirtualDualSenseUsbip.Device;
 using VirtualDualSenseUsbip.Live;
@@ -80,6 +82,16 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
     object captureGate = new();
     long hidOutputCount = 0;
     byte[]? lastLoggedTriggerBlock = null;
+    long isoOutCount = 0;
+    long isoOutBytes = 0;
+    long isoOutPackets = 0;
+    long firstIsoTimestamp = 0;
+    long previousIsoTimestamp = 0;
+    double minimumIsoGapMs = double.PositiveInfinity;
+    double maximumIsoGapMs = 0;
+    double[] isoWindowSumSquares = new double[4];
+    int[] isoWindowPeaks = new int[4];
+    long isoWindowFrames = 0;
     if (!string.IsNullOrWhiteSpace(capturePath))
     {
         string fullCapturePath = Path.GetFullPath(capturePath);
@@ -135,6 +147,119 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
         }
     };
 
+    server.IsochronousOutReceived += capture =>
+    {
+        _ = bluetoothInput?.QueueHapticAudio(capture.Data);
+        double[] captureSumSquares = new double[4];
+        int[] capturePeaks = new int[4];
+        int captureFrames = capture.Data.Length % 8 == 0 ? capture.Data.Length / 8 : 0;
+        for (int frame = 0; frame < captureFrames; frame++)
+        {
+            int offset = frame * 8;
+            for (int channel = 0; channel < 4; channel++)
+            {
+                short sample = BinaryPrimitives.ReadInt16LittleEndian(
+                    capture.Data.AsSpan(offset + channel * 2, 2));
+                double normalized = sample / 32768.0;
+                captureSumSquares[channel] += normalized * normalized;
+                capturePeaks[channel] = Math.Max(capturePeaks[channel], Math.Abs((int)sample));
+            }
+        }
+
+        long count;
+        long totalBytes;
+        long totalPackets;
+        long firstTimestamp;
+        double minGapMs;
+        double maxGapMs;
+        double[] rmsPercent = new double[4];
+        double[] peakPercent = new double[4];
+        lock (captureGate)
+        {
+            double incomingGapMs = previousIsoTimestamp == 0
+                ? 0
+                : (capture.MonotonicTimestamp - previousIsoTimestamp) * 1000.0 /
+                  Stopwatch.Frequency;
+            if (incomingGapMs > 100)
+            {
+                isoOutCount = 0;
+                isoOutBytes = 0;
+                isoOutPackets = 0;
+                firstIsoTimestamp = 0;
+                minimumIsoGapMs = double.PositiveInfinity;
+                maximumIsoGapMs = 0;
+                Array.Clear(isoWindowSumSquares);
+                Array.Clear(isoWindowPeaks);
+                isoWindowFrames = 0;
+            }
+
+            count = ++isoOutCount;
+            isoOutBytes += capture.Data.Length;
+            isoOutPackets += capture.Packets.Count;
+            totalBytes = isoOutBytes;
+            totalPackets = isoOutPackets;
+            if (firstIsoTimestamp == 0)
+            {
+                firstIsoTimestamp = capture.MonotonicTimestamp;
+            }
+            if (previousIsoTimestamp != 0 && incomingGapMs <= 100)
+            {
+                minimumIsoGapMs = Math.Min(minimumIsoGapMs, incomingGapMs);
+                maximumIsoGapMs = Math.Max(maximumIsoGapMs, incomingGapMs);
+            }
+            previousIsoTimestamp = capture.MonotonicTimestamp;
+            firstTimestamp = firstIsoTimestamp;
+            minGapMs = minimumIsoGapMs;
+            maxGapMs = maximumIsoGapMs;
+            for (int channel = 0; channel < 4; channel++)
+            {
+                isoWindowSumSquares[channel] += captureSumSquares[channel];
+                isoWindowPeaks[channel] = Math.Max(isoWindowPeaks[channel], capturePeaks[channel]);
+            }
+            isoWindowFrames += captureFrames;
+            if (count == 1 || count % 500 == 0)
+            {
+                for (int channel = 0; channel < 4; channel++)
+                {
+                    rmsPercent[channel] = isoWindowFrames > 0
+                        ? Math.Sqrt(isoWindowSumSquares[channel] / isoWindowFrames) * 100.0
+                        : 0;
+                    peakPercent[channel] = isoWindowPeaks[channel] * 100.0 / 32768.0;
+                    isoWindowSumSquares[channel] = 0;
+                    isoWindowPeaks[channel] = 0;
+                }
+                isoWindowFrames = 0;
+            }
+        }
+
+        if (count == 1 || count % 500 == 0)
+        {
+            double elapsedSeconds = Math.Max(0.000001,
+                (capture.MonotonicTimestamp - firstTimestamp) / (double)Stopwatch.Frequency);
+            uint minPacket = capture.Packets.Min(packet => packet.Length);
+            uint maxPacket = capture.Packets.Max(packet => packet.Length);
+            string gapRange = double.IsPositiveInfinity(minGapMs)
+                ? "n/a"
+                : $"{minGapMs:0.###}..{maxGapMs:0.###}";
+            string rate = count == 1
+                ? "urbs/s=n/a KiB/s=n/a"
+                : $"urbs/s={count / elapsedSeconds:0.0} KiB/s={totalBytes / elapsedSeconds / 1024:0.0}";
+            string bluetoothStats = bluetoothInput == null
+                ? string.Empty
+                : $" bt36={bluetoothInput.RelayedHapticReportCount} " +
+                  $"btq={bluetoothInput.HapticQueueBytes} " +
+                  $"bt-underrun={bluetoothInput.HapticUnderrunCount} " +
+                  $"bt-errors={bluetoothInput.HapticWriteErrorCount}";
+            Console.WriteLine($"{capture.Timestamp.ToLocalTime():HH:mm:ss.fff} ISO OUT " +
+                $"total={count} seq={capture.SequenceNumber} ep={capture.Endpoint} " +
+                $"{rate} " +
+                $"packets={totalPackets} current={capture.Packets.Count}x{minPacket}..{maxPacket} " +
+                $"gap-ms={gapRange} rms%={string.Join('/', rmsPercent.Select(value => value.ToString("0.00")))} " +
+                $"peak%={string.Join('/', peakPercent.Select(value => value.ToString("0.0")))} " +
+                $"start={capture.StartFrame} interval={capture.Interval}{bluetoothStats}");
+        }
+    };
+
     using var cancellation = new CancellationTokenSource();
     ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
     {
@@ -159,7 +284,7 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
     return;
 }
 
-Console.WriteLine("VirtualDualSenseUsbip M2.2 protocol core + M2.3 live HID device");
+Console.WriteLine("VirtualDualSenseUsbip M2.2-M2.5 protocol, HID, UAC1, and ISO spike");
 Console.WriteLine("  selftest              USB/IP protocol golden vectors + fragmentation");
 Console.WriteLine("  devicetest [fixtures] replay captured EP0 enumeration byte-exact");
 Console.WriteLine("  servertest [fixtures] exercise the live server over loopback TCP");

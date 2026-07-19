@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using HidSharp;
 using Microsoft.Win32.SafeHandles;
@@ -22,21 +23,36 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IDisposa
     private const byte BluetoothInputCrcSeed = 0xA1;
     private const byte BluetoothOutputCrcSeed = 0xA2;
     private const byte BluetoothFeatureCrcSeed = 0xA3;
+    private const int BluetoothHapticOutputLength = 398;
+    private const int HapticFramesPerReport = 32;
+    private const int HapticBytesPerReport = HapticFramesPerReport * 2;
+    private const int UsbAudioChannels = 4;
+    private const int UsbAudioBytesPerFrame = UsbAudioChannels * 2;
+    private const int UsbToBluetoothHapticDecimation = 16;
+    private const double HapticReportPeriodMs = HapticFramesPerReport * 1000.0 / 3000.0;
 
     private readonly SafeFileHandle handle;
     private readonly int inputReportLength;
     private readonly Action<string> log;
     private readonly Thread readThread;
     private readonly Thread outputThread;
+    private readonly Thread hapticThread;
     private readonly AutoResetEvent outputAvailable = new(initialState: false);
+    private readonly AutoResetEvent hapticAvailable = new(initialState: false);
     private readonly object outputQueueGate = new();
     private readonly object outputWriteGate = new();
     private byte[] latestReport = new NeutralInputReportSource().CreateReport(UsbInputLength);
     private byte[]? pendingTriggerOutput;
     private byte[]? lastQueuedTriggerOutput;
+    private readonly HapticPcmRing hapticPcm = new(capacityBytes: 1200);
+    private long lastHapticInputTimestamp;
+    private int hapticStreamingRequested;
     private long validReportCount;
     private long invalidReportCount;
     private long relayedTriggerReportCount;
+    private long relayedHapticReportCount;
+    private long hapticWriteErrorCount;
+    private long hapticUnderrunCount;
     private int disposed;
 
     public string Description { get; }
@@ -44,6 +60,10 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IDisposa
     public long ValidReportCount => Interlocked.Read(ref validReportCount);
     public long InvalidReportCount => Interlocked.Read(ref invalidReportCount);
     public long RelayedTriggerReportCount => Interlocked.Read(ref relayedTriggerReportCount);
+    public long RelayedHapticReportCount => Interlocked.Read(ref relayedHapticReportCount);
+    public long HapticWriteErrorCount => Interlocked.Read(ref hapticWriteErrorCount);
+    public long HapticUnderrunCount => Interlocked.Read(ref hapticUnderrunCount);
+    public int HapticQueueBytes => hapticPcm.Count;
 
     private BluetoothDualSenseInputSource(HidDevice device, SafeFileHandle handle,
         int inputReportLength, Action<string> log)
@@ -63,8 +83,15 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IDisposa
             IsBackground = true,
             Name = "Virtual DualSense trigger output",
         };
+        hapticThread = new Thread(HapticLoop)
+        {
+            IsBackground = true,
+            Priority = ThreadPriority.AboveNormal,
+            Name = "Virtual DualSense native haptic audio",
+        };
         readThread.Start();
         outputThread.Start();
+        hapticThread.Start();
     }
 
     public static BluetoothDualSenseInputSource Open(Action<string>? log = null)
@@ -149,6 +176,78 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IDisposa
         }
         outputAvailable.Set();
         return true;
+    }
+
+    /// <summary>
+    /// Queues native wired DualSense haptic channels 3/4. The USB endpoint is
+    /// 4-channel, 48 kHz, signed 16-bit PCM; Bluetooth report 0x36 carries
+    /// stereo signed 8-bit PCM at 3 kHz, so each 16-frame group is averaged.
+    /// </summary>
+    public bool QueueHapticAudio(ReadOnlySpan<byte> usbFourChannelPcm16)
+    {
+        if (Volatile.Read(ref disposed) != 0 ||
+            usbFourChannelPcm16.Length < UsbAudioBytesPerFrame * UsbToBluetoothHapticDecimation ||
+            usbFourChannelPcm16.Length % UsbAudioBytesPerFrame != 0)
+        {
+            return false;
+        }
+
+        int outputBytes = usbFourChannelPcm16.Length /
+            (UsbAudioBytesPerFrame * UsbToBluetoothHapticDecimation) * 2;
+        byte[] converted = new byte[outputBytes];
+        int written = ConvertUsbHapticPcm(usbFourChannelPcm16, converted);
+        bool hasEnergy = false;
+        for (int i = 0; i < written; i++)
+        {
+            if (converted[i] != 0)
+            {
+                hasEnergy = true;
+                break;
+            }
+        }
+        if (!hasEnergy)
+        {
+            // An open game endpoint commonly carries ordinary channels 1/2
+            // while native haptic channels remain silent. Let an active stream
+            // drain and send its silence tail, but do not keep 0x36 alive forever.
+            return true;
+        }
+
+        hapticPcm.Write(converted.AsSpan(0, written));
+        Interlocked.Exchange(ref lastHapticInputTimestamp, Stopwatch.GetTimestamp());
+        if (Interlocked.Exchange(ref hapticStreamingRequested, 1) == 0)
+        {
+            hapticAvailable.Set();
+        }
+        return true;
+    }
+
+    internal static int ConvertUsbHapticPcm(ReadOnlySpan<byte> usbFourChannelPcm16,
+        Span<byte> bluetoothStereoPcm8)
+    {
+        int usbFrames = usbFourChannelPcm16.Length / UsbAudioBytesPerFrame;
+        int groups = Math.Min(usbFrames / UsbToBluetoothHapticDecimation,
+            bluetoothStereoPcm8.Length / 2);
+        for (int group = 0; group < groups; group++)
+        {
+            int leftSum = 0;
+            int rightSum = 0;
+            for (int sample = 0; sample < UsbToBluetoothHapticDecimation; sample++)
+            {
+                int frameOffset = (group * UsbToBluetoothHapticDecimation + sample) *
+                    UsbAudioBytesPerFrame;
+                leftSum += BinaryPrimitives.ReadInt16LittleEndian(
+                    usbFourChannelPcm16.Slice(frameOffset + 4, 2));
+                rightSum += BinaryPrimitives.ReadInt16LittleEndian(
+                    usbFourChannelPcm16.Slice(frameOffset + 6, 2));
+            }
+
+            int left = leftSum / UsbToBluetoothHapticDecimation / 256;
+            int right = rightSum / UsbToBluetoothHapticDecimation / 256;
+            bluetoothStereoPcm8[group * 2] = unchecked((byte)(sbyte)Math.Clamp(left, -128, 127));
+            bluetoothStereoPcm8[group * 2 + 1] = unchecked((byte)(sbyte)Math.Clamp(right, -128, 127));
+        }
+        return groups * 2;
     }
 
     internal static bool TryConvertBluetoothReport(ReadOnlySpan<byte> bluetoothReport,
@@ -263,6 +362,153 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IDisposa
         }
     }
 
+    private void HapticLoop()
+    {
+        byte[] chunk = new byte[HapticBytesPerReport];
+        byte[] report = new byte[BluetoothHapticOutputLength];
+        byte sequence = 0;
+        byte packetCounter = 0;
+
+        while (true)
+        {
+            hapticAvailable.WaitOne();
+            if (Volatile.Read(ref disposed) != 0)
+            {
+                return;
+            }
+
+            // About 30 ms protects the 10.667 ms Bluetooth clock from the
+            // measured 2..17 ms USB/IP arrival jitter without unbounded delay.
+            Thread.Sleep(30);
+            Stopwatch clock = Stopwatch.StartNew();
+            double nextDeadlineMs = 0;
+            int trailingSilenceReports = 0;
+            bool loggedStart = false;
+
+            while (Volatile.Read(ref disposed) == 0)
+            {
+                int copied = hapticPcm.ReadPartial(chunk);
+                if (copied < chunk.Length)
+                {
+                    Array.Clear(chunk, copied, chunk.Length - copied);
+                }
+
+                double inputAgeMs = (Stopwatch.GetTimestamp() -
+                    Interlocked.Read(ref lastHapticInputTimestamp)) * 1000.0 / Stopwatch.Frequency;
+                if (copied < chunk.Length && inputAgeMs <= 100)
+                {
+                    Interlocked.Increment(ref hapticUnderrunCount);
+                }
+                if (copied == 0 && inputAgeMs > 100)
+                {
+                    trailingSilenceReports++;
+                }
+                else
+                {
+                    trailingSilenceReports = 0;
+                }
+
+                nextDeadlineMs += HapticReportPeriodMs;
+                double waitMs = nextDeadlineMs - clock.Elapsed.TotalMilliseconds;
+                if (waitMs > 2)
+                {
+                    Thread.Sleep((int)(waitMs - 1));
+                }
+                while (clock.Elapsed.TotalMilliseconds < nextDeadlineMs)
+                {
+                    Thread.SpinWait(80);
+                }
+                if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > 100)
+                {
+                    nextDeadlineMs = clock.Elapsed.TotalMilliseconds;
+                }
+
+                BuildBluetoothHapticReport(report, sequence, packetCounter, chunk);
+                sequence = (byte)((sequence + 1) & 0x0F);
+                packetCounter++;
+                if (!WriteBluetoothReport(report, out int error))
+                {
+                    long errors = Interlocked.Increment(ref hapticWriteErrorCount);
+                    if (errors <= 3 && Volatile.Read(ref disposed) == 0)
+                    {
+                        log($"Bluetooth native-haptic relay write failed (Win32 error {error}).");
+                    }
+                }
+                else
+                {
+                    long count = Interlocked.Increment(ref relayedHapticReportCount);
+                    if (!loggedStart)
+                    {
+                        loggedStart = true;
+                        log($"Relayed native USB haptic channels 3/4 to Bluetooth report 0x36 " +
+                            $"(first stream report {count}).");
+                    }
+                }
+
+                if (trailingSilenceReports < 6)
+                {
+                    continue;
+                }
+
+                Interlocked.Exchange(ref hapticStreamingRequested, 0);
+                if (hapticPcm.Count > 0 &&
+                    Interlocked.Exchange(ref hapticStreamingRequested, 1) == 0)
+                {
+                    continue;
+                }
+                log($"Bluetooth native-haptic stream idled after " +
+                    $"{RelayedHapticReportCount} total report 0x36 writes.");
+                break;
+            }
+        }
+    }
+
+    internal static void BuildBluetoothHapticReport(Span<byte> report, byte sequence,
+        byte packetCounter, ReadOnlySpan<byte> signedStereoPcm8)
+    {
+        if (report.Length < BluetoothHapticOutputLength ||
+            signedStereoPcm8.Length < HapticBytesPerReport)
+        {
+            throw new ArgumentException("Bluetooth haptic report buffers are too short.");
+        }
+
+        report[..BluetoothHapticOutputLength].Clear();
+        report[0] = 0x36;
+        report[1] = (byte)((sequence & 0x0F) << 4);
+        report[2] = 0x91;
+        report[3] = 0x07;
+        report[4] = 0xFE;
+        report[5] = 0x20;
+        report[6] = 0x20;
+        report[7] = 0x20;
+        report[8] = 0x20;
+        report[9] = 0x20;
+        report[10] = packetCounter;
+        report[11] = 0x90;
+        report[12] = (byte)KnownHapticState.Length;
+        KnownHapticState.CopyTo(report.Slice(13, KnownHapticState.Length));
+        report[76] = 0x92;
+        report[77] = HapticBytesPerReport;
+        signedStereoPcm8[..HapticBytesPerReport].CopyTo(
+            report.Slice(78, HapticBytesPerReport));
+        uint crc = ComputeBluetoothCrc(BluetoothOutputCrcSeed,
+            report[..(BluetoothHapticOutputLength - 4)]);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            report.Slice(BluetoothHapticOutputLength - 4, 4), crc);
+    }
+
+    private static readonly byte[] KnownHapticState =
+    {
+        0xFD, 0xF7, 0x00, 0x00,
+        0x7F, 0x64, 0xFF, 0x09, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0A,
+        0x07, 0x00, 0x00, 0x02, 0x01, 0x00, 0xFF, 0xD7, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+
     private bool WriteBluetoothReport(byte[] report, out int error)
     {
         lock (outputWriteGate)
@@ -346,9 +592,13 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IDisposa
         {
             _ = WriteBluetoothReport(clearBluetoothOutput, out _);
         }
+        byte[] silentHapticReport = new byte[BluetoothHapticOutputLength];
+        BuildBluetoothHapticReport(silentHapticReport, 0, 0, new byte[HapticBytesPerReport]);
+        _ = WriteBluetoothReport(silentHapticReport, out _);
 
         _ = NativeMethods.CancelIoEx(handle, IntPtr.Zero);
         outputAvailable.Set();
+        hapticAvailable.Set();
         if (Thread.CurrentThread != readThread)
         {
             _ = readThread.Join(TimeSpan.FromSeconds(2));
@@ -357,9 +607,60 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IDisposa
         {
             _ = outputThread.Join(TimeSpan.FromSeconds(2));
         }
+        if (Thread.CurrentThread != hapticThread)
+        {
+            _ = hapticThread.Join(TimeSpan.FromSeconds(2));
+        }
         handle.Dispose();
         outputAvailable.Dispose();
+        hapticAvailable.Dispose();
         GC.SuppressFinalize(this);
+    }
+
+    private sealed class HapticPcmRing
+    {
+        private readonly byte[] buffer;
+        private readonly object gate = new();
+        private int head;
+        private int count;
+
+        public HapticPcmRing(int capacityBytes) => buffer = new byte[capacityBytes & ~1];
+        public int Count { get { lock (gate) return count; } }
+
+        public void Write(ReadOnlySpan<byte> source)
+        {
+            lock (gate)
+            {
+                int bytes = source.Length & ~1;
+                for (int i = 0; i < bytes; i += 2)
+                {
+                    if (count > buffer.Length - 2)
+                    {
+                        head = (head + 2) % buffer.Length;
+                        count -= 2;
+                    }
+                    int tail = (head + count) % buffer.Length;
+                    buffer[tail] = source[i];
+                    buffer[(tail + 1) % buffer.Length] = source[i + 1];
+                    count += 2;
+                }
+            }
+        }
+
+        public int ReadPartial(Span<byte> destination)
+        {
+            lock (gate)
+            {
+                int bytes = Math.Min(count, destination.Length) & ~1;
+                for (int i = 0; i < bytes; i++)
+                {
+                    destination[i] = buffer[head];
+                    head = (head + 1) % buffer.Length;
+                }
+                count -= bytes;
+                return bytes;
+            }
+        }
     }
 
     private static class NativeMethods
