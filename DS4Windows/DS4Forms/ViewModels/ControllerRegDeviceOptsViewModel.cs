@@ -442,11 +442,7 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             service.NativeModeManager.StateChanged -= NativeModeManager_StateChanged;
         }
 
-        private bool IsNativeModeSessionActive => DS4Devices.NativeModeGuard.IsActive ||
-            service.NativeModeManager.State == NativeModeState.Starting ||
-            service.NativeModeManager.State == NativeModeState.Serving ||
-            service.NativeModeManager.State == NativeModeState.Attached ||
-            service.NativeModeManager.State == NativeModeState.PadLost;
+        private bool IsNativeModeSessionActive => service.IsNativeModeSessionActive;
 
         private void ApplyNativeSettingsToCurrentController()
         {

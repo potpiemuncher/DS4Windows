@@ -78,11 +78,11 @@ namespace DS4Windows
         private readonly SemaphoreSlim lifecycleGate = new SemaphoreSlim(1, 1);
         private readonly object stateGate = new object();
         private readonly object statsGate = new object();
-        private Process serverProcess;
+        private volatile Process serverProcess;
         private Task standardOutputTask = Task.CompletedTask;
         private Task standardErrorTask = Task.CompletedTask;
         private Task exitMonitorTask = Task.CompletedTask;
-        private bool stopping;
+        private volatile bool stopping;
         private NativeModeState state = NativeModeState.Stopped;
         private string stateDetail = "Native mode server stopped.";
         private NativeModeStatsSnapshot latestStats =
@@ -107,6 +107,12 @@ namespace DS4Windows
                     return latestStats;
             }
         }
+
+        /// <summary>
+        /// Remains true until teardown has disposed the child, including after
+        /// an unexpected exit or a failed stop that should be retried.
+        /// </summary>
+        public bool HasOwnedProcess => serverProcess != null;
 
         public async Task WaitForServingAsync(TimeSpan timeout,
             CancellationToken cancellationToken = default)
@@ -299,14 +305,20 @@ namespace DS4Windows
             string line;
             while ((line = await reader.ReadLineAsync().ConfigureAwait(false)) != null)
             {
-                AppLogger.LogToGui($"[native] {line}", warning);
-                HandleLogLine(line);
+                if (ProcessLogLine(line, warning))
+                    AppLogger.LogToGui($"[native] {line}", warning);
             }
         }
 
-        private void HandleLogLine(string line)
+        internal bool ProcessLogLine(string line, bool warning)
         {
             NativeModeLogKind kind = NativeModeLogClassifier.Classify(line);
+            HandleLogLine(line, kind);
+            return NativeModeLogPolicy.ShouldForwardToGui(kind, warning);
+        }
+
+        private void HandleLogLine(string line, NativeModeLogKind kind)
+        {
             switch (kind)
             {
                 case NativeModeLogKind.ServerListening:

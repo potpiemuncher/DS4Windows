@@ -97,9 +97,14 @@ namespace DS4Windows
         private readonly NativeModeElevationBroker nativeModeElevationBroker =
             new NativeModeElevationBroker();
         private readonly SemaphoreSlim nativeModeLifecycleGate = new SemaphoreSlim(1, 1);
+        private volatile bool nativeModeShutdownRequested;
         public NativeModeManager NativeModeManager => nativeModeManager;
         public NativeModeElevationBroker NativeModeElevationBroker =>
             nativeModeElevationBroker;
+        public bool IsNativeModeSessionActive =>
+            NativeModeLifecyclePolicy.IsSessionActive(nativeModeManager.State,
+                DS4Devices.NativeModeGuard.IsActive,
+                nativeModeManager.HasOwnedProcess);
 
         private DS4WinWPF.ArgumentParser cmdParser;
 
@@ -237,6 +242,7 @@ namespace DS4Windows
             DS4Devices.PostDS4Init = PostDS4DeviceInit;
             DS4Devices.PreparePendingDevice = CheckForSupportedDevice;
             outputslotMan.ViGEmFailure += OutputslotMan_ViGEmFailure;
+            nativeModeManager.StateChanged += NativeModeManager_StateChanged;
 
             Global.UDPServerSmoothingMincutoffChanged += ChangeUdpSmoothingAttrs;
             Global.UDPServerSmoothingBetaChanged += ChangeUdpSmoothingAttrs;
@@ -614,6 +620,7 @@ namespace DS4Windows
 
         public void ShutDown()
         {
+            StopNativeModeForShutdown();
             outputslotMan.ShutDown();
             OutputSlotPersist.WriteConfig(outputslotMan);
 
@@ -1568,6 +1575,7 @@ namespace DS4Windows
 
         public bool Start(bool showlog = true)
         {
+            nativeModeShutdownRequested = false;
             inServiceTask = true;
             StartViGEm();
             if (vigemTestClient != null)
@@ -1803,10 +1811,19 @@ namespace DS4Windows
 
         public bool Stop(bool showlog = true, bool immediateUnplug = false)
         {
-            if (running)
+            bool wasRunning = running;
+            if (wasRunning)
             {
                 running = false;
                 runHotPlug = false;
+            }
+
+            // This is intentionally synchronous: service shutdown must not
+            // return while its native-mode child can still own the virtual pad.
+            StopNativeModeForShutdown();
+
+            if (wasRunning)
+            {
                 inServiceTask = true;
                 PreServiceStop?.Invoke(this, EventArgs.Empty);
 
@@ -1923,7 +1940,7 @@ namespace DS4Windows
 
         public bool HotPlug()
         {
-            if (running)
+            if (running && !nativeModeShutdownRequested)
             {
                 inServiceTask = true;
                 loopControllers = true;
@@ -2059,7 +2076,13 @@ namespace DS4Windows
             await nativeModeLifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                if (!running)
+                if (IsNativeModeSessionActive)
+                {
+                    throw new InvalidOperationException(
+                        "Native mode is already active. Stop it before starting another session.");
+                }
+
+                if (nativeModeShutdownRequested || !running)
                     throw new InvalidOperationException("DS4Windows service is not running.");
 
                 if (deviceIndex < 0 || deviceIndex >= DS4Controllers.Length)
@@ -2093,6 +2116,10 @@ namespace DS4Windows
                     await Task.Run(() => ReleaseControllerForNativeMode(device, deviceIndex))
                         .ConfigureAwait(false);
 
+                    if (nativeModeShutdownRequested)
+                        throw new InvalidOperationException(
+                            "DS4Windows is stopping; native mode was canceled.");
+
                     await nativeModeManager.StartAsync(serverArguments,
                         CancellationToken.None).ConfigureAwait(false);
 
@@ -2116,19 +2143,22 @@ namespace DS4Windows
                 {
                     NativeModeState failedState = nativeModeManager.State;
                     await RecoverControllerAfterFailedNativeStartAsync().ConfigureAwait(false);
-                    if (attachFailure?.FailureKind ==
-                        NativeModeAttachFailureKind.SetupRequired)
+                    if (!nativeModeShutdownRequested)
                     {
-                        nativeModeManager.MarkSetupRequired(attachFailure.Reason);
-                    }
-                    else if (failedState == NativeModeState.PadLost)
-                    {
-                        nativeModeManager.MarkPadLost(ex.Message);
-                    }
-                    else
-                    {
-                        nativeModeManager.MarkFaulted(
-                            attachFailure?.Reason ?? ex.Message);
+                        if (attachFailure?.FailureKind ==
+                            NativeModeAttachFailureKind.SetupRequired)
+                        {
+                            nativeModeManager.MarkSetupRequired(attachFailure.Reason);
+                        }
+                        else if (failedState == NativeModeState.PadLost)
+                        {
+                            nativeModeManager.MarkPadLost(ex.Message);
+                        }
+                        else
+                        {
+                            nativeModeManager.MarkFaulted(
+                                attachFailure?.Reason ?? ex.Message);
+                        }
                     }
                     throw;
                 }
@@ -2165,20 +2195,106 @@ namespace DS4Windows
         public async Task StopNativeModeAsync(
             CancellationToken cancellationToken = default)
         {
+            await StopNativeModeAsync(rescanAfterStop: true, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        public void StopNativeModeForShutdown()
+        {
+            nativeModeShutdownRequested = true;
+            try
+            {
+                StopNativeModeAsync(rescanAfterStop: false,
+                    CancellationToken.None).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                AppLogger.LogToGui(
+                    $"[native] Failed to stop native mode during shutdown: {ex.Message}",
+                    true);
+            }
+        }
+
+        private async Task StopNativeModeAsync(bool rescanAfterStop,
+            CancellationToken cancellationToken)
+        {
             await nativeModeLifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                if (!IsNativeModeSessionActive)
+                    return;
+
+                await StopNativeModeUnderGateAsync(rescanAfterStop)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                nativeModeLifecycleGate.Release();
+            }
+        }
+
+        private async Task StopNativeModeUnderGateAsync(bool rescanAfterStop)
+        {
+            try
+            {
+                await nativeModeManager.StopAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                DS4Devices.EndNativeModeSuppression();
+                if (rescanAfterStop && running)
+                    HotPlug();
+            }
+        }
+
+        private void NativeModeManager_StateChanged(object sender,
+            NativeModeStateChangedEventArgs e)
+        {
+            if (!nativeModeShutdownRequested &&
+                NativeModeLifecyclePolicy.RequiresAutomaticCleanup(e.State,
+                DS4Devices.NativeModeGuard.IsActive))
+            {
+                _ = CleanupTerminatedNativeModeAsync(e.State, e.Detail);
+            }
+        }
+
+        private async Task CleanupTerminatedNativeModeAsync(
+            NativeModeState terminalState, string detail)
+        {
+            await nativeModeLifecycleGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (nativeModeShutdownRequested ||
+                    !NativeModeLifecyclePolicy.RequiresAutomaticCleanup(
+                    terminalState, DS4Devices.NativeModeGuard.IsActive))
+                {
+                    return;
+                }
+
                 try
                 {
-                    await nativeModeManager.StopAsync(CancellationToken.None)
+                    await StopNativeModeUnderGateAsync(rescanAfterStop: true)
                         .ConfigureAwait(false);
                 }
-                finally
+                catch (Exception ex)
                 {
-                    DS4Devices.EndNativeModeSuppression();
-                    if (running)
-                        HotPlug();
+                    AppLogger.LogToGui(
+                        $"[native] Automatic native-mode cleanup failed: {ex.Message}",
+                        true);
                 }
+
+                if (terminalState == NativeModeState.PadLost)
+                    nativeModeManager.MarkPadLost(detail);
+                else
+                    nativeModeManager.MarkFaulted(detail);
+            }
+            catch (Exception ex)
+            {
+                // This method is launched from a state event; observe every
+                // exception so a teardown failure cannot become unobserved.
+                AppLogger.LogToGui(
+                    $"[native] Native-mode recovery failed: {ex.Message}", true);
             }
             finally
             {

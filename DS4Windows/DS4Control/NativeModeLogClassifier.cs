@@ -64,4 +64,26 @@ namespace DS4Windows
             return NativeModeLogKind.Other;
         }
     }
+
+    /// <summary>
+    /// Keeps high-rate telemetry out of the WPF log while retaining it in the
+    /// manager's snapshots. State markers, rebuffers, and stderr remain visible.
+    /// </summary>
+    public static class NativeModeLogPolicy
+    {
+        public static bool ShouldForwardToGui(NativeModeLogKind kind,
+            bool fromStandardError)
+        {
+            if (kind == NativeModeLogKind.IsochronousOutStats ||
+                kind == NativeModeLogKind.AudioStats)
+            {
+                return false;
+            }
+
+            return fromStandardError || kind == NativeModeLogKind.ServerListening ||
+                kind == NativeModeLogKind.PadOpenFailure ||
+                kind == NativeModeLogKind.PadLost ||
+                kind == NativeModeLogKind.SpeakerRebuffer;
+        }
+    }
 }
