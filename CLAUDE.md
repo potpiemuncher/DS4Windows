@@ -14,7 +14,8 @@ Repository state:
 - Fork: `https://github.com/potpiemuncher/DS4Windows.git`
 - Upstream: `https://github.com/ds4windowsapp/DS4Windows.git`
 - Active branch: `feature/bt-audio-haptics`
-- Latest implementation checkpoint: `1e454b7`
+- Latest implementation checkpoint: `1e454b7` (streamer stability); native-game
+  haptics end-to-end validation documented 2026-07-19 (see below)
 
 Read `doc/BT_AUDIO_HAPTICS_RESEARCH.md` and
 `doc/VIRTUAL_DUALSENSE_DESIGN.md` before changing the protocol or Phase 4
@@ -40,6 +41,12 @@ DualSense:
 - On 2026-07-19, a controlled three-pulse 120 Hz system-audio test reached the
   physical controller through `System Audio + Rumble` on the stabilized build;
   the user confirmed exactly three pulses.
+- **On 2026-07-19 the full native-game path was validated end to end.** Assassin's
+  Creed Black Flag Resynced ran against the virtual wired DualSense (usbip
+  composite) while the physical pad stayed on Bluetooth; the game's own haptic
+  audio on isochronous channels 3/4 was relayed to the physical controller as
+  `0x36` reports, and **the user physically felt it in their hands.** This closes
+  the last open Phase 4 milestone.
 
 `System Audio + Rumble` means audio-derived haptic PCM and synthesized XInput
 rumble are mixed into the same voice-coil haptic stream. It does not itself
@@ -217,12 +224,48 @@ At 10:50:45 the controller logged read failure 1167 and Windows `HidBth` event 2
 its idle timeout and powered off, then manually turned it back on. It reconnected
 normally; this event is not evidence of a writer or teardown regression.
 
+## Native-Game Haptics Validation (2026-07-19) — MILESTONE MET
+
+The previously-open gap ("a native game has not yet been shown to emit nonzero
+channels 3/4 through this path") is now closed. Assassin's Creed Black Flag
+Resynced was run against the attached composite virtual DualSense
+(`serve --configuration composite --input bluetooth --capture ...`, then
+`usbip attach ... --serial DS4WSPKCOMP001 --once`). DS4Windows was closed for the
+run so the emulator's `--input bluetooth` bridge was the sole owner of the
+physical pad; the native game does not need DS4Windows or XInput.
+
+Evidence (server ISO meter, `artifacts/m2-native/blackflag-20260719-111224.*`):
+
+- Clean pre-game baseline: audio streaming interfaces at alt 0, no ISO ch3/4
+  activity, `bt36=0`.
+- ISO stream opened at the correct format: ten 384-byte packets per URB,
+  ~99 URBs/s (~370 KiB/s), interval 4.
+- Multiple game-authored haptic bursts on channels 3/4 with channels 1/2 either
+  silent (haptic-only) or co-active (explosions driving speaker + actuators):
+  observed ch3/ch4 peaks of 19.1/23.4%, 11.1/9.9%, and **50.4/24.2%**; ch3/ch4
+  RMS up to ~4.4%.
+- Return to silent baseline (ch3/ch4 → 0.00, relay counter frozen) whenever
+  gameplay paused — confirming the bursts were game-driven, not an artifact.
+- **461 haptic `0x36` reports relayed to the physical pad, zero Bluetooth write
+  errors across the whole session (~285k ISO frames, 0 `bt-errors`).**
+- No synth exists in this path, so all channel-3/4 energy is game-authored.
+- The user physically confirmed feeling it.
+- Graceful teardown: game closed, `usbip detach -p 1`, server stopped, DS4Windows
+  restarted. Virtual device removed cleanly, no stuck devnode, no bugcheck; the
+  UNLINK/teardown fix held.
+
+Known follow-up (not a blocker): `bt-underrun` rose to ~90 because the game's
+haptics are burstier than the earlier steady-tone test. Add a small prebuffer /
+deeper queue to `BluetoothDualSenseInputSource`'s haptic relay so bursty content
+does not momentarily drain the relay queue. Zero write errors throughout, so this
+is a smoothing refinement, not a correctness fix.
+
 ## Current Limitation
 
-M2.5 ISO pacing and the controlled M2.6 haptic relay now work, but a native game
-has not yet been shown to emit nonzero channels 3/4 through this path. Audible
-USB channels 1/2 are metered only; this spike does not relay cable-like
-controller speaker/headphone audio.
+The native-game haptic path is validated. Remaining spike limitations: only the
+haptic channels (3/4) are relayed — this path does not relay cable-like
+controller speaker/headphone audio (channels 1/2 are metered only); a native
+game speaker-audio relay and the microphone path (Phase 3b) are not implemented.
 
 The primary PC previously bugchecked at 7:24 PM during removal of
 `USB\VID_054C&PID_0CE6\DS4WSPKM26001`. The minidump reports
@@ -237,14 +280,33 @@ request with no failed, duplicate, orphaned, or late completion. The user
 accepted that evidence and declared the teardown issue fixed; the primary-PC
 safety hold is lifted.
 
-## Next Milestone: Native DualSense Game Compatibility
+## Phase 4: Native DualSense Game Compatibility — ACHIEVED (2026-07-19)
 
-The architecture is a user-space virtual wired DualSense composite USB device
-(HID plus UAC1 audio) exposed through usbip-win2's signed VHCI driver. The real
-controller remains connected over Bluetooth; native game output is translated
-and forwarded through the proven Bluetooth `0x36` streamer.
+The core goal is met end to end. The architecture is a user-space virtual wired
+DualSense composite USB device (HID plus UAC1 audio) exposed through usbip-win2's
+signed VHCI driver. The real controller stays on Bluetooth; native game HID output
+(adaptive triggers) and isochronous haptic audio (channels 3/4) are translated and
+forwarded through the proven Bluetooth `0x36`/`0x31` streamers, and a real native
+game (Black Flag Resynced) was felt on the physical pad.
 
-Status and order:
+### Remaining work (polish / optional, none blocking the core result)
+
+1. **Relay smoothing**: add a small prebuffer / deeper queue to the haptic relay
+   in `BluetoothDualSenseInputSource` so bursty game haptics stop draining the
+   queue (observed `bt-underrun` ~90; zero write errors — this is feel polish).
+2. **Endurance**: a one-hour continuous native-game session with underrun/error
+   counters and a clean detach at the end.
+3. **Ergonomics**: the run currently requires closing DS4Windows, launching the
+   emulator, and an elevated `usbip attach`. Fold the attach/serve lifecycle into
+   DS4Windows (or a helper) so it is one action, and auto-detach on exit.
+4. **Trigger coverage**: capture the remaining trigger programs beyond the two
+   Black Flag modes; test more native titles (SDL3, other libScePad games).
+5. **Optional features**: native-game speaker audio relay (channels 1/2), and the
+   microphone path (Phase 3b) which needs a virtual audio capture driver.
+6. **Upstream**: when the user is ready, prepare the PR to ds4windowsapp/DS4Windows
+   with credits (egormanga/SAxense, awalol/DS5Dongle) and the usbip-win2 BSD notice.
+
+### Milestone status and order (all core milestones PASSED):
 
 1. **M2.0 complete**: exact wired DualSense descriptors/fixtures live under
    `utils/DSCompatProbe/fixtures/dualsense_usb_0ce6`.
@@ -299,7 +361,7 @@ Status and order:
    (375.1 KiB/s). A 105-second run stayed connected at the exact long-term rate.
    The first immediate-completion experiment produced an invalid approximately
    11,000 URBs/s / 41 MiB/s loop; never restore immediate ISO completion.
-7. **M2.6 controlled relay PASSED; game validation pending (2026-07-18)**:
+7. **M2.6 relay PASSED, including native-game validation (2026-07-18/19)**:
    48 kHz signed 16-bit channels 3/4 are reduced to 3 kHz signed 8-bit stereo
    and sent in authenticated 398-byte Bluetooth report `0x36` frames. The
    controlled tone measured 9.56-10.61% RMS and 15% peaks on channels 3/4,
@@ -307,6 +369,11 @@ Status and order:
    A separate 120 Hz / 25% run sent 503 haptic reports with zero write errors.
    Silence suppression drains a six-report tail and then idles. The native
    11-byte adaptive-trigger relay remains proven in M2.3.
+   **On 2026-07-19 a real native game (Black Flag Resynced) drove this path**:
+   game-authored channel-3/4 haptics (peaks to 50.4%) relayed to the physical
+   pad as 461 `0x36` reports with zero write errors, correlated with in-game
+   events, and the user felt it. See "Native-Game Haptics Validation" above.
+   Follow-up: add a relay-queue prebuffer to smooth bursty-content underruns.
 8. **Live teardown fix PASSED (2026-07-18)**: the 7:24 PM bugcheck happened
    while this composite instance was being removed. The emulator's
    UNLINK/completion race is fixed with an atomic
