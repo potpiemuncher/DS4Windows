@@ -670,10 +670,18 @@ internal sealed class UsbIpDeviceSession
                 pendingIsochronous.TryRemove(submit.Basic.SequenceNumber, out _);
             }
 
+            // Ideal timeline: chain from the SCHEDULED completion instant, not
+            // the post-write clock. Ratcheting from `now` folded per-URB write
+            // overhead into the stream clock — measured 98.8 URBs/s instead of
+            // 100, i.e. the audio engine (whose pin clock follows these
+            // completions) fed audio 1.2 % slower than the Bluetooth side
+            // consumes, draining the relay buffer every few seconds. Resync
+            // only after falling far behind (bounded catch-up, never a burst
+            // loop — immediate ISO completion remains forbidden).
             now = Stopwatch.GetTimestamp();
-            // Store the last completion point, not the following deadline. The
-            // next URB adds its own packet duration and never bursts to catch up.
-            nextCompletionTimestamp = Math.Max(completionTimestamp, now);
+            nextCompletionTimestamp = now - completionTimestamp > Stopwatch.Frequency / 20
+                ? now
+                : completionTimestamp;
         }
     }
 
@@ -734,10 +742,12 @@ internal sealed class UsbIpDeviceSession
                 pendingIsochronousIn.TryRemove(submit.Basic.SequenceNumber, out _);
             }
 
+            // Ideal timeline with bounded catch-up — same reasoning as the OUT
+            // pump: post-write ratcheting would run the capture clock slow.
             now = Stopwatch.GetTimestamp();
-            // Store the last completion point, not the following deadline. The
-            // next URB adds its own packet duration and never bursts to catch up.
-            nextCompletionTimestamp = Math.Max(completionTimestamp, now);
+            nextCompletionTimestamp = now - completionTimestamp > Stopwatch.Frequency / 20
+                ? now
+                : completionTimestamp;
         }
     }
 
