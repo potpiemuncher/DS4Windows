@@ -93,6 +93,18 @@ namespace DS4Windows
         private ControlServiceDeviceOptions deviceOptions;
         public ControlServiceDeviceOptions DeviceOptions { get => deviceOptions; }
 
+        private readonly NativeModeManager nativeModeManager = new NativeModeManager();
+        private readonly SemaphoreSlim nativeModeLifecycleGate = new SemaphoreSlim(1, 1);
+        private static readonly string[] NativeModeServerArguments =
+        {
+            "serve",
+            "--configuration", "composite",
+            "--input", "bluetooth",
+            "--speaker-audio", "on",
+            "--route", "auto",
+        };
+        public NativeModeManager NativeModeManager => nativeModeManager;
+
         private DS4WinWPF.ArgumentParser cmdParser;
 
         public event EventHandler ServiceStarted;
@@ -1945,7 +1957,9 @@ namespace DS4Windows
                 {
                     DS4Device device = devEnum.Current;
 
-                    if (device.isDisconnectingStatus())
+                    if (device.isDisconnectingStatus() ||
+                        DS4Devices.NativeModeGuard.ShouldSuppress(
+                            device.getMacAddress(), device.HidDevice.DevicePath))
                         continue;
 
                     // Use local method rather than Func
@@ -2041,6 +2055,125 @@ namespace DS4Windows
             }
 
             return true;
+        }
+
+        public async Task StartNativeModeAsync(int deviceIndex,
+            CancellationToken cancellationToken = default)
+        {
+            await nativeModeLifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (!running)
+                    throw new InvalidOperationException("DS4Windows service is not running.");
+
+                if (deviceIndex < 0 || deviceIndex >= DS4Controllers.Length)
+                    throw new ArgumentOutOfRangeException(nameof(deviceIndex));
+
+                DS4Device device = DS4Controllers[deviceIndex];
+                if (device == null || device.IsRemoved || device.IsRemoving ||
+                    device.isDisconnectingStatus())
+                {
+                    throw new InvalidOperationException(
+                        "The selected controller is no longer available.");
+                }
+
+                if (device.DeviceType != InputDevices.InputDeviceType.DualSense ||
+                    device.getConnectionType() != ConnectionType.BT)
+                {
+                    throw new InvalidOperationException(
+                        "Native mode requires a Bluetooth DualSense controller.");
+                }
+
+                string macAddress = device.getMacAddress();
+                string devicePath = device.HidDevice.DevicePath;
+                DS4Devices.BeginNativeModeSuppression(macAddress, devicePath);
+
+                try
+                {
+                    await Task.Run(() => ReleaseControllerForNativeMode(device, deviceIndex))
+                        .ConfigureAwait(false);
+
+                    await nativeModeManager.StartAsync(NativeModeServerArguments,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+                catch
+                {
+                    await RecoverControllerAfterFailedNativeStartAsync().ConfigureAwait(false);
+                    throw;
+                }
+            }
+            finally
+            {
+                nativeModeLifecycleGate.Release();
+            }
+        }
+
+        public async Task StopNativeModeAsync(
+            CancellationToken cancellationToken = default)
+        {
+            await nativeModeLifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                try
+                {
+                    await nativeModeManager.StopAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    DS4Devices.EndNativeModeSuppression();
+                    if (running)
+                        HotPlug();
+                }
+            }
+            finally
+            {
+                nativeModeLifecycleGate.Release();
+            }
+        }
+
+        private void ReleaseControllerForNativeMode(DS4Device device, int deviceIndex)
+        {
+            // StopUpdate cancels and joins the input thread and stops every
+            // output producer, including the DualSense haptics streamer.
+            device.StopUpdate();
+
+            // Cancellation usually raises Removal from the input thread. If it
+            // did not, explicitly run the same service and registry paths. Both
+            // are idempotent for an already-gone controller.
+            On_DS4Removal(device, EventArgs.Empty);
+            DS4Devices.RemoveDevice(device);
+
+            // DS4Windows' legacy CloseDevice only changes bookkeeping. Native
+            // mode additionally requires the kernel handle itself to be gone.
+            device.HidDevice.CloseDeviceHandle();
+            if (!device.HidDevice.IsDeviceHandleReleased ||
+                device.HidDevice.SafeReadHandle != null || device.HidDevice.IsOpen)
+                throw new InvalidOperationException("Failed to release the controller HID handle.");
+
+            if (ReferenceEquals(DS4Controllers[deviceIndex], device))
+                DS4Controllers[deviceIndex] = null;
+            activeControllers = DS4Controllers.Count(controller => controller != null);
+        }
+
+        private async Task RecoverControllerAfterFailedNativeStartAsync()
+        {
+            try
+            {
+                await nativeModeManager.StopAsync(CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                AppLogger.LogToGui(
+                    $"[native] Failed to stop server after startup failure: {ex.Message}", true);
+            }
+            finally
+            {
+                DS4Devices.EndNativeModeSuppression();
+                if (running)
+                    HotPlug();
+            }
         }
 
         private void PrepareConnectedInputControllerSettingEvents(int numControllers, DS4Device device, int index)
