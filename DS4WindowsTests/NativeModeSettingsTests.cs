@@ -98,9 +98,11 @@ public class NativeModeSettingsTests
 
     [DataTestMethod]
     [DataRow(NativeModeState.Serving,
-        "Server running — attach pending (complete setup in next phase).")]
+        "Server running — attaching virtual DualSense...")]
     [DataRow(NativeModeState.PadLost,
         "Pad lost — press PS, then Start Native Mode again.")]
+    [DataRow(NativeModeState.SetupRequired,
+        "Elevation setup required — select Set up native mode.")]
     public void StatusForState_ProvidesActionableNativeModeText(
         NativeModeState state, string expected)
     {

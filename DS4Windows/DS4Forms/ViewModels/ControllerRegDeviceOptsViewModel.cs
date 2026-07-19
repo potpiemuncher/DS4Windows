@@ -352,6 +352,10 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             !IsNativeModeSessionActive;
         public event EventHandler NativeModeSettingsEnabledChanged;
 
+        public bool NativeModeSetupCanRun => !nativeModeOperationInProgress &&
+            !IsNativeModeSessionActive;
+        public event EventHandler NativeModeSetupCanRunChanged;
+
         public string NativeModeStatus => nativeModeStatus;
         public event EventHandler NativeModeStatusChanged;
 
@@ -389,7 +393,41 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             }
             catch (Exception ex)
             {
-                nativeModeStatus = $"Native mode error: {ex.Message}";
+                NativeModeState state = service.NativeModeManager.State;
+                nativeModeStatus = state == NativeModeState.SetupRequired ||
+                    state == NativeModeState.Faulted
+                    ? StatusForState(state, ex.Message)
+                    : $"Native mode error: {ex.Message}";
+                NativeModeStatusChanged?.Invoke(this, EventArgs.Empty);
+            }
+            finally
+            {
+                nativeModeOperationInProgress = false;
+                NotifyNativeModeProperties();
+            }
+        }
+
+        public async Task SetupNativeModeAsync()
+        {
+            if (nativeModeOperationInProgress || IsNativeModeSessionActive)
+                return;
+
+            nativeModeOperationInProgress = true;
+            NotifyNativeModeProperties();
+            try
+            {
+                nativeModeStatus = "Requesting one-time native-mode elevation setup...";
+                NativeModeStatusChanged?.Invoke(this, EventArgs.Empty);
+                NativeModeAttachResult result =
+                    await service.EnsureNativeModeAttachTaskAsync();
+                nativeModeStatus = result.Success
+                    ? "Native-mode elevation setup complete — Start Native Mode when ready."
+                    : $"Native-mode setup failed: {result.Reason}";
+                NativeModeStatusChanged?.Invoke(this, EventArgs.Empty);
+            }
+            catch (Exception ex)
+            {
+                nativeModeStatus = $"Native-mode setup failed: {ex.Message}";
                 NativeModeStatusChanged?.Invoke(this, EventArgs.Empty);
             }
             finally
@@ -447,6 +485,7 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             NativeModeButtonTextChanged?.Invoke(this, EventArgs.Empty);
             NativeModeCanToggleChanged?.Invoke(this, EventArgs.Empty);
             NativeModeSettingsEnabledChanged?.Invoke(this, EventArgs.Empty);
+            NativeModeSetupCanRunChanged?.Invoke(this, EventArgs.Empty);
         }
 
         internal static string StatusForState(NativeModeState state, string detail)
@@ -455,10 +494,13 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             {
                 NativeModeState.Starting => "Starting native mode server...",
                 NativeModeState.Serving =>
-                    "Server running — attach pending (complete setup in next phase).",
+                    "Server running — attaching virtual DualSense...",
                 NativeModeState.Attached => "Native mode attached.",
                 NativeModeState.PadLost =>
                     "Pad lost — press PS, then Start Native Mode again.",
+                NativeModeState.SetupRequired => string.IsNullOrWhiteSpace(detail)
+                    ? "Elevation setup required — select Set up native mode."
+                    : detail,
                 NativeModeState.Faulted => string.IsNullOrWhiteSpace(detail)
                     ? "Native mode faulted."
                     : $"Native mode faulted: {detail}",

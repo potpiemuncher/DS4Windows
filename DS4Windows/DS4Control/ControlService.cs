@@ -94,8 +94,12 @@ namespace DS4Windows
         public ControlServiceDeviceOptions DeviceOptions { get => deviceOptions; }
 
         private readonly NativeModeManager nativeModeManager = new NativeModeManager();
+        private readonly NativeModeElevationBroker nativeModeElevationBroker =
+            new NativeModeElevationBroker();
         private readonly SemaphoreSlim nativeModeLifecycleGate = new SemaphoreSlim(1, 1);
         public NativeModeManager NativeModeManager => nativeModeManager;
+        public NativeModeElevationBroker NativeModeElevationBroker =>
+            nativeModeElevationBroker;
 
         private DS4WinWPF.ArgumentParser cmdParser;
 
@@ -2081,6 +2085,7 @@ namespace DS4Windows
                 var dualSense = (InputDevices.DualSenseDevice)device;
                 string[] serverArguments = BuildNativeModeServerArguments(
                     dualSense.NativeOptionsStore);
+                NativeModeAttachResult attachFailure = null;
                 DS4Devices.BeginNativeModeSuppression(macAddress, devicePath);
 
                 try
@@ -2090,10 +2095,41 @@ namespace DS4Windows
 
                     await nativeModeManager.StartAsync(serverArguments,
                         CancellationToken.None).ConfigureAwait(false);
+
+                    await nativeModeManager.WaitForServingAsync(
+                        TimeSpan.FromSeconds(10), cancellationToken)
+                        .ConfigureAwait(false);
+
+                    NativeModeAttachResult attachResult =
+                        await nativeModeElevationBroker.RunAttachAsync(
+                            Global.UsbipExePath, cancellationToken)
+                            .ConfigureAwait(false);
+                    if (!attachResult.Success)
+                    {
+                        attachFailure = attachResult;
+                        throw new InvalidOperationException(attachResult.Reason);
+                    }
+
+                    nativeModeManager.MarkAttached();
                 }
-                catch
+                catch (Exception ex)
                 {
+                    NativeModeState failedState = nativeModeManager.State;
                     await RecoverControllerAfterFailedNativeStartAsync().ConfigureAwait(false);
+                    if (attachFailure?.FailureKind ==
+                        NativeModeAttachFailureKind.SetupRequired)
+                    {
+                        nativeModeManager.MarkSetupRequired(attachFailure.Reason);
+                    }
+                    else if (failedState == NativeModeState.PadLost)
+                    {
+                        nativeModeManager.MarkPadLost(ex.Message);
+                    }
+                    else
+                    {
+                        nativeModeManager.MarkFaulted(
+                            attachFailure?.Reason ?? ex.Message);
+                    }
                     throw;
                 }
             }
@@ -2117,6 +2153,13 @@ namespace DS4Windows
                 "--speaker-audio", options.NativeModeSpeakerAudio ? "on" : "off",
                 "--route", options.NativeModeRoute.ToString().ToLowerInvariant(),
             };
+        }
+
+        public Task<NativeModeAttachResult> EnsureNativeModeAttachTaskAsync(
+            CancellationToken cancellationToken = default)
+        {
+            return nativeModeElevationBroker.EnsureAttachTaskAsync(
+                Global.UsbipExePath, cancellationToken);
         }
 
         public async Task StopNativeModeAsync(

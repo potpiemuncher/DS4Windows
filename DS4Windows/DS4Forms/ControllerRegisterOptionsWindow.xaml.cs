@@ -99,5 +99,15 @@ namespace DS4WinWPF.DS4Forms
             }
         }
 
+        private async void NativeModeSetupButton_Click(object sender,
+            RoutedEventArgs e)
+        {
+            if (sender is FrameworkElement element &&
+                element.DataContext is DualSenseControllerOptionsWrapper wrapper)
+            {
+                await wrapper.SetupNativeModeAsync();
+            }
+        }
+
     }
 }

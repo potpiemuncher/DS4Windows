@@ -20,8 +20,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
-using System.Management;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -33,6 +31,7 @@ namespace DS4Windows
         Serving,
         Attached,
         PadLost,
+        SetupRequired,
         Stopped,
         Faulted,
     }
@@ -73,7 +72,6 @@ namespace DS4Windows
     public sealed class NativeModeManager : IAsyncDisposable
     {
         private const string ServerExecutableName = "VirtualDualSenseUsbip.exe";
-        private const string VirtualDualSenseHardwareIdPrefix = "USB\\VID_054C&PID_0CE6";
         private static readonly TimeSpan DeviceRemovalTimeout = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan DeviceRemovalPollInterval = TimeSpan.FromMilliseconds(200);
 
@@ -86,6 +84,7 @@ namespace DS4Windows
         private Task exitMonitorTask = Task.CompletedTask;
         private bool stopping;
         private NativeModeState state = NativeModeState.Stopped;
+        private string stateDetail = "Native mode server stopped.";
         private NativeModeStatsSnapshot latestStats =
             new NativeModeStatsSnapshot(null, null, null, DateTimeOffset.MinValue);
 
@@ -107,6 +106,15 @@ namespace DS4Windows
                 lock (statsGate)
                     return latestStats;
             }
+        }
+
+        public async Task WaitForServingAsync(TimeSpan timeout,
+            CancellationToken cancellationToken = default)
+        {
+            await NativeModeReadinessAwaiter.WaitForServingAsync(GetStateSnapshot,
+                handler => StateChanged += handler,
+                handler => StateChanged -= handler,
+                timeout, cancellationToken).ConfigureAwait(false);
         }
 
         public static string LocateServerExecutable()
@@ -220,6 +228,21 @@ namespace DS4Windows
                     $"Cannot mark native mode attached while state is {current}.");
 
             SetState(NativeModeState.Attached, "Virtual DualSense attached.");
+        }
+
+        public void MarkSetupRequired(string detail)
+        {
+            SetState(NativeModeState.SetupRequired, detail);
+        }
+
+        public void MarkPadLost(string detail)
+        {
+            SetState(NativeModeState.PadLost, detail);
+        }
+
+        public void MarkFaulted(string detail)
+        {
+            SetState(NativeModeState.Faulted, detail);
         }
 
         public async Task StopAsync(CancellationToken cancellationToken = default)
@@ -352,6 +375,7 @@ namespace DS4Windows
                     return;
 
                 state = newState;
+                stateDetail = detail;
                 handler = StateChanged;
             }
 
@@ -362,37 +386,82 @@ namespace DS4Windows
             CancellationToken cancellationToken)
         {
             DateTimeOffset deadline = DateTimeOffset.UtcNow + DeviceRemovalTimeout;
-            while (IsVirtualDualSensePresent() && DateTimeOffset.UtcNow < deadline)
+            while (NativeModeDevicePresence.IsVirtualDualSensePresent() &&
+                DateTimeOffset.UtcNow < deadline)
             {
                 await Task.Delay(DeviceRemovalPollInterval, cancellationToken)
                     .ConfigureAwait(false);
             }
 
-            if (IsVirtualDualSensePresent())
+            if (NativeModeDevicePresence.IsVirtualDualSensePresent())
             {
                 AppLogger.LogToGui(
                     "[native] Virtual DualSense is still present after server shutdown.", true);
             }
         }
 
-        private static bool IsVirtualDualSensePresent()
+        private (NativeModeState State, string Detail) GetStateSnapshot()
         {
+            lock (stateGate)
+                return (state, stateDetail);
+        }
+    }
+
+    internal static class NativeModeReadinessAwaiter
+    {
+        public static async Task WaitForServingAsync(
+            Func<(NativeModeState State, string Detail)> getState,
+            Action<EventHandler<NativeModeStateChangedEventArgs>> subscribe,
+            Action<EventHandler<NativeModeStateChangedEventArgs>> unsubscribe,
+            TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            if (timeout <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(timeout));
+
+            var completion = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+
+            void ApplyState(NativeModeState state, string detail)
+            {
+                switch (state)
+                {
+                    case NativeModeState.Serving:
+                    case NativeModeState.Attached:
+                        completion.TrySetResult(true);
+                        break;
+                    case NativeModeState.PadLost:
+                    case NativeModeState.SetupRequired:
+                    case NativeModeState.Stopped:
+                    case NativeModeState.Faulted:
+                        completion.TrySetException(new InvalidOperationException(
+                            string.IsNullOrWhiteSpace(detail)
+                                ? $"Native mode entered {state} before the server became ready."
+                                : detail));
+                        break;
+                }
+            }
+
+            EventHandler<NativeModeStateChangedEventArgs> handler =
+                (_, e) => ApplyState(e.State, e.Detail);
+            subscribe(handler);
             try
             {
-                using var searcher = new ManagementObjectSearcher(
-                    "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID IS NOT NULL");
-                using ManagementObjectCollection devices = searcher.Get();
-                return devices.Cast<ManagementObject>().Any(device =>
-                    (device["DeviceID"] as string)?.StartsWith(
-                        VirtualDualSenseHardwareIdPrefix,
-                        StringComparison.OrdinalIgnoreCase) == true);
+                (NativeModeState current, string detail) = getState();
+                ApplyState(current, detail);
+                try
+                {
+                    await completion.Task.WaitAsync(timeout, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    throw new TimeoutException(
+                        $"Native mode server did not become ready within {timeout.TotalSeconds:0.#} seconds.");
+                }
             }
-            catch (Exception ex) when (ex is ManagementException ||
-                ex is UnauthorizedAccessException)
+            finally
             {
-                AppLogger.LogToGui(
-                    $"[native] Unable to query virtual DualSense removal: {ex.Message}", true);
-                return false;
+                unsubscribe(handler);
             }
         }
     }

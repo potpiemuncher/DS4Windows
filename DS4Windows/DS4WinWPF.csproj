@@ -406,4 +406,28 @@
 	<ItemGroup>
 		<Folder Remove="extras\" />
 	</ItemGroup>
+
+	<!--
+		Release packaging consumes an already-published native-mode server. It must
+		never build VirtualDualSenseUsbip or write to that project's default bin
+		directory. Prepare the default staging directory separately with:
+		  dotnet publish utils/VirtualDualSenseUsbip -c Release -o utils/VirtualDualSenseUsbip/obj/native-staging -p:BaseOutputPath=obj/native-build/
+		NativeDualSensePublishDir may be overridden by release/CI packaging.
+	-->
+	<PropertyGroup>
+		<NativeDualSensePublishDir Condition="'$(NativeDualSensePublishDir)' == ''">$(MSBuildProjectDirectory)\..\utils\VirtualDualSenseUsbip\obj\native-staging</NativeDualSensePublishDir>
+	</PropertyGroup>
+
+	<Target Name="CopyNativeDualSenseServer" AfterTargets="Build"
+			Condition="'$(Configuration)' == 'Release'">
+		<ItemGroup Condition="Exists('$(NativeDualSensePublishDir)\VirtualDualSenseUsbip.exe')">
+			<NativeDualSensePublishFiles Include="$(NativeDualSensePublishDir)\**\*" />
+		</ItemGroup>
+		<Warning Condition="!Exists('$(NativeDualSensePublishDir)\VirtualDualSenseUsbip.exe')"
+			Text="Native DualSense server staging output was not found at '$(NativeDualSensePublishDir)'. DS4Windows will build without native-mode packaged files." />
+		<Copy SourceFiles="@(NativeDualSensePublishFiles)"
+			DestinationFiles="@(NativeDualSensePublishFiles->'$(TargetDir)native\%(RecursiveDir)%(Filename)%(Extension)')"
+			SkipUnchangedFiles="true"
+			Condition="'@(NativeDualSensePublishFiles)' != ''" />
+	</Target>
 </Project>
