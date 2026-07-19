@@ -347,25 +347,31 @@ internal sealed class UsbIpDeviceSession
         finally
         {
             sessionCancellation.Cancel();
-            foreach (Task pump in new[] { inputPump, isochronousPump, isochronousInPump })
+            try
             {
-                try
+                foreach (Task pump in new[] { inputPump, isochronousPump, isochronousInPump })
                 {
-                    await pump;
-                }
-                catch (OperationCanceledException) when (sessionCancellation.IsCancellationRequested)
-                {
+                    try
+                    {
+                        await pump;
+                    }
+                    catch (OperationCanceledException) when (sessionCancellation.IsCancellationRequested)
+                    {
+                    }
                 }
             }
-
-            // The URB session is over: release the physical controller's audio
-            // paths so the microphone and the continuous 0x36 stream never
-            // outlive a detach or a dropped connection.
-            audioRelay?.SetPlaybackInterfaceActive(false);
-            audioRelay?.SetCaptureInterfaceActive(false);
-            if (pendingIsochronousInHighWater > 0)
+            finally
             {
-                log($"ISO IN pending high-water mark: {pendingIsochronousInHighWater}.");
+                // The URB session is over: release the physical controller's
+                // audio paths unconditionally — even when a pump faulted with
+                // an I/O error — so the microphone and the continuous 0x36
+                // stream never outlive a detach or a dropped connection.
+                audioRelay?.SetPlaybackInterfaceActive(false);
+                audioRelay?.SetCaptureInterfaceActive(false);
+                if (pendingIsochronousInHighWater > 0)
+                {
+                    log($"ISO IN pending high-water mark: {pendingIsochronousInHighWater}.");
+                }
             }
         }
     }
@@ -433,9 +439,12 @@ internal sealed class UsbIpDeviceSession
         bool validPacketSizes = knownEndpoint && endpoint != null &&
             submit.IsoPackets.All(packet => packet.Length <= endpoint.MaxPacketSize);
         long describedLength = submit.IsoPackets.Sum(packet => (long)packet.Length);
+        // IN URBs may legally describe gapped descriptor layouts, so only
+        // bound the described total; the codec already validated each
+        // packet's offset/length range against the transfer buffer.
         bool validPayload = isInput
             ? submit.TransferBuffer.Length == 0 &&
-              describedLength == submit.TransferBufferLength
+              describedLength <= submit.TransferBufferLength
             : describedLength == submit.TransferBuffer.Length &&
               submit.TransferBuffer.Length == submit.TransferBufferLength;
 
@@ -755,6 +764,9 @@ internal sealed class UsbIpDeviceSession
                 int nominal = Math.Min(MicrophoneNominalPacketBytes, capacity);
                 written = audioRelay?.FillMicrophonePacket(
                     data.AsSpan(filled, capacity), nominal) ?? 0;
+                // Distrust relay results: clamp into the packet and keep whole
+                // 4-byte stereo frames so descriptor accounting cannot drift.
+                written = Math.Clamp(written, 0, capacity) & ~3;
                 if (written <= 0)
                 {
                     written = nominal; // buffer is already zeroed: silence

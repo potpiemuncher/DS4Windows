@@ -76,6 +76,15 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     private const int SpeakerPrebufferFrames = 2;
     private const double IsochronousKeepAliveMs = 1000.0;
     private const double HeadsetDebounceMs = 250.0;
+    private const int MaxConsecutiveStreamWriteFailures = 50;
+
+    // The Windows audio engine keeps an open playback pin primed with silence
+    // for long stretches (sometimes indefinitely). Streaming silent 0x36
+    // reports for that costs ~37 kB/s of Bluetooth bandwidth and controller
+    // battery, so the audio stream only runs while channels 1/2 carried real
+    // energy recently. |sample| > 164 is about -46 dBFS.
+    private const int SpeakerEnergyThreshold = 164;
+    private const double SpeakerSilenceGateMs = 2000.0;
 
     // Microphone: 71-byte Opus mono 48 kHz frames inside flagged 0x31 input
     // reports; served to USB as 48 kHz stereo signed 16-bit.
@@ -126,7 +135,15 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     private int headsetRawState;
     private long headsetRawSince;
     private int headsetStableState;
-    private int controlSequence;
+    // Starts at 1 so the first rolling config container gets sequence 2:
+    // the amplifier init deliberately uses the fixed, validated 0x10 second
+    // byte (sequence 1), and a colliding sequence could be deduplicated.
+    private int controlSequence = 1;
+    private int amplifierInitialized;
+    private int bluetoothLinkDead;
+    private long lastSpeakerEnergyTimestamp;
+    private int unknownInputFlagLogged;
+    private readonly byte[] silenceOpusFrame = new byte[OpusFrameBytes];
 
     // Microphone state
     private readonly IOpusDecoder? microphoneDecoder;
@@ -192,6 +209,17 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             speakerResampler = new StereoLinearResampler(OpusSampleRate, AudioDeliveryRate);
             speakerPcm = new ShortRing(AudioDeliveryRate * 2 / 5); // ~200 ms stereo
             speakerFrames = new OpusFrameQueue(SpeakerFrameQueueDepth, OpusFrameBytes);
+            // A known-good 200-byte silence packet, encoded while the encoder
+            // state is pristine. Used whenever a runtime encode misbehaves so
+            // the stream never carries zero-padded pseudo-Opus.
+            int silenceBytes = speakerEncoder.Encode(
+                new short[OpusSamplesPerFrame * 2], OpusSamplesPerFrame,
+                silenceOpusFrame, silenceOpusFrame.Length);
+            if (silenceBytes != OpusFrameBytes)
+            {
+                throw new InvalidOperationException(
+                    $"CBR silence frame encoded to {silenceBytes} bytes; expected {OpusFrameBytes}.");
+            }
         }
 
         if (audioOptions.Microphone)
@@ -358,12 +386,13 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         }
 
         // Channels 1/2 commonly stay active while native haptic channels are
-        // silent. The stream must run whenever the playback interface is open
-        // and the speaker relay wants the audio clock, or when haptic energy
-        // arrives; otherwise stay idle so silent packets cannot keep the
-        // voice coils faintly energized.
+        // silent, and the audio engine keeps an open pin primed with silence.
+        // Stream while real speaker energy is recent (the silence gate) or
+        // when haptic energy arrives; otherwise stay idle so silent packets
+        // cannot keep the voice coils energized or burn Bluetooth bandwidth.
         bool wantStream = hasEnergy ||
-            (speakerRelay && Volatile.Read(ref playbackInterfaceActive) != 0);
+            (speakerRelay && Volatile.Read(ref playbackInterfaceActive) != 0 &&
+             SpeakerEnergyAgeMs() <= SpeakerSilenceGateMs);
         if (wantStream && Interlocked.Exchange(ref hapticStreamingRequested, 1) == 0)
         {
             hapticAvailable.Set();
@@ -376,6 +405,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         float volume = PlaybackVolume;
         int totalFrames = usbFourChannelPcm16.Length / UsbAudioBytesPerFrame;
         int frameOffset = 0;
+        bool hasEnergy = false;
         while (frameOffset < totalFrames)
         {
             int take = Math.Min(totalFrames - frameOffset, SpeakerChunkFrames);
@@ -386,6 +416,8 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                     usbFourChannelPcm16.Slice(byteOffset, 2));
                 int right = BinaryPrimitives.ReadInt16LittleEndian(
                     usbFourChannelPcm16.Slice(byteOffset + 2, 2));
+                hasEnergy |= Math.Abs(left) > SpeakerEnergyThreshold ||
+                    Math.Abs(right) > SpeakerEnergyThreshold;
                 speakerExtractScratch[i * 2] = ScaleSample(left, volume);
                 speakerExtractScratch[i * 2 + 1] = ScaleSample(right, volume);
             }
@@ -398,6 +430,21 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             }
             frameOffset += take;
         }
+
+        if (hasEnergy)
+        {
+            Interlocked.Exchange(ref lastSpeakerEnergyTimestamp, Stopwatch.GetTimestamp());
+        }
+    }
+
+    private double SpeakerEnergyAgeMs()
+    {
+        long last = Interlocked.Read(ref lastSpeakerEnergyTimestamp);
+        if (last == 0)
+        {
+            return double.PositiveInfinity;
+        }
+        return (Stopwatch.GetTimestamp() - last) * 1000.0 / Stopwatch.Frequency;
     }
 
     private static short ScaleSample(int sample, float volume)
@@ -514,10 +561,13 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                     out uint bytesRead, IntPtr.Zero))
             {
                 int error = Marshal.GetLastWin32Error();
+                Volatile.Write(ref bluetoothLinkDead, 1);
+                hapticAvailable.Set(); // let the stream loop observe the loss
                 if (Volatile.Read(ref disposed) == 0)
                 {
                     log($"Bluetooth input stopped after {ValidReportCount} valid reports " +
-                        $"(Win32 error {error}).");
+                        $"(Win32 error {error}). The physical pad is gone; restart serve " +
+                        "after it reconnects.");
                 }
                 return;
             }
@@ -542,6 +592,17 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             {
                 Interlocked.Increment(ref invalidReportCount);
                 continue;
+            }
+
+            // Observability: the low nibble of byte 1 is expected clear on
+            // normal gamepad reports (bit 1 = microphone is filtered above).
+            // Unknown flags are logged once but parsing continues — rejecting
+            // on an unverified pattern could break real input.
+            if ((buffer[1] & 0x0D) != 0 &&
+                Interlocked.Exchange(ref unknownInputFlagLogged, 1) == 0)
+            {
+                log($"Note: gamepad input report byte 1 carries unexpected flags " +
+                    $"0x{buffer[1]:X2}; parsing continues.");
             }
 
             // Byte 55 of the Bluetooth report (USB report byte 54) carries the
@@ -690,6 +751,11 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             {
                 return;
             }
+            if (Volatile.Read(ref bluetoothLinkDead) != 0)
+            {
+                log("Bluetooth stream loop stopped: the physical pad's link is gone.");
+                return;
+            }
 
             // About 30 ms protects the 10.667 ms Bluetooth clock from the
             // measured 2..17 ms USB/IP arrival jitter without unbounded delay.
@@ -700,8 +766,11 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             bool loggedStart = false;
             bool audioSession = false;
             bool audioPrimed = false;
+            int consecutiveWriteFailures = 0;
+            int firstWriteError = 0;
 
-            while (Volatile.Read(ref disposed) == 0)
+            while (Volatile.Read(ref disposed) == 0 &&
+                Volatile.Read(ref bluetoothLinkDead) == 0)
             {
                 int copied = hapticPcm.ReadPartial(chunk);
                 if (copied < chunk.Length)
@@ -741,32 +810,36 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
 
                 bool audioKeepAlive = speakerPcm != null &&
                     (Volatile.Read(ref playbackInterfaceActive) != 0 ||
-                     IsochronousOutAgeMs() <= IsochronousKeepAliveMs);
+                     IsochronousOutAgeMs() <= IsochronousKeepAliveMs) &&
+                    SpeakerEnergyAgeMs() <= SpeakerSilenceGateMs;
                 if (audioKeepAlive && !audioSession)
                 {
-                    // Entering audio mode: reset the frame pipeline and unmute
+                    // Entering audio mode: drop stale encoded frames and unmute
                     // the controller amplifier before the first audio report.
+                    // The PCM ring is deliberately NOT cleared — it holds the
+                    // first real audio that triggered this session; the
+                    // per-tick trim below already bounds any stale silence.
                     audioSession = true;
                     audioPrimed = false;
                     speakerFrames!.Clear();
-                    speakerPcm!.Reset();
-                    if (!SendAmplifierSetup(out int setupError))
-                    {
-                        log($"Controller audio amplifier setup write failed (Win32 error {setupError}).");
-                    }
-                    else
-                    {
-                        log("Controller audio amplifier initialized for native speaker relay.");
-                    }
+                    EnsureAmplifierInitialized();
                 }
 
                 if (audioSession)
                 {
-                    while (speakerPcm!.ReadExact(encoderBlock))
+                    // Bound encoder work per tick and trim stale PCM first so a
+                    // scheduling stall can never stack encodes inside this
+                    // cadence-critical loop or bake in permanent extra latency.
+                    speakerPcm!.TrimToNewest(
+                        (SpeakerFrameQueueDepth + 1) * OpusSamplesPerFrame * 2);
+                    int encodedThisTick = 0;
+                    while (encodedThisTick <= SpeakerFrameQueueDepth &&
+                        speakerPcm.ReadExact(encoderBlock))
                     {
                         byte[] slot = speakerFrames!.RentSlot();
-                        EncodeOpusFrame(speakerEncoder!, encoderBlock, slot);
+                        EncodeOpusFrame(speakerEncoder!, encoderBlock, slot, silenceOpusFrame);
                         speakerFrames.CommitSlot();
+                        encodedThisTick++;
                     }
 
                     if (!audioPrimed && speakerFrames!.Count >= SpeakerPrebufferFrames)
@@ -785,7 +858,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                         // Encode silence through the live encoder so the
                         // controller-side Opus decoder state stays continuous.
                         Array.Clear(encoderBlock);
-                        EncodeOpusFrame(speakerEncoder!, encoderBlock, opusFrame);
+                        EncodeOpusFrame(speakerEncoder!, encoderBlock, opusFrame, silenceOpusFrame);
                     }
 
                     BuildBluetoothAudioReport(report, sequence, packetCounter, chunk,
@@ -805,9 +878,22 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
                     {
                         log($"Bluetooth native-haptic relay write failed (Win32 error {error}).");
                     }
+                    if (consecutiveWriteFailures == 0)
+                    {
+                        firstWriteError = error;
+                    }
+                    if (++consecutiveWriteFailures >= MaxConsecutiveStreamWriteFailures)
+                    {
+                        log($"Bluetooth stream aborted after {consecutiveWriteFailures} " +
+                            $"consecutive write failures (Win32 first={firstWriteError}, " +
+                            $"last={error}). Restart serve after the pad reconnects.");
+                        Interlocked.Exchange(ref hapticStreamingRequested, 0);
+                        break;
+                    }
                 }
                 else
                 {
+                    consecutiveWriteFailures = 0;
                     long count = Interlocked.Increment(ref relayedHapticReportCount);
                     if (audioSession)
                     {
@@ -873,12 +959,16 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         }
     }
 
-    private static void EncodeOpusFrame(IOpusEncoder encoder, ReadOnlySpan<short> pcm, Span<byte> dest)
+    private static void EncodeOpusFrame(IOpusEncoder encoder, ReadOnlySpan<short> pcm,
+        Span<byte> dest, ReadOnlySpan<byte> silenceFallback)
     {
         int written = encoder.Encode(pcm, OpusSamplesPerFrame, dest, dest.Length);
-        if (written > 0 && written < dest.Length)
+        if (written != OpusFrameBytes)
         {
-            dest[written..].Clear();
+            // CBR at 160 kbps/10 ms must yield exactly 200 bytes; anything
+            // else would put zero-padded pseudo-Opus on the wire. Substitute
+            // the known-good silence packet instead.
+            silenceFallback[..OpusFrameBytes].CopyTo(dest);
         }
     }
 
@@ -993,9 +1083,28 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         return pkt;
     }
 
-    private bool SendAmplifierSetup(out int win32Error)
+    /// <summary>
+    /// Sends the SetStateData amplifier/audio-control initialization exactly
+    /// once per link, before the first audio-bearing report or microphone
+    /// enable. The reference dongle always initializes controller audio state
+    /// at connect before any repeatable audio toggles.
+    /// </summary>
+    private void EnsureAmplifierInitialized()
     {
-        return WriteBluetoothReport(BuildAmplifierSetupReport(), out win32Error);
+        if (Interlocked.Exchange(ref amplifierInitialized, 1) != 0)
+        {
+            return;
+        }
+
+        if (!WriteBluetoothReport(BuildAmplifierSetupReport(), out int error))
+        {
+            Interlocked.Exchange(ref amplifierInitialized, 0);
+            log($"Controller audio amplifier setup write failed (Win32 error {error}).");
+        }
+        else
+        {
+            log("Controller audio amplifier initialized.");
+        }
     }
 
     private static readonly byte[] KnownHapticState =
@@ -1026,11 +1135,8 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
         }
 
         log($"USB playback interface {(active ? "opened" : "closed")} by the host.");
-        if (active && speakerPcm != null &&
-            Interlocked.Exchange(ref hapticStreamingRequested, 1) == 0)
-        {
-            hapticAvailable.Set();
-        }
+        // The stream itself starts when channels 1/2 first carry real energy
+        // (see QueueHapticAudio); an open-but-silent pin stays quiet.
     }
 
     public void SetCaptureInterfaceActive(bool active)
@@ -1053,6 +1159,12 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             Interlocked.Exchange(ref microphoneMeasureStart, 0);
             Interlocked.Exchange(ref microphoneMeasureCount, 0);
             microphonePacketFrames = 48;
+            // A fresh capture session measures its own rate: discard any
+            // resampler chosen by a previous session along with its
+            // interpolation history, and reset the Opus decoder state.
+            microphoneResampler = null;
+            microphoneDecoder?.ResetState();
+            EnsureAmplifierInitialized();
         }
 
         byte sequence = (byte)(Interlocked.Increment(ref controlSequence) & 0x0F);
@@ -1332,6 +1444,23 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
             {
                 head = 0;
                 count = 0;
+            }
+        }
+
+        /// <summary>Drops the oldest samples until at most
+        /// <paramref name="maxSamples"/> remain (frame-aligned).</summary>
+        public void TrimToNewest(int maxSamples)
+        {
+            lock (gate)
+            {
+                int keep = Math.Max(0, maxSamples) & ~1;
+                if (count <= keep)
+                {
+                    return;
+                }
+                int drop = count - keep;
+                head = (head + drop) % buffer.Length;
+                count = keep;
             }
         }
 
