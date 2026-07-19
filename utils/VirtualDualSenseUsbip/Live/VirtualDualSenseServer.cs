@@ -21,7 +21,7 @@ public sealed record HidOutputCapture(
     byte[] Data);
 
 /// <summary>
-/// Local USB/IP v1.1.1 server exporting one synthetic HID-only DualSense.
+/// Local USB/IP v1.1.1 server exporting one synthetic wired DualSense.
 /// Management clients receive DEVLIST/IMPORT records; after a successful import
 /// the connection becomes a USB/IP URB session until detach/disconnect.
 /// </summary>
@@ -65,7 +65,8 @@ public sealed class VirtualDualSenseServer : IDisposable
             ConfigurationValue: 0,
             descriptors.NumConfigurations,
             descriptors.NumInterfaces,
-            new[] { new UsbIpInterfaceInfo(3, 0, 0) });
+            descriptors.Interfaces.Select(info =>
+                new UsbIpInterfaceInfo(info.Class, info.SubClass, info.Protocol)).ToArray());
     }
 
     public void Start()
@@ -164,7 +165,7 @@ public sealed class VirtualDualSenseServer : IDisposable
                 await writer.WriteAsync(
                     UsbIpCodec.EncodeOperationReply(UsbIpConstants.OpRepDevList, 0,
                         deviceInfo, includeInterfaceList: true), cancellationToken);
-                EmitLog("Served OP_REP_DEVLIST for the HID-only DualSense.");
+                EmitLog($"Served OP_REP_DEVLIST for a {descriptors.NumInterfaces}-interface DualSense.");
                 return;
 
             case UsbIpConstants.OpReqImport when operation.BusId == options.BusId:
@@ -231,6 +232,8 @@ internal sealed class UsbIpDeviceSession
         this.stream = stream;
         this.writer = writer;
         controlEndpoint = new ControlEndpoint(descriptors, featureReports);
+        controlEndpoint.InterfaceAltChanged += (interfaceNumber, alternateSetting) =>
+            log($"SET_INTERFACE interface {interfaceNumber} alt {alternateSetting}.");
         this.inputReports = inputReports;
         this.inputInterval = inputInterval;
         this.captureOutput = captureOutput;

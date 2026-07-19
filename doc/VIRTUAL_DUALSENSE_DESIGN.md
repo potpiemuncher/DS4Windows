@@ -247,6 +247,23 @@ repeated clean attach/detach cycles. Raw captures and logs remain outside the
 repository under `C:\Users\patri\PS5Haptics\m23-*-hid-output.ndjson` and
 `m23-*-server.*.log`.
 
-M2.4 UAC1 composite enumeration is next. No cable-like native haptic audio was
-expected or heard during the HID-only Resynced test because Windows had no
-virtual DualSense audio endpoint to receive the game's four-channel stream.
+## M2.4 UAC1 composite live status (2026-07-18) -- passed
+
+The server can now expose the frozen 227-byte composite configuration instead
+of the derived HID-only configuration. DEVLIST reports all four captured
+interface classes, and endpoint topology is parsed and verified directly from
+the fixture. The live device materializes as a healthy USB Composite Device,
+MEDIA child, HID game controller, Speakers endpoint, and Headset Microphone
+endpoint.
+
+Windows' live startup sequence required UAC1 Feature Unit mute and master
+volume state. Supporting GET/SET current plus GET minimum, maximum, and
+resolution removed MEDIA Code 10. The descriptor bytes remain exact. The
+currently emulated volume range is -100..0 dB in 1 dB steps; capture the real
+wired control responses before treating those three range values as Sony-exact.
+
+The Windows audio engine selects interface 1 alt 1 and immediately submits
+isochronous OUT URBs. Those transfers are still rejected by the explicit M2.5
+gate, so no native haptic audio is expected yet. M2.5 is next: preserve each
+packet descriptor, accept the 4-channel 48 kHz stream at USB frame cadence,
+measure underrun/jitter behavior, and only then feed channels 3/4 into M2.6.

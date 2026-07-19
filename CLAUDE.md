@@ -14,7 +14,7 @@ Repository state:
 - Fork: `https://github.com/potpiemuncher/DS4Windows.git`
 - Upstream: `https://github.com/ds4windowsapp/DS4Windows.git`
 - Active branch: `feature/bt-audio-haptics`
-- Validated branch tip before this handoff: `d5046ed`
+- Latest pushed checkpoint before M2.4: `860014d`
 
 Read `doc/BT_AUDIO_HAPTICS_RESEARCH.md` and
 `doc/VIRTUAL_DUALSENSE_DESIGN.md` before changing the protocol or Phase 4
@@ -95,8 +95,10 @@ Phase 4/native-game foundation:
   starts the user-space USB/IP protocol core (M2.2).
 - `558ae95` prevents DSCompatProbe failures from showing CLR crash dialogs.
 - `ebdf780` records the successful M2.1 usbip-win2 driver qualification.
-- The current M2.3-live work adds a HID-only server, live VHCI attachment,
-  feature reports, 250 Hz interrupt input, and interrupt-output capture.
+- `1d150e4` attaches the HID-only virtual DualSense through the qualified VHCI.
+- `bc21906` bridges authenticated physical Bluetooth input at 250 Hz.
+- `860014d` relays native game-authored adaptive-trigger programs over
+  Bluetooth without blocking USB output completion.
 
 Latest user-validated fixes:
 
@@ -155,12 +157,11 @@ Do not rely on an old process ID; check the current process and binary path.
 
 ## Current Limitation
 
-The HID-only virtual wired DualSense is now recognized by a native PC title,
-and game-authored adaptive-trigger output is captured and relayed to the real
-Bluetooth pad. Native game haptic audio is not available yet because the
-virtual device does not expose its UAC1 audio interfaces. Do not claim native
-haptic-audio support until M2.4-M2.6 materialize the 4-channel endpoint,
-qualify isochronous timing, and relay channels 3/4 successfully.
+The virtual wired DualSense now exposes the exact four-interface composite
+descriptor, and Windows creates healthy speaker and microphone endpoints.
+Native game haptic audio is not available yet because USB/IP isochronous
+transfers remain deliberately gated. Do not claim native haptic-audio support
+until M2.5-M2.6 qualify ISO timing and relay channels 3/4 successfully.
 
 ## Next Milestone: Native DualSense Game Compatibility
 
@@ -210,8 +211,16 @@ Status and order:
    physical R2 resistance while firing. Remaining M2.3 work: capture the other
    planned trigger programs, run one-hour stability, add graceful server
    shutdown, and repeat clean attach/detach cycles.
-5. **M2.4**: add exact UAC1 composite descriptors.
-6. **M2.5**: qualify isochronous timing and stability.
+5. **M2.4 PASSED (2026-07-18)**: the exact captured 227-byte composite
+   configuration is live through VHCI with Audio Control, playback Audio
+   Streaming, capture Audio Streaming, and HID interfaces. Windows starts the
+   MEDIA child and creates healthy `Speakers` and `Headset Microphone`
+   endpoints. The audio engine selects playback interface 1 alt 1 and submits
+   isochronous OUT traffic. Live iteration identified and implemented the UAC1
+   speaker mute/volume GET/SET controls and volume range queries required by
+   Windows. The provisional -100..0 dB / 1 dB range must be replaced if a
+   future wired control capture proves Sony uses different values.
+6. **M2.5 in progress**: accept, time, and qualify isochronous playback URBs.
 7. **M2.6**: relay UAC haptic channels 3/4 to 3 kHz Bluetooth haptic PCM. The
    native 11-byte adaptive-trigger relay is already proven in M2.3.
 

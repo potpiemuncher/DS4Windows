@@ -14,6 +14,8 @@ public sealed class ControlEndpoint
     private readonly FeatureReportSet featureReports;
     private readonly Dictionary<byte, byte> interfaceAltSettings = new();
     private readonly Dictionary<byte, byte> idleRates = new();
+    private readonly Dictionary<byte, byte> audioMuteStates = new();
+    private readonly Dictionary<byte, short> audioVolumeStates = new();
 
     public byte ConfigurationValue { get; private set; }
     public bool SelfPowered { get; init; } = true; // config bmAttributes 0xC0
@@ -101,7 +103,17 @@ public sealed class ControlEndpoint
 
     private ControlResult HandleClass(UsbSetupPacket setup, ReadOnlySpan<byte> outData)
     {
-        // HID class requests are directed at the HID interface.
+        if (setup.Recipient == UsbSetupPacket.RecipientInterface &&
+            (byte)setup.Index != descriptors.HidInterfaceNumber)
+        {
+            return HandleAudioClass(setup, outData);
+        }
+
+        return HandleHidClass(setup);
+    }
+
+    private ControlResult HandleHidClass(UsbSetupPacket setup)
+    {
         switch (setup.Request)
         {
             case UsbHidRequest.SetIdle:
@@ -130,4 +142,76 @@ public sealed class ControlEndpoint
                 return ControlResult.Stalled();
         }
     }
+
+    private ControlResult HandleAudioClass(UsbSetupPacket setup, ReadOnlySpan<byte> outData)
+    {
+        const byte SetCurrent = 0x01;
+        const byte GetCurrent = 0x81;
+        const byte GetMinimum = 0x82;
+        const byte GetMaximum = 0x83;
+        const byte GetResolution = 0x84;
+        const byte MuteControlSelector = 0x01;
+        const byte VolumeControlSelector = 0x02;
+        const short VolumeMinimum = -100 * 256;
+        const short VolumeMaximum = 0;
+        const short VolumeResolution = 1 * 256;
+
+        byte interfaceNumber = (byte)setup.Index;
+        byte entityId = (byte)(setup.Index >> 8);
+        byte controlSelector = (byte)(setup.Value >> 8);
+        bool knownFeatureUnit = interfaceNumber == 0 && entityId is 2 or 5;
+        if (!knownFeatureUnit)
+        {
+            return ControlResult.Stalled();
+        }
+
+        if (controlSelector == MuteControlSelector && setup.Length == 1)
+        {
+            if (setup.Request == GetCurrent && setup.DeviceToHost)
+            {
+                return ControlResult.Ok(new[] { audioMuteStates.GetValueOrDefault(entityId) });
+            }
+            if (setup.Request == SetCurrent && !setup.DeviceToHost && outData.Length >= 1)
+            {
+                audioMuteStates[entityId] = (byte)(outData[0] & 0x01);
+                return ControlResult.Ack();
+            }
+        }
+
+        if (controlSelector == VolumeControlSelector && setup.Length == 2)
+        {
+            if (setup.Request == GetCurrent && setup.DeviceToHost)
+            {
+                return AudioVolumeResult(audioVolumeStates.GetValueOrDefault(entityId));
+            }
+            if (setup.DeviceToHost)
+            {
+                short? value = setup.Request switch
+                {
+                    GetMinimum => VolumeMinimum,
+                    GetMaximum => VolumeMaximum,
+                    GetResolution => VolumeResolution,
+                    _ => null,
+                };
+                if (value.HasValue)
+                {
+                    return AudioVolumeResult(value.Value);
+                }
+            }
+            if (setup.Request == SetCurrent && !setup.DeviceToHost && outData.Length >= 2)
+            {
+                audioVolumeStates[entityId] = unchecked((short)(outData[0] | (outData[1] << 8)));
+                return ControlResult.Ack();
+            }
+        }
+
+        return ControlResult.Stalled();
+    }
+
+    private static ControlResult AudioVolumeResult(short volume) =>
+        ControlResult.Ok(new[]
+        {
+            (byte)(volume & 0xFF),
+            (byte)((volume >> 8) & 0xFF),
+        });
 }

@@ -176,12 +176,24 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IDisposa
             return false;
         }
 
+        byte triggerUpdateFlags = (byte)(usbOutputReport[1] & 0x0C);
+        if (triggerUpdateFlags == 0)
+        {
+            return false;
+        }
+
         bluetoothReport = new byte[BluetoothOutputLength];
         bluetoothReport[0] = 0x31;
         bluetoothReport[1] = 0x02; // DATA tag
-        bluetoothReport[2] = 0x0C; // update R2 + L2 only
-        usbOutputReport.Slice(11, 11).CopyTo(bluetoothReport.AsSpan(12));
-        usbOutputReport.Slice(22, 11).CopyTo(bluetoothReport.AsSpan(23));
+        bluetoothReport[2] = triggerUpdateFlags;
+        if ((triggerUpdateFlags & 0x04) != 0)
+        {
+            usbOutputReport.Slice(11, 11).CopyTo(bluetoothReport.AsSpan(12));
+        }
+        if ((triggerUpdateFlags & 0x08) != 0)
+        {
+            usbOutputReport.Slice(22, 11).CopyTo(bluetoothReport.AsSpan(23));
+        }
         uint crc = ComputeBluetoothCrc(BluetoothOutputCrcSeed,
             bluetoothReport.AsSpan(0, BluetoothOutputLength - 4));
         BinaryPrimitives.WriteUInt32LittleEndian(
@@ -329,6 +341,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IDisposa
         // remain latched after detach.
         byte[] clearUsbOutput = new byte[48];
         clearUsbOutput[0] = 0x02;
+        clearUsbOutput[1] = 0x0C;
         if (TryBuildBluetoothTriggerReport(clearUsbOutput, out byte[] clearBluetoothOutput))
         {
             _ = WriteBluetoothReport(clearBluetoothOutput, out _);

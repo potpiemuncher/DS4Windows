@@ -104,8 +104,62 @@ public static class DeviceSelfTest
             return 1;
         }
 
+        var getSpeakerMute = new UsbSetupPacket(
+            RequestType: 0xA1,
+            Request: 0x81,
+            Value: 0x0100,
+            Index: 0x0200,
+            Length: 1);
+        ControlResult initialMute = ep0.Handle(getSpeakerMute, ReadOnlySpan<byte>.Empty);
+        if (initialMute.Status != 0 || initialMute.Data.Length != 1 || initialMute.Data[0] != 0)
+        {
+            Console.Error.WriteLine("FAIL: UAC speaker-mute GET_CUR did not return unmuted state.");
+            return 1;
+        }
+
+        var setSpeakerMute = getSpeakerMute with { RequestType = 0x21, Request = 0x01 };
+        ControlResult setMute = ep0.Handle(setSpeakerMute, new byte[] { 1 });
+        ControlResult updatedMute = ep0.Handle(getSpeakerMute, ReadOnlySpan<byte>.Empty);
+        if (setMute.Status != 0 || updatedMute.Status != 0 || updatedMute.Data[0] != 1)
+        {
+            Console.Error.WriteLine("FAIL: UAC speaker-mute SET_CUR state did not round-trip.");
+            return 1;
+        }
+
+        var getSpeakerVolume = getSpeakerMute with { Value = 0x0200, Length = 2 };
+        ControlResult initialVolume = ep0.Handle(getSpeakerVolume, ReadOnlySpan<byte>.Empty);
+        if (initialVolume.Status != 0 || !initialVolume.Data.AsSpan().SequenceEqual(new byte[] { 0, 0 }))
+        {
+            Console.Error.WriteLine("FAIL: UAC speaker-volume GET_CUR did not return 0 dB.");
+            return 1;
+        }
+
+        var setSpeakerVolume = getSpeakerVolume with { RequestType = 0x21, Request = 0x01 };
+        ControlResult setVolume = ep0.Handle(setSpeakerVolume, new byte[] { 0x00, 0xFF });
+        ControlResult updatedVolume = ep0.Handle(getSpeakerVolume, ReadOnlySpan<byte>.Empty);
+        if (setVolume.Status != 0 || updatedVolume.Status != 0 ||
+            !updatedVolume.Data.AsSpan().SequenceEqual(new byte[] { 0x00, 0xFF }))
+        {
+            Console.Error.WriteLine("FAIL: UAC speaker-volume SET_CUR state did not round-trip.");
+            return 1;
+        }
+
+        var getSpeakerVolumeMin = getSpeakerVolume with { Request = 0x82 };
+        var getSpeakerVolumeMax = getSpeakerVolume with { Request = 0x83 };
+        var getSpeakerVolumeRes = getSpeakerVolume with { Request = 0x84 };
+        if (!ep0.Handle(getSpeakerVolumeMin, ReadOnlySpan<byte>.Empty).Data.AsSpan()
+                .SequenceEqual(new byte[] { 0x00, 0x9C }) ||
+            !ep0.Handle(getSpeakerVolumeMax, ReadOnlySpan<byte>.Empty).Data.AsSpan()
+                .SequenceEqual(new byte[] { 0x00, 0x00 }) ||
+            !ep0.Handle(getSpeakerVolumeRes, ReadOnlySpan<byte>.Empty).Data.AsSpan()
+                .SequenceEqual(new byte[] { 0x00, 0x01 }))
+        {
+            Console.Error.WriteLine("FAIL: UAC speaker-volume min/max/resolution responses are invalid.");
+            return 1;
+        }
+
         Console.WriteLine($"PASS: {checks} EP0 exchanges replay byte-exact; device configured, " +
-            $"audio-streaming alt setting activated.");
+            $"audio-streaming alt setting activated; UAC mute/volume controls and range passed.");
         return 0;
     }
 }

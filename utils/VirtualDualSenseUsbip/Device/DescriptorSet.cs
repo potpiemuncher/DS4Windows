@@ -2,6 +2,13 @@ using System.Buffers.Binary;
 
 namespace VirtualDualSenseUsbip.Device;
 
+public sealed record UsbInterfaceDescriptorInfo(
+    byte Number, byte Class, byte SubClass, byte Protocol);
+
+public sealed record UsbEndpointDescriptorInfo(
+    byte InterfaceNumber, byte AlternateSetting, byte Address,
+    byte Attributes, ushort MaxPacketSize, byte Interval);
+
 /// <summary>
 /// Byte-exact descriptor store for the virtual wired DualSense, loaded from the
 /// frozen M2.0 capture fixtures (utils/DSCompatProbe/fixtures/dualsense_usb_0ce6).
@@ -26,6 +33,8 @@ public sealed class DescriptorSet
     public byte NumConfigurations { get; }
     public byte NumInterfaces { get; }
     public int ConfigurationDescriptorLength => configuration.Length;
+    public IReadOnlyList<UsbInterfaceDescriptorInfo> Interfaces { get; }
+    public IReadOnlyList<UsbEndpointDescriptorInfo> Endpoints { get; }
 
     private DescriptorSet(byte[] device, byte[] configuration, byte[] hidReport,
         byte[] hidDescriptor, Dictionary<byte, byte[]> strings, byte hidInterfaceNumber)
@@ -42,6 +51,7 @@ public sealed class DescriptorSet
         DeviceBcd = (ushort)(device[12] | (device[13] << 8));
         NumConfigurations = device[17];
         NumInterfaces = configuration[4];
+        (Interfaces, Endpoints) = ParseTopology(configuration, NumInterfaces);
     }
 
     public static DescriptorSet LoadFromFixtures(string fixturesDir)
@@ -151,6 +161,54 @@ public sealed class DescriptorSet
         hidOnly[4] = 1; // bNumInterfaces
         hidOnly[captured[0] + 2] = 0; // bInterfaceNumber
         return hidOnly;
+    }
+
+    private static (IReadOnlyList<UsbInterfaceDescriptorInfo> Interfaces,
+        IReadOnlyList<UsbEndpointDescriptorInfo> Endpoints) ParseTopology(
+        byte[] config, byte expectedInterfaceCount)
+    {
+        var interfaces = new Dictionary<byte, UsbInterfaceDescriptorInfo>();
+        var endpoints = new List<UsbEndpointDescriptorInfo>();
+        byte currentInterface = 0xFF;
+        byte currentAlternate = 0;
+        int offset = 0;
+        while (offset + 2 <= config.Length)
+        {
+            int length = config[offset];
+            int type = config[offset + 1];
+            if (length < 2 || offset + length > config.Length)
+            {
+                throw new InvalidDataException("Malformed descriptor in configuration topology.");
+            }
+
+            if (type == UsbDescriptorType.Interface && length >= 9)
+            {
+                currentInterface = config[offset + 2];
+                currentAlternate = config[offset + 3];
+                interfaces.TryAdd(currentInterface, new UsbInterfaceDescriptorInfo(
+                    currentInterface, config[offset + 5], config[offset + 6], config[offset + 7]));
+            }
+            else if (type == UsbDescriptorType.Endpoint && length >= 7 && currentInterface != 0xFF)
+            {
+                endpoints.Add(new UsbEndpointDescriptorInfo(
+                    currentInterface,
+                    currentAlternate,
+                    config[offset + 2],
+                    config[offset + 3],
+                    BinaryPrimitives.ReadUInt16LittleEndian(config.AsSpan(offset + 4, 2)),
+                    config[offset + 6]));
+            }
+
+            offset += length;
+        }
+
+        if (interfaces.Count != expectedInterfaceCount)
+        {
+            throw new InvalidDataException(
+                $"Configuration advertises {expectedInterfaceCount} interfaces but describes {interfaces.Count}.");
+        }
+
+        return (interfaces.Values.OrderBy(info => info.Number).ToArray(), endpoints);
     }
 
     /// <summary>

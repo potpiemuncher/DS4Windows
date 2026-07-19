@@ -47,9 +47,19 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
     string busId = GetOption(args, "--busid") ?? "1-1";
     string? capturePath = GetOption(args, "--capture");
     string inputMode = GetOption(args, "--input") ?? "neutral";
+    string configurationMode = GetOption(args, "--configuration") ?? "hid";
+    string suggestedSerial = configurationMode.Equals("composite", StringComparison.OrdinalIgnoreCase)
+        ? "DS4WSPKCOMP001"
+        : "DS4WSPKHID001";
     int port = ParsePort(GetOption(args, "--port"));
 
-    DescriptorSet descriptors = DescriptorSet.LoadHidOnlyFromFixtures(Path.GetFullPath(fixtures));
+    string fullFixturesPath = Path.GetFullPath(fixtures);
+    DescriptorSet descriptors = configurationMode.ToLowerInvariant() switch
+    {
+        "hid" => DescriptorSet.LoadHidOnlyFromFixtures(fullFixturesPath),
+        "composite" => DescriptorSet.LoadFromFixtures(fullFixturesPath),
+        _ => throw new ArgumentException("--configuration must be 'hid' or 'composite'."),
+    };
     using BluetoothDualSenseInputSource? bluetoothInput =
         inputMode.Equals("bluetooth", StringComparison.OrdinalIgnoreCase)
             ? BluetoothDualSenseInputSource.Open(
@@ -98,13 +108,16 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
         lock (captureGate)
         {
             outputNumber = ++hidOutputCount;
-            if (capture.Data.Length >= 33 && capture.Data[0] == 0x02)
+            if (capture.Data.Length >= 33 && capture.Data[0] == 0x02 &&
+                (capture.Data[1] & 0x0C) != 0)
             {
-                ReadOnlySpan<byte> triggerBlock = capture.Data.AsSpan(11, 22);
+                byte[] triggerState = new byte[23];
+                triggerState[0] = (byte)(capture.Data[1] & 0x0C);
+                capture.Data.AsSpan(11, 22).CopyTo(triggerState.AsSpan(1));
                 if (lastLoggedTriggerBlock == null ||
-                    !triggerBlock.SequenceEqual(lastLoggedTriggerBlock))
+                    !triggerState.AsSpan().SequenceEqual(lastLoggedTriggerBlock))
                 {
-                    lastLoggedTriggerBlock = triggerBlock.ToArray();
+                    lastLoggedTriggerBlock = triggerState;
                     triggerChanged = true;
                 }
             }
@@ -133,9 +146,9 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
     try
     {
         server.Start();
-        Console.WriteLine("HID-only virtual DualSense is ready for usbip-win2.");
+        Console.WriteLine($"Virtual DualSense ({configurationMode} configuration) is ready for usbip-win2.");
         Console.WriteLine($"Attach from an elevated terminal:");
-        Console.WriteLine($"  usbip attach -r 127.0.0.1 -b {busId} --serial DS4WSPKHID001 --once");
+        Console.WriteLine($"  usbip attach -r 127.0.0.1 -b {busId} --serial {suggestedSerial} --once");
         await server.RunAsync(cancellation.Token);
     }
     finally
@@ -152,7 +165,7 @@ Console.WriteLine("  devicetest [fixtures] replay captured EP0 enumeration byte-
 Console.WriteLine("  servertest [fixtures] exercise the live server over loopback TCP");
 Console.WriteLine("  inputtest [seconds]   validate physical BT input and USB report conversion");
 Console.WriteLine("  serve [--fixtures DIR] [--port 3240] [--busid 1-1] [--capture FILE]");
-Console.WriteLine("        [--input neutral|bluetooth]");
+Console.WriteLine("        [--input neutral|bluetooth] [--configuration hid|composite]");
 
 static string DefaultFixturesPath() => Path.Combine(AppContext.BaseDirectory,
     "..", "..", "..", "..", "DSCompatProbe", "fixtures", "dualsense_usb_0ce6");

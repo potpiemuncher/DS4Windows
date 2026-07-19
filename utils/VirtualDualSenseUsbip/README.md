@@ -1,13 +1,14 @@
 # VirtualDualSenseUsbip
 
-User-space USB/IP device emulator for DS4Windows Phase 4. It exposes a
-HID-only wired DualSense through usbip-win2's signed VHCI driver. A later
-milestone will add the captured UAC1 audio interfaces and relay native haptic
-audio to the real Bluetooth controller.
+User-space USB/IP device emulator for DS4Windows Phase 4. It exposes a wired
+DualSense through usbip-win2's signed VHCI driver. The exact composite mode now
+materializes Windows audio endpoints; the next milestone accepts isochronous
+playback and relays native haptic audio to the real Bluetooth controller.
 
 ## Status
 
-M2.3-live enumeration is working on the primary Windows 11 PC:
+M2.3 HID/input/trigger relay and M2.4 composite enumeration are working on the
+primary Windows 11 PC:
 
 - usbip-win2 0.9.7.8 is qualified under Secure Boot and Memory Integrity.
 - `usbip list` and `usbip attach` discover and materialize the virtual device.
@@ -28,13 +29,17 @@ M2.3-live enumeration is working on the primary Windows 11 PC:
   Bluetooth `0x31` reports. Black Flag Resynced recognized the virtual wired
   device, emitted R2 modes `0x05`/`0x22` and L2 mode `0x05`, and the user
   confirmed physical R2 resistance while firing.
+- `--configuration composite` serves the exact captured 227-byte UAC1 + HID
+  configuration. Windows starts the MEDIA child and creates healthy Speakers
+  and Headset Microphone endpoints. The audio engine reaches playback
+  interface 1 alt 1 and submits ISO OUT traffic.
 - In neutral-input mode, feature report `0x05` intentionally stalls rather
   than returning invented sensor calibration.
 
 Capturing the other planned adaptive-trigger programs, one-hour stability,
 graceful server shutdown, and repeated clean attach/detach remain M2.3
-durability work. UAC1 audio is not exposed yet, so native cable-like haptic
-audio is not expected; that begins in M2.4.
+durability work. ISO playback remains gated until M2.5, so native cable-like
+haptic audio is not expected yet.
 
 ## Build and test
 
@@ -48,8 +53,9 @@ dotnet run --project .\utils\DSHapticsProto -- watchusb 12
 ```
 
 The tests cover USB/IP golden vectors and fragmentation, byte-exact replay of
-the captured composite EP0 fixture, and a loopback live-server session with
-management, HID-only EP0, feature, interrupt-IN/OUT, and UNLINK traffic.
+the captured composite EP0 fixture, UAC1 mute/volume state and range controls,
+exact composite topology, and a loopback live-server session with management,
+HID-only EP0, feature, interrupt-IN/OUT, and UNLINK traffic.
 
 ## Live attach
 
@@ -79,6 +85,10 @@ The physical controller must be awake and connected over Bluetooth before the
 server starts. Keep DS4Windows, DSX, and Steam Input closed for the first live
 bridge test. Use `--input neutral` when only enumeration/output capture is
 needed.
+
+For composite enumeration, add `--configuration composite` and attach with an
+alphanumeric serial such as `DS4WSPKCOMP001`. Change the serial while iterating
+Windows driver startup so a previous failed device instance is not reused.
 
 Protocol source: [Linux kernel USB/IP protocol documentation](https://docs.kernel.org/usb/usbip_protocol.html).
 The captured descriptors live in

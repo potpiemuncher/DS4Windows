@@ -21,6 +21,26 @@ public static class LiveServerSelfTest
             "HID-only descriptor set did not expose exactly interface zero");
         Require(descriptors.ConfigurationDescriptorLength == 41,
             $"unexpected HID-only configuration length {descriptors.ConfigurationDescriptorLength}");
+        Require(descriptors.Interfaces.Count == 1 &&
+                descriptors.Interfaces[0] == new UsbInterfaceDescriptorInfo(0, 3, 0, 0),
+            "HID-only topology metadata mismatch");
+
+        Console.WriteLine("servertest: exact composite topology");
+        DescriptorSet composite = DescriptorSet.LoadFromFixtures(fixturesDir);
+        Require(composite.ConfigurationDescriptorLength == 227 &&
+                composite.NumInterfaces == 4 && composite.Interfaces.Count == 4,
+            "composite descriptor set did not preserve all four interfaces");
+        Require(composite.Interfaces[0] == new UsbInterfaceDescriptorInfo(0, 1, 1, 0) &&
+                composite.Interfaces[1] == new UsbInterfaceDescriptorInfo(1, 1, 2, 0) &&
+                composite.Interfaces[2] == new UsbInterfaceDescriptorInfo(2, 1, 2, 0) &&
+                composite.Interfaces[3] == new UsbInterfaceDescriptorInfo(3, 3, 0, 0),
+            "composite interface class topology mismatch");
+        Require(composite.Endpoints.Contains(new UsbEndpointDescriptorInfo(1, 1, 0x01, 0x09, 392, 4)) &&
+                composite.Endpoints.Contains(new UsbEndpointDescriptorInfo(2, 1, 0x82, 0x05, 196, 4)) &&
+                composite.Endpoints.Contains(new UsbEndpointDescriptorInfo(3, 0, 0x84, 0x03, 64, 6)) &&
+                composite.Endpoints.Contains(new UsbEndpointDescriptorInfo(3, 0, 0x03, 0x03, 64, 6)),
+            "composite endpoint topology mismatch");
+        await TestCompositeDeviceListAsync(composite);
 
         using var server = new VirtualDualSenseServer(descriptors,
             new VirtualDualSenseServerOptions(Port: 0,
@@ -35,7 +55,7 @@ public static class LiveServerSelfTest
         try
         {
             Console.WriteLine("servertest: OP_REQ_DEVLIST");
-            await TestDeviceListAsync(server.Port);
+            await TestDeviceListAsync(server.Port, descriptors.Interfaces);
 
             Console.WriteLine("servertest: OP_REQ_IMPORT + EP0 + interrupt endpoints");
             await TestImportSessionAsync(server.Port, captured.Task);
@@ -79,6 +99,7 @@ public static class LiveServerSelfTest
 
         byte[] usbOutput = new byte[48];
         usbOutput[0] = 0x02;
+        usbOutput[1] = 0x0C;
         usbOutput[11] = 0x22;
         usbOutput[12] = 0x12;
         usbOutput[13] = 0x00;
@@ -95,6 +116,10 @@ public static class LiveServerSelfTest
                 BinaryPrimitives.ReadUInt32LittleEndian(bluetoothOutput.AsSpan(74)) ==
                     ComputeBluetoothCrc(0xA2, bluetoothOutput.AsSpan(0, 74)),
             "USB output did not map to an authenticated trigger-only Bluetooth report");
+        usbOutput[1] = 0x02;
+        Require(!BluetoothDualSenseInputSource.TryBuildBluetoothTriggerReport(
+                usbOutput, out _),
+            "output without adaptive-trigger update flags must not alter trigger state");
     }
 
     private static uint ComputeBluetoothCrc(byte seed, ReadOnlySpan<byte> data)
@@ -117,14 +142,41 @@ public static class LiveServerSelfTest
         return state;
     }
 
-    private static async Task TestDeviceListAsync(int port)
+    private static async Task TestCompositeDeviceListAsync(DescriptorSet descriptors)
+    {
+        using var server = new VirtualDualSenseServer(descriptors,
+            new VirtualDualSenseServerOptions(Port: 0,
+                InputInterval: TimeSpan.FromMilliseconds(200)));
+        server.Start();
+        using var cancellation = new CancellationTokenSource();
+        Task serverTask = server.RunAsync(cancellation.Token);
+        try
+        {
+            await TestDeviceListAsync(server.Port, descriptors.Interfaces);
+        }
+        finally
+        {
+            cancellation.Cancel();
+            try
+            {
+                await serverTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+    }
+
+    private static async Task TestDeviceListAsync(int port,
+        IReadOnlyList<UsbInterfaceDescriptorInfo> expectedInterfaces)
     {
         using var client = new TcpClient { NoDelay = true };
         await client.ConnectAsync("127.0.0.1", port);
         NetworkStream stream = client.GetStream();
         await stream.WriteAsync(EncodeOperation(UsbIpConstants.OpReqDevList));
 
-        byte[] reply = await UsbIpCodec.ReadExactlyAsync(stream, 12 + 312 + 4);
+        byte[] reply = await UsbIpCodec.ReadExactlyAsync(stream,
+            12 + 312 + expectedInterfaces.Count * 4);
         Require(U16(reply, 0) == UsbIpConstants.Version &&
                 U16(reply, 2) == UsbIpConstants.OpRepDevList &&
                 U32(reply, 4) == 0 && U32(reply, 8) == 1,
@@ -132,8 +184,17 @@ public static class LiveServerSelfTest
         Require(U16(reply, 12 + 256 + 32 + 12) == 0x054C &&
                 U16(reply, 12 + 256 + 32 + 14) == 0x0CE6,
             "OP_REP_DEVLIST VID/PID mismatch");
-        Require(reply[^4] == 3 && reply[^3] == 0 && reply[^2] == 0,
-            "OP_REP_DEVLIST HID interface mismatch");
+        Require(reply[12 + 311] == expectedInterfaces.Count,
+            "OP_REP_DEVLIST interface count mismatch");
+        for (int i = 0; i < expectedInterfaces.Count; i++)
+        {
+            int offset = 12 + 312 + i * 4;
+            UsbInterfaceDescriptorInfo expected = expectedInterfaces[i];
+            Require(reply[offset] == expected.Class &&
+                    reply[offset + 1] == expected.SubClass &&
+                    reply[offset + 2] == expected.Protocol,
+                $"OP_REP_DEVLIST interface {i} class mismatch");
+        }
     }
 
     private static async Task TestImportSessionAsync(int port, Task<HidOutputCapture> captureTask)
