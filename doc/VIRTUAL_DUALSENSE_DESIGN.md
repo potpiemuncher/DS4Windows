@@ -308,7 +308,7 @@ It does not yet prove that a real game emits nonzero channels 3/4 in a tested
 scene, and it does not forward audible USB channels 1/2 to the controller
 speaker or headphone jack.
 
-## Composite teardown crash and safety hold (2026-07-18)
+## Composite teardown crash, fix, and live revalidation (2026-07-18)
 
 At approximately 7:24 PM, removal of composite instance
 `USB\VID_054C&PID_0CE6\DS4WSPKM26001` coincided with bugcheck
@@ -332,11 +332,28 @@ transfers now use an atomic pending/completing/canceled state machine:
   window and verifies both `-ECONNRESET` and the absence of a late RET_SUBMIT.
 
 The fix builds with zero warnings and all offline protocol, descriptor, UAC1,
-conversion, and live-loopback tests pass. It has deliberately not been
-revalidated against usbip-win2 on the primary PC; 50 consecutive loopback
-servertest runs passed offline. The upstream project itself
-recommends restore points, WPP driver tracing, kernel dumps, and Driver Verifier
-for crash diagnosis. Resume live work only on a disposable Windows machine or
-VM configured for those captures; require repeated composite attach, active
-ISO, UNLINK, detach, server-loss, and surprise-removal stress before lifting the
-primary-PC hold.
+conversion, and live-loopback tests pass; 50 consecutive loopback servertest
+runs passed. The primary PC was then configured with Active Memory Dump backed
+by a 31 GB system-managed pagefile, verbose KMDF logging, and both USB/IP WPP
+providers with zero-loss ETL capture.
+
+Two independent active-ISO detach cycles survived and reconciled cleanly:
+
+- Cycle 1: 16,093 CMD_SUBMITs, 16,089 normal RET_SUBMITs, and exactly four
+  outstanding requests (two ISO OUT and two interrupt IN) canceled once at
+  plug-out.
+- Cycle 2: 1,171 CMD_SUBMITs, 1,167 normal RET_SUBMITs, and the same expected
+  four once-canceled outstanding requests.
+- Across both traces there were no nonzero RET_SUBMIT statuses, ISO packet
+  errors, orphan or duplicate sequence numbers, late completions, or USB/IP
+  protocol messages after plug-out. Endpoint queues cleaned up, composite
+  unregister succeeded, `force delete` remained zero, and the port became
+  empty. Neither ETL lost events or had format errors.
+
+The second batch harness reported failure only because it treated an unavailable
+completed-process exit-code property as a nonzero exit; its six-second audio
+test completed normally and the driver trace was clean. The user elected to
+stop additional server-loss/Driver Verifier stress and declared the teardown
+issue fixed. The primary-PC safety hold is therefore lifted. Preserve the audit
+under `C:\Users\patri\PS5Haptics\USBIP-M2.6-Safety-Audit`, and re-arm WPP plus
+dump capture before testing future teardown, pacing, or protocol changes.

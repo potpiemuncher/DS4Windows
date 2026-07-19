@@ -4,8 +4,8 @@ User-space USB/IP device emulator for DS4Windows Phase 4. It exposes a wired
 DualSense through usbip-win2's signed VHCI driver. The exact composite mode now
 materializes Windows audio endpoints, accepts paced isochronous playback, and
 relays native haptic channels 3/4 to the real Bluetooth controller. Controlled
-M2.6 haptics work, but live USB/IP testing is on safety hold after a teardown
-bugcheck on the primary PC.
+M2.6 haptics and the corrected teardown path are live-validated on the primary
+PC under USB/IP WPP tracing.
 
 ## Status
 
@@ -43,15 +43,18 @@ primary Windows 11 PC:
 - In neutral-input mode, feature report `0x05` intentionally stalls rather
   than returning invented sensor calibration.
 
-Real game-authored channels 3/4, one-hour stability, and safe teardown still
-need validation. Audible USB channels 1/2 are not forwarded by this spike.
+Real game-authored channels 3/4 and one-hour stability still need validation.
+Audible USB channels 1/2 are not forwarded by this spike.
 
-**Safety hold:** do not attach this device through usbip-win2 on the primary PC.
-A composite removal at 7:24 PM on 2026-07-18 produced bugcheck `0xA` while
-Windows freed an IRP; PnP black-box data named the exact virtual instance. An
-UNLINK/late-RET_SUBMIT race was found and fixed offline, but the fix must first
-survive trace-enabled attach/detach stress on a disposable Windows machine or
-VM.
+**Teardown fix live-validated:** a composite removal at 7:24 PM on 2026-07-18
+produced bugcheck `0xA` while Windows freed an IRP. An emulator race could let
+successful UNLINK precede a late RET_SUBMIT. The atomic transfer-state fix was
+subsequently exercised by two primary-PC active-ISO detaches with Active Memory
+Dump and both USB/IP WPP providers armed. The traces reconciled 16,093/1,171
+submits into normal completions plus exactly four once-canceled outstanding
+requests per unplug. They contained no failed, duplicate, orphaned, or late
+completion, no ISO error, no post-plug-out protocol traffic, and no trace loss.
+The user accepted this evidence as fixed and lifted the primary-PC safety hold.
 
 ## Build and test
 
@@ -73,11 +76,10 @@ UNLINK traffic. The teardown regression unlinks a synthetic 100-packet ISO trans
 during its pacing window and verifies that no late RET_SUBMIT follows. The
 complete loopback suite passed 50 consecutive runs after the fix.
 
-## Live attach (disposable test systems only)
+## Live attach
 
-Do not run these commands on the primary PC while the safety hold above is
-active. Configure USB/IP WPP tracing and kernel dumps before testing on a
-disposable machine.
+Configure USB/IP WPP tracing and kernel dumps before testing changes to
+teardown, ISO pacing, or USB/IP protocol behavior.
 
 Close DS4Windows for the first clean enumeration. Start the server from a
 normal terminal:

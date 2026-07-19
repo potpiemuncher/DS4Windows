@@ -14,7 +14,7 @@ Repository state:
 - Fork: `https://github.com/potpiemuncher/DS4Windows.git`
 - Upstream: `https://github.com/ds4windowsapp/DS4Windows.git`
 - Active branch: `feature/bt-audio-haptics`
-- Latest pushed checkpoint before the current M2.5-M2.6 work: `587e458`
+- Latest pushed implementation checkpoint: `319090c`
 
 Read `doc/BT_AUDIO_HAPTICS_RESEARCH.md` and
 `doc/VIRTUAL_DUALSENSE_DESIGN.md` before changing the protocol or Phase 4
@@ -168,16 +168,18 @@ has not yet been shown to emit nonzero channels 3/4 through this path. Audible
 USB channels 1/2 are metered only; this spike does not relay cable-like
 controller speaker/headphone audio.
 
-More importantly, the primary PC bugchecked at 7:24 PM during removal of
+The primary PC previously bugchecked at 7:24 PM during removal of
 `USB\VID_054C&PID_0CE6\DS4WSPKM26001`. The minidump reports
 `0xA IRQL_NOT_LESS_OR_EQUAL`, `AV_nt!RtlpHpVsChunkFree`, and
 `IoFreeIrp -> IopUserCompletion`; PnP black-box data names that exact virtual
 device with problem code 24. The small dump cannot prove the responsible
 driver, but an emulator race was found where paced ISO work left the pending
 table before RET_SUBMIT, allowing UNLINK status 0 to precede a late RET_SUBMIT.
-The race is fixed and covered offline. Do not attach this USB/IP device again
-on the primary PC until the fix passes trace-enabled attach/detach stress on a
-disposable Windows machine or VM.
+The race is fixed, covered offline, and live-revalidated twice on the primary
+PC under USB/IP WPP tracing. Both active-ISO detach traces reconciled every
+request with no failed, duplicate, orphaned, or late completion. The user
+accepted that evidence and declared the teardown issue fixed; the primary-PC
+safety hold is lifted.
 
 ## Next Milestone: Native DualSense Game Compatibility
 
@@ -249,13 +251,26 @@ Status and order:
    A separate 120 Hz / 25% run sent 503 haptic reports with zero write errors.
    Silence suppression drains a six-report tail and then idles. The native
    11-byte adaptive-trigger relay remains proven in M2.3.
-8. **Live teardown safety BLOCKED**: the 7:24 PM bugcheck happened while this
-   composite instance was being removed. The emulator's UNLINK/completion race
-   is fixed with an atomic pending/completing/canceled state machine and a
-   regression test that forbids late RET_SUBMIT after successful UNLINK. All
-   offline builds and selftest/devicetest/servertest pass; 50 consecutive
-   servertest runs also passed. Live revalidation must happen off the primary PC
-   with USB/IP WPP tracing and a kernel dump configured.
+8. **Live teardown fix PASSED (2026-07-18)**: the 7:24 PM bugcheck happened
+   while this composite instance was being removed. The emulator's
+   UNLINK/completion race is fixed with an atomic
+   pending/completing/canceled state machine and a regression test that
+   forbids late RET_SUBMIT after successful UNLINK. All offline builds and
+   selftest/devicetest/servertest pass; 50 consecutive servertest runs also
+   passed. Active Memory Dump, verbose KMDF logging, and both USB/IP WPP
+   providers were then armed on the primary PC. The first live active-ISO
+   detach reconciled 16,093 submits as 16,089 normal RET_SUBMITs plus exactly
+   four once-canceled outstanding requests. A second independent cycle
+   reconciled 1,171 submits as 1,167 normal returns plus the same expected
+   four cancellations. Both traces had zero nonzero completion statuses, ISO
+   errors, orphan/duplicate sequences, protocol traffic after plug-out, trace
+   loss, or `force delete`; composite unregister and port cleanup succeeded.
+   Evidence is under
+   `C:\Users\patri\PS5Haptics\USBIP-M2.6-Safety-Audit`. The second batch
+   harness stopped after that pass because it treated an unavailable process
+   exit-code property as failure; its audio test actually completed normally.
+   The user elected not to continue Driver Verifier/server-loss stress and
+   declared the teardown issue fixed.
 
 Installing the VHCI kernel driver is a material system change and briefly
 restarts USB 3.0 hubs/devices. Before doing it, get explicit user approval,
@@ -264,16 +279,18 @@ Boot/HVCI/testsigning state, create a restore point if available, and verify the
 downloaded package/signatures. Do not weaken Windows security to make the
 driver load.
 
-The primary PC has already completed installation and qualification, but the
-later teardown crash supersedes the earlier live-test permission. Do not
-reinstall, attach, detach, or cycle its USB hubs for this spike. The installed
-driver may remain idle while offline work continues.
+The primary PC has completed installation, qualification, and traced teardown
+revalidation. Do not reinstall or cycle USB hubs without a new reason and the
+same system-change precautions. Normal attach/detach testing is permitted, but
+re-arm WPP tracing and dump capture before testing any new teardown, pacing, or
+USB/IP protocol change.
 
 ## Working Rules for the Next Agent
 
 - Inspect `git status` before editing and preserve unrelated user work.
-- Keep USB/IP detached on the primary PC. Do not treat the offline UNLINK fix as
-  permission to reproduce a kernel crash there.
+- Keep USB/IP detached when it is not being tested. The current UNLINK fix is
+  live-validated; re-arm WPP tracing and dumps before changing teardown or ISO
+  completion behavior.
 - Keep report `0x36` as the known-good Bluetooth transport unless new hardware
   evidence proves another report works.
 - Keep listening audio and audible system output independent via WASAPI
