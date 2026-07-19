@@ -1,6 +1,6 @@
 # DS4Windows Bluetooth Audio/Haptics Project Handoff
 
-Last updated: 2026-07-18
+Last updated: 2026-07-19
 
 ## Mission
 
@@ -14,7 +14,7 @@ Repository state:
 - Fork: `https://github.com/potpiemuncher/DS4Windows.git`
 - Upstream: `https://github.com/ds4windowsapp/DS4Windows.git`
 - Active branch: `feature/bt-audio-haptics`
-- Latest pushed implementation checkpoint: `319090c`
+- Latest implementation checkpoint: `1e454b7`
 
 Read `doc/BT_AUDIO_HAPTICS_RESEARCH.md` and
 `doc/VIRTUAL_DUALSENSE_DESIGN.md` before changing the protocol or Phase 4
@@ -37,6 +37,9 @@ DualSense:
   resistance while firing.
 - A controlled virtual-USB four-channel tone reached native haptic channels 3/4
   and the user felt it at about 7:20 PM on 2026-07-18.
+- On 2026-07-19, a controlled three-pulse 120 Hz system-audio test reached the
+  physical controller through `System Audio + Rumble` on the stabilized build;
+  the user confirmed exactly three pulses.
 
 `System Audio + Rumble` means audio-derived haptic PCM and synthesized XInput
 rumble are mixed into the same voice-coil haptic stream. It does not itself
@@ -116,6 +119,10 @@ Latest user-validated fixes:
   controller audio and improved sound quality.
 - `d5046ed` lets pure rumble synthesis use full PCM amplitude. This fixed weak
   rumble-to-haptics pulses.
+- `1e454b7` stabilizes the shared Bluetooth HID output path: all `0x31`, `0x32`,
+  and `0x36` writers are serialized; interrupt writes honor their timeout and
+  report Win32 errors; startup publishes only one streamer; and replacement
+  streams use generation-specific cancellation so an older thread cannot resume.
 
 Use `git log --oneline upstream/main..HEAD` for the complete ordered commit
 history.
@@ -155,11 +162,60 @@ with a 2.1% maximum. Two isolated zero-credit samples occurred without a
 dropout. The monitor's stored PnP-presence identifier was stale after a
 reconnect; live bidirectional traffic proved the connection was present.
 
-The last manually launched validated executable was:
+The currently launched exact validated executable is:
 
-`C:\Users\patri\PS5Haptics\rumblefull-build\x64\Release\net8.0-windows\DS4Windows.exe`
+`C:\Users\patri\PS5Haptics\stability-final-build\x64\Release\net8.0-windows\DS4Windows.exe`
+
+Its `DS4Windows.dll` SHA-256 is
+`E35D61E8E1A45050A07928AED12C5459290C77AE64402C08E201C2CA85F15240`.
 
 Do not rely on an old process ID; check the current process and binary path.
+
+## Bluetooth Streamer Stability Fix (2026-07-19)
+
+The short approximately 0.54-second stream abort was deterministic: 50 failed
+writes multiplied by the 10.667 ms haptic slot. Three producers were racing the
+same Bluetooth HID output endpoint (normal state `0x31`, amplifier setup `0x32`,
+and continuous stream `0x36`), the supplied interrupt-write timeout was ignored,
+and startup/settings notifications could create multiple streamer generations.
+
+`1e454b7` fixes all three layers:
+
+- `HidDevice` has one ordered output-report gate per physical HID device.
+- Interrupt writes use a bounded, non-alertable overlapped wait. A timed-out
+  request is canceled by its exact `OVERLAPPED` pointer and completion is drained
+  before its stack/event storage is released.
+- Write failures now preserve the first/last Win32 error and report ID/size.
+- Settings loading cannot start the streamer before `StartUpdate`; initial
+  publication is atomic.
+- Every stream generation has its own cancellation source. A late old thread
+  cannot observe a new generation's `running` state or clear its active state.
+
+Validation on the primary PC:
+
+- Focused `DualSenseHapticsStreamerTests`: 12/12 passed after the final change.
+- Startup produced exactly one streamer. Live changes from Rumble-to-Haptics to
+  Mix, Mix plus listening audio, and back to Mix each produced one clean
+  replacement with no write failure, abort, or stream error.
+- A 30-second music/Mix capture produced 26 valid samples: controller and
+  DS4Windows present throughout, 37,783.1 B/s average outbound
+  (37,439.7-37,937.8), zero ACL flushes, minimum four write credits, and 1.0%
+  average / 1.5% maximum DS4Windows CPU.
+- The exact final binary then restarted directly into persisted Mix. A 10-second
+  check produced 37,835.2 B/s average outbound (37,647.9-38,043.5), zero ACL
+  flushes, and no monitor/log errors.
+- A final controlled three-pulse 120 Hz test was physically confirmed as exactly
+  three controller pulses.
+
+Approximately 37-38 kB/s is the healthy single-writer rate for this continuous
+398-byte stream at about 93.75 reports/s. Do not classify it as low merely
+because an older mixed-traffic baseline exceeded 40 kB/s; roughly double this
+rate would instead indicate duplicate writer generations.
+
+At 10:50:45 the controller logged read failure 1167 and Windows `HidBth` event 2
+(out of range or unresponsive). The user confirmed the controller had reached
+its idle timeout and powered off, then manually turned it back on. It reconnected
+normally; this event is not evidence of a writer or teardown regression.
 
 ## Current Limitation
 
