@@ -382,6 +382,32 @@ namespace DS4Windows
 
         public event EventHandler BTHapticsOptionChanged;
 
+        private bool nativeModeSpeakerAudio = true;
+        public bool NativeModeSpeakerAudio
+        {
+            get => nativeModeSpeakerAudio;
+            set
+            {
+                if (nativeModeSpeakerAudio == value) return;
+                nativeModeSpeakerAudio = value;
+                NativeModeOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private AudioOutputRoute nativeModeRoute = AudioOutputRoute.Auto;
+        public AudioOutputRoute NativeModeRoute
+        {
+            get => nativeModeRoute;
+            set
+            {
+                if (nativeModeRoute == value) return;
+                nativeModeRoute = value;
+                NativeModeOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        public event EventHandler NativeModeOptionChanged;
+
         public DualSenseControllerOptions(InputDeviceType deviceType) :
             base(deviceType)
         {

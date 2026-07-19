@@ -95,14 +95,6 @@ namespace DS4Windows
 
         private readonly NativeModeManager nativeModeManager = new NativeModeManager();
         private readonly SemaphoreSlim nativeModeLifecycleGate = new SemaphoreSlim(1, 1);
-        private static readonly string[] NativeModeServerArguments =
-        {
-            "serve",
-            "--configuration", "composite",
-            "--input", "bluetooth",
-            "--speaker-audio", "on",
-            "--route", "auto",
-        };
         public NativeModeManager NativeModeManager => nativeModeManager;
 
         private DS4WinWPF.ArgumentParser cmdParser;
@@ -2086,6 +2078,9 @@ namespace DS4Windows
 
                 string macAddress = device.getMacAddress();
                 string devicePath = device.HidDevice.DevicePath;
+                var dualSense = (InputDevices.DualSenseDevice)device;
+                string[] serverArguments = BuildNativeModeServerArguments(
+                    dualSense.NativeOptionsStore);
                 DS4Devices.BeginNativeModeSuppression(macAddress, devicePath);
 
                 try
@@ -2093,7 +2088,7 @@ namespace DS4Windows
                     await Task.Run(() => ReleaseControllerForNativeMode(device, deviceIndex))
                         .ConfigureAwait(false);
 
-                    await nativeModeManager.StartAsync(NativeModeServerArguments,
+                    await nativeModeManager.StartAsync(serverArguments,
                         CancellationToken.None).ConfigureAwait(false);
                 }
                 catch
@@ -2106,6 +2101,22 @@ namespace DS4Windows
             {
                 nativeModeLifecycleGate.Release();
             }
+        }
+
+        public static string[] BuildNativeModeServerArguments(
+            DualSenseControllerOptions options)
+        {
+            if (options == null)
+                throw new ArgumentNullException(nameof(options));
+
+            return new[]
+            {
+                "serve",
+                "--configuration", "composite",
+                "--input", "bluetooth",
+                "--speaker-audio", options.NativeModeSpeakerAudio ? "on" : "off",
+                "--route", options.NativeModeRoute.ToString().ToLowerInvariant(),
+            };
         }
 
         public async Task StopNativeModeAsync(
