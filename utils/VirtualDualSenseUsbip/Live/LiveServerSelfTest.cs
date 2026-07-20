@@ -333,6 +333,7 @@ public static class LiveServerSelfTest
             await TestDeviceListAsync(server.Port, descriptors.Interfaces);
             Console.WriteLine("servertest: composite isochronous OUT completion");
             await TestCompositeIsoOutAsync(server.Port, captured.Task);
+            await TestIsochronousOutWatchdogAsync(server.Port);
         }
         finally
         {
@@ -478,14 +479,93 @@ public static class LiveServerSelfTest
         catch (OperationCanceledException) when (noLateMicrophoneCompletion.IsCancellationRequested)
         {
         }
+
+        await TestConfigurationZeroQuiescingAsync(stream);
+    }
+
+    private static async Task TestConfigurationZeroQuiescingAsync(NetworkStream stream)
+    {
+        Console.WriteLine("servertest: SET_CONFIGURATION zero quiesces and resets ISO OUT");
+        byte[] audio = new byte[1000 * 384];
+        UsbIpIsoPacket[] packets = Enumerable.Range(0, 1000)
+            .Select(index => new UsbIpIsoPacket(
+                checked((uint)(index * 384)), 384, 0, 0))
+            .ToArray();
+        await stream.WriteAsync(EncodeIsoSubmit(40, endpoint: 1, startFrame: 8000,
+            interval: 4, audio, packets));
+
+        byte[] deconfigure = Setup(0x00, UsbStandardRequest.SetConfiguration,
+            value: 0, index: 0, length: 0);
+        await stream.WriteAsync(EncodeSubmit(41, UsbIpConstants.DirectionOut,
+            endpoint: 0, transferLength: 0, deconfigure));
+        SubmitReply deconfigureReply = await ReadSubmitReplyAsync(stream,
+            hasInputPayload: false);
+        Require(deconfigureReply.SequenceNumber == 41 && deconfigureReply.Status == 0,
+            nameof(TestConfigurationZeroQuiescingAsync));
+
+        byte[] getPlaybackInterface = Setup(0x81, UsbStandardRequest.GetInterface,
+            value: 0, index: 1, length: 1);
+        await stream.WriteAsync(EncodeSubmit(42, UsbIpConstants.DirectionIn,
+            endpoint: 0, transferLength: 1, getPlaybackInterface));
+        SubmitReply resetAltReply = await ReadSubmitReplyAsync(stream,
+            hasInputPayload: true);
+        Require(resetAltReply.SequenceNumber == 42 && resetAltReply.Status == 0 &&
+                resetAltReply.Data.SequenceEqual(new byte[] { 0 }),
+            nameof(TestConfigurationZeroQuiescingAsync));
+
+        byte[] setPlaybackInterfaceOn = Setup(0x01, UsbStandardRequest.SetInterface,
+            value: 1, index: 1, length: 0);
+        await stream.WriteAsync(EncodeSubmit(43, UsbIpConstants.DirectionOut,
+            endpoint: 0, transferLength: 0, setPlaybackInterfaceOn));
+        SubmitReply unsafeReopen = await ReadSubmitReplyAsync(stream,
+            hasInputPayload: false);
+        Require(unsafeReopen.SequenceNumber == 43 &&
+                unsafeReopen.Status == ControlResult.Stall,
+            nameof(TestConfigurationZeroQuiescingAsync));
+
+        await stream.WriteAsync(EncodeUnlink(44, unlinkSequence: 40));
+        byte[] unlinkReply = await UsbIpCodec.ReadExactlyAsync(stream,
+            UsbIpConstants.UrbHeaderLength);
+        Require(U32(unlinkReply, 0) == UsbIpConstants.RetUnlink &&
+                U32(unlinkReply, 4) == 44 && I32(unlinkReply, 20) == -104,
+            nameof(TestConfigurationZeroQuiescingAsync));
+
+        byte[] configure = Setup(0x00, UsbStandardRequest.SetConfiguration,
+            value: 1, index: 0, length: 0);
+        await stream.WriteAsync(EncodeSubmit(45, UsbIpConstants.DirectionOut,
+            endpoint: 0, transferLength: 0, configure));
+        SubmitReply configureReply = await ReadSubmitReplyAsync(stream,
+            hasInputPayload: false);
+        Require(configureReply.SequenceNumber == 45 && configureReply.Status == 0,
+            nameof(TestConfigurationZeroQuiescingAsync));
+
+        long reopenStarted = Stopwatch.GetTimestamp();
+        await stream.WriteAsync(EncodeSubmit(46, UsbIpConstants.DirectionOut,
+            endpoint: 0, transferLength: 0, setPlaybackInterfaceOn));
+        SubmitReply reopenReply = await ReadSubmitReplyAsync(stream,
+            hasInputPayload: false);
+        byte[] shortAudio = new byte[2 * 384];
+        UsbIpIsoPacket[] shortPackets = Enumerable.Range(0, 2)
+            .Select(index => new UsbIpIsoPacket(
+                checked((uint)(index * 384)), 384, 0, 0))
+            .ToArray();
+        await stream.WriteAsync(EncodeIsoSubmit(47, endpoint: 1, startFrame: 9000,
+            interval: 4, shortAudio, shortPackets));
+        IsoSubmitReply newGenerationReply = await ReadIsoSubmitReplyAsync(stream);
+        double reopenElapsedMs = (Stopwatch.GetTimestamp() - reopenStarted) * 1000.0 /
+            Stopwatch.Frequency;
+        Require(reopenReply.SequenceNumber == 46 && reopenReply.Status == 0 &&
+                newGenerationReply.SequenceNumber == 47 &&
+                newGenerationReply.Status == 0 && reopenElapsedMs < 500,
+            nameof(TestConfigurationZeroQuiescingAsync));
     }
 
     private static async Task TestIsochronousOutQuiescingAsync(NetworkStream stream)
     {
         Console.WriteLine("servertest: ISO OUT alt-zero quiesce barrier and generation reopen");
 
-        byte[] longAudio = new byte[250 * 384];
-        UsbIpIsoPacket[] longPackets = Enumerable.Range(0, 250)
+        byte[] longAudio = new byte[1000 * 384];
+        UsbIpIsoPacket[] longPackets = Enumerable.Range(0, 1000)
             .Select(index => new UsbIpIsoPacket(
                 checked((uint)(index * 384)), 384, 0, 0))
             .ToArray();
@@ -510,52 +590,62 @@ public static class LiveServerSelfTest
             hasInputPayload: false);
         Require(altZeroReply.SequenceNumber == 20 && altZeroReply.Status == 0,
             nameof(TestIsochronousOutQuiescingAsync));
-        long quiescedAt = Stopwatch.GetTimestamp();
+        byte[] setPlaybackInterfaceOn = Setup(0x01, UsbStandardRequest.SetInterface,
+            value: 1, index: 1, length: 0);
+        await stream.WriteAsync(EncodeSubmit(21, UsbIpConstants.DirectionOut,
+            endpoint: 0, transferLength: 0, setPlaybackInterfaceOn));
+        SubmitReply unsafeReopenReply = await ReadSubmitReplyAsync(stream,
+            hasInputPayload: false);
+        Require(unsafeReopenReply.SequenceNumber == 21 &&
+                unsafeReopenReply.Status == ControlResult.Stall,
+            nameof(TestIsochronousOutQuiescingAsync));
 
-        await stream.WriteAsync(EncodeUnlink(21, unlinkSequence: 10));
+        await stream.WriteAsync(EncodeUnlink(22, unlinkSequence: 10));
         byte[] unlinkWon = await UsbIpCodec.ReadExactlyAsync(stream,
             UsbIpConstants.UrbHeaderLength);
         Require(U32(unlinkWon, 0) == UsbIpConstants.RetUnlink &&
-                U32(unlinkWon, 4) == 21 && I32(unlinkWon, 20) == -104,
+                U32(unlinkWon, 4) == 22 && I32(unlinkWon, 20) == -104,
             nameof(TestIsochronousOutQuiescingAsync));
 
-        byte[] setPlaybackInterfaceOn = Setup(0x01, UsbStandardRequest.SetInterface,
-            value: 1, index: 1, length: 0);
-        await stream.WriteAsync(EncodeSubmit(22, UsbIpConstants.DirectionOut,
+        await stream.WriteAsync(EncodeUnlink(23, unlinkSequence: 11));
+        byte[] unlinkSecond = await UsbIpCodec.ReadExactlyAsync(stream,
+            UsbIpConstants.UrbHeaderLength);
+        Require(U32(unlinkSecond, 0) == UsbIpConstants.RetUnlink &&
+                U32(unlinkSecond, 4) == 23 && I32(unlinkSecond, 20) == -104,
+            nameof(TestIsochronousOutQuiescingAsync));
+
+        await stream.WriteAsync(EncodeUnlink(24, unlinkSequence: 12));
+        byte[] unlinkThird = await UsbIpCodec.ReadExactlyAsync(stream,
+            UsbIpConstants.UrbHeaderLength);
+        Require(U32(unlinkThird, 0) == UsbIpConstants.RetUnlink &&
+                U32(unlinkThird, 4) == 24 && I32(unlinkThird, 20) == -104,
+            nameof(TestIsochronousOutQuiescingAsync));
+
+        long reopenStarted = Stopwatch.GetTimestamp();
+        await stream.WriteAsync(EncodeSubmit(25, UsbIpConstants.DirectionOut,
             endpoint: 0, transferLength: 0, setPlaybackInterfaceOn));
         SubmitReply reopenedAltReply = await ReadSubmitReplyAsync(stream,
             hasInputPayload: false);
-        Require(reopenedAltReply.SequenceNumber == 22 && reopenedAltReply.Status == 0,
+        Require(reopenedAltReply.SequenceNumber == 25 && reopenedAltReply.Status == 0,
             nameof(TestIsochronousOutQuiescingAsync));
 
         await stream.WriteAsync(EncodeIsoSubmit(30, endpoint: 1, startFrame: 6000,
             interval: 4, shortAudio, shortPackets));
         IsoSubmitReply reopenedReply = await ReadIsoSubmitReplyAsync(stream);
+        double reopenElapsedMs = (Stopwatch.GetTimestamp() - reopenStarted) * 1000.0 /
+            Stopwatch.Frequency;
         Require(reopenedReply.SequenceNumber == 30 && reopenedReply.Status == 0 &&
                 reopenedReply.ActualLength == shortAudio.Length &&
                 reopenedReply.Packets.All(packet =>
-                    packet.ActualLength == 384 && packet.Status == 0),
+                    packet.ActualLength == 384 && packet.Status == 0) &&
+                reopenElapsedMs < 500,
             nameof(TestIsochronousOutQuiescingAsync));
 
-        IsoSubmitReply expiredOne = await ReadIsoSubmitReplyAsync(stream);
-        IsoSubmitReply expiredTwo = await ReadIsoSubmitReplyAsync(stream);
-        IsoSubmitReply[] expired = new[] { expiredOne, expiredTwo };
-        double watchdogElapsedMs = (Stopwatch.GetTimestamp() - quiescedAt) * 1000.0 /
-            Stopwatch.Frequency;
-        Require(expired.Select(reply => reply.SequenceNumber).Order()
-                    .SequenceEqual(new uint[] { 11, 12 }) &&
-                expired.All(reply => reply.Status == -104 && reply.ActualLength == 0 &&
-                    reply.ErrorCount == 2 && reply.Packets.Count == 2 &&
-                    reply.Packets.All(packet =>
-                        packet.ActualLength == 0 && packet.Status == -104)) &&
-                watchdogElapsedMs >= 600,
-            nameof(TestIsochronousOutQuiescingAsync));
-
-        await stream.WriteAsync(EncodeUnlink(23, unlinkSequence: 11));
+        await stream.WriteAsync(EncodeUnlink(31, unlinkSequence: 30));
         byte[] completionWon = await UsbIpCodec.ReadExactlyAsync(stream,
             UsbIpConstants.UrbHeaderLength);
         Require(U32(completionWon, 0) == UsbIpConstants.RetUnlink &&
-                U32(completionWon, 4) == 23 && I32(completionWon, 20) == 0,
+                U32(completionWon, 4) == 31 && I32(completionWon, 20) == 0,
             nameof(TestIsochronousOutQuiescingAsync));
 
         using var noDuplicateCompletion = new CancellationTokenSource(
@@ -569,6 +659,92 @@ public static class LiveServerSelfTest
         catch (OperationCanceledException) when (noDuplicateCompletion.IsCancellationRequested)
         {
         }
+    }
+
+    private static async Task TestIsochronousOutWatchdogAsync(int port)
+    {
+        Console.WriteLine("servertest: ISO OUT quiesce watchdog closes one session without reply");
+        using (var client = new TcpClient { NoDelay = true })
+        {
+            await client.ConnectAsync("127.0.0.1", port);
+            NetworkStream stream = client.GetStream();
+            await stream.WriteAsync(EncodeOperation(UsbIpConstants.OpReqImport, "1-1"));
+            byte[] importReply = await UsbIpCodec.ReadExactlyAsync(stream, 8 + 312);
+            Require(U16(importReply, 2) == UsbIpConstants.OpRepImport &&
+                    U32(importReply, 4) == 0,
+                nameof(TestIsochronousOutWatchdogAsync));
+
+            byte[] setConfiguration = Setup(0x00, UsbStandardRequest.SetConfiguration,
+                value: 1, index: 0, length: 0);
+            await stream.WriteAsync(EncodeSubmit(1, UsbIpConstants.DirectionOut,
+                endpoint: 0, transferLength: 0, setConfiguration));
+            SubmitReply configurationReply = await ReadSubmitReplyAsync(stream,
+                hasInputPayload: false);
+            Require(configurationReply.Status == 0,
+                nameof(TestIsochronousOutWatchdogAsync));
+
+            byte[] setPlaybackInterfaceOn = Setup(0x01, UsbStandardRequest.SetInterface,
+                value: 1, index: 1, length: 0);
+            await stream.WriteAsync(EncodeSubmit(2, UsbIpConstants.DirectionOut,
+                endpoint: 0, transferLength: 0, setPlaybackInterfaceOn));
+            SubmitReply altOneReply = await ReadSubmitReplyAsync(stream,
+                hasInputPayload: false);
+            Require(altOneReply.Status == 0,
+                nameof(TestIsochronousOutWatchdogAsync));
+
+            byte[] audio = new byte[1000 * 384];
+            UsbIpIsoPacket[] packets = Enumerable.Range(0, 1000)
+                .Select(index => new UsbIpIsoPacket(
+                    checked((uint)(index * 384)), 384, 0, 0))
+                .ToArray();
+            await stream.WriteAsync(EncodeIsoSubmit(3, endpoint: 1, startFrame: 7000,
+                interval: 4, audio, packets));
+
+            byte[] setPlaybackInterfaceOff = Setup(0x01, UsbStandardRequest.SetInterface,
+                value: 0, index: 1, length: 0);
+            await stream.WriteAsync(EncodeSubmit(4, UsbIpConstants.DirectionOut,
+                endpoint: 0, transferLength: 0, setPlaybackInterfaceOff));
+            SubmitReply altZeroReply = await ReadSubmitReplyAsync(stream,
+                hasInputPayload: false);
+            Require(altZeroReply.SequenceNumber == 4 && altZeroReply.Status == 0,
+                nameof(TestIsochronousOutWatchdogAsync));
+
+            long watchdogStarted = Stopwatch.GetTimestamp();
+            bool disconnectedWithoutData = false;
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            try
+            {
+                byte[] oneByte = new byte[1];
+                int received = await stream.ReadAsync(oneByte, timeout.Token);
+                disconnectedWithoutData = received == 0;
+            }
+            catch (IOException)
+            {
+                disconnectedWithoutData = true;
+            }
+            catch (SocketException)
+            {
+                disconnectedWithoutData = true;
+            }
+
+            double watchdogElapsedMs = (Stopwatch.GetTimestamp() - watchdogStarted) *
+                1000.0 / Stopwatch.Frequency;
+            Require(disconnectedWithoutData && watchdogElapsedMs >= 600 &&
+                    watchdogElapsedMs < 1800,
+                nameof(TestIsochronousOutWatchdogAsync));
+        }
+
+        using var reconnect = new TcpClient { NoDelay = true };
+        using var reconnectTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        await reconnect.ConnectAsync("127.0.0.1", port, reconnectTimeout.Token);
+        NetworkStream reconnectStream = reconnect.GetStream();
+        await reconnectStream.WriteAsync(
+            EncodeOperation(UsbIpConstants.OpReqImport, "1-1"), reconnectTimeout.Token);
+        byte[] reconnectReply = await UsbIpCodec.ReadExactlyAsync(reconnectStream, 8 + 312,
+            reconnectTimeout.Token);
+        Require(U16(reconnectReply, 2) == UsbIpConstants.OpRepImport &&
+                U32(reconnectReply, 4) == 0,
+            nameof(TestIsochronousOutWatchdogAsync));
     }
 
     private static async Task TestDeviceListAsync(int port,

@@ -39,6 +39,18 @@ public sealed class ControlEndpoint
     public byte GetAltSetting(byte interfaceNumber) =>
         interfaceAltSettings.GetValueOrDefault(interfaceNumber);
 
+    internal void ResetInterfaceAltSettings()
+    {
+        foreach (byte interfaceNumber in interfaceAltSettings
+            .Where(setting => setting.Value != 0)
+            .Select(setting => setting.Key)
+            .ToArray())
+        {
+            interfaceAltSettings[interfaceNumber] = 0;
+            InterfaceAltChanged?.Invoke(interfaceNumber, 0);
+        }
+    }
+
     /// <summary>Handles one EP0 SETUP transaction. <paramref name="outData"/> is
     /// the host-to-device data stage payload (empty for IN transfers).</summary>
     public ControlResult Handle(UsbSetupPacket setup, ReadOnlySpan<byte> outData)

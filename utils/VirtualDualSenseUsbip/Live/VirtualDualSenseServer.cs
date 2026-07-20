@@ -264,6 +264,8 @@ internal sealed class UsbIpDeviceSession
     private readonly ConcurrentQueue<QuiescedIsochronousGeneration> quiescedIsochronousOut = new();
     private readonly SemaphoreSlim quiescedIsochronousOutSignal = new(0);
     private readonly Dictionary<byte, IsochronousOutInterfaceState> isochronousOutInterfaces = new();
+    private readonly List<CancellationTokenSource> isochronousOutGenerationCancellations = new();
+    private bool isochronousOutSessionDoomed;
     private readonly ConcurrentDictionary<uint, PendingTransfer> pendingIsochronousIn = new();
     private readonly ConcurrentQueue<uint> pendingIsochronousInOrder = new();
     private readonly SemaphoreSlim pendingIsochronousInSignal = new(0);
@@ -304,8 +306,11 @@ internal sealed class UsbIpDeviceSession
             .Select(endpoint => endpoint.InterfaceNumber).ToHashSet();
         foreach (byte interfaceNumber in playbackInterfaces)
         {
+            var generationCancellation = new CancellationTokenSource();
+            isochronousOutGenerationCancellations.Add(generationCancellation);
             isochronousOutInterfaces.Add(interfaceNumber,
-                new IsochronousOutInterfaceState(AlternateSetting: 0, Generation: 0));
+                new IsochronousOutInterfaceState(AlternateSetting: 0, Generation: 0,
+                    generationCancellation));
         }
         HashSet<byte> captureInterfaces = isochronousInEndpoints.Values
             .Select(endpoint => endpoint.InterfaceNumber).ToHashSet();
@@ -389,6 +394,11 @@ internal sealed class UsbIpDeviceSession
                 if (pendingIsochronousInHighWater > 0)
                 {
                     log($"ISO IN pending high-water mark: {pendingIsochronousInHighWater}.");
+                }
+                foreach (CancellationTokenSource generationCancellation in
+                    isochronousOutGenerationCancellations)
+                {
+                    generationCancellation.Dispose();
                 }
             }
         }
@@ -519,12 +529,14 @@ internal sealed class UsbIpDeviceSession
         {
             IsochronousOutInterfaceState state =
                 isochronousOutInterfaces[endpoint!.InterfaceNumber];
-            queuedIsochronousOut = state.AlternateSetting == endpoint.AlternateSetting &&
+            queuedIsochronousOut = !isochronousOutSessionDoomed &&
+                state.AlternateSetting == endpoint.AlternateSetting &&
                 pendingIsochronous.Count < MaxPendingIsochronousTransfers &&
                 pendingIsochronous.Count + pendingIsochronousIn.Count <
                     MaxPendingIsochronousTotal &&
                 pendingIsochronous.TryAdd(submit.Basic.SequenceNumber,
-                    new PendingTransfer(submit, endpoint.InterfaceNumber, state.Generation));
+                    new PendingTransfer(submit, endpoint.InterfaceNumber, state.Generation,
+                        state.GenerationCancellation.Token));
         }
         finally
         {
@@ -573,13 +585,17 @@ internal sealed class UsbIpDeviceSession
         }
 
         ControlResult result;
-        bool scheduleQuiesceWatchdog = false;
-        QuiescedIsochronousGeneration quiescedGeneration = default;
+        var quiescedGenerations = new List<QuiescedIsochronousGeneration>();
         bool isPlaybackSetInterface =
             setup.Type == UsbSetupPacket.TypeStandard &&
             setup.Recipient == UsbSetupPacket.RecipientInterface &&
             setup.Request == UsbStandardRequest.SetInterface &&
             isochronousOutInterfaces.ContainsKey((byte)setup.Index);
+        bool isDeconfigure =
+            setup.Type == UsbSetupPacket.TypeStandard &&
+            setup.Recipient == UsbSetupPacket.RecipientDevice &&
+            setup.Request == UsbStandardRequest.SetConfiguration &&
+            setup.Value == 0;
         if (isPlaybackSetInterface)
         {
             byte interfaceNumber = (byte)setup.Index;
@@ -589,21 +605,33 @@ internal sealed class UsbIpDeviceSession
             {
                 IsochronousOutInterfaceState previous =
                     isochronousOutInterfaces[interfaceNumber];
-                result = controlEndpoint.Handle(setup, submit.TransferBuffer);
+                bool alternateSettingChanging =
+                    previous.AlternateSetting != alternateSetting;
+                bool requestedAltActive =
+                    IsIsochronousOutAltActive(interfaceNumber, alternateSetting);
+                bool requestedAltKnown = alternateSetting == 0 || requestedAltActive;
+                bool oldTransfersRemain = pendingIsochronous.Values.Any(pending =>
+                    pending.IsochronousOutInterfaceNumber == interfaceNumber);
+                bool unsafeActivation = alternateSettingChanging &&
+                    requestedAltActive && oldTransfersRemain;
+                result = !requestedAltKnown || unsafeActivation
+                    ? ControlResult.Stalled()
+                    : controlEndpoint.Handle(setup, submit.TransferBuffer);
                 if (result.Status == 0 && previous.AlternateSetting != alternateSetting)
                 {
+                    bool previousAltActive = IsIsochronousOutAltActive(interfaceNumber,
+                        previous.AlternateSetting);
                     long nextGeneration = checked(previous.Generation + 1);
+                    previous.GenerationCancellation.Cancel();
+                    var nextGenerationCancellation = new CancellationTokenSource();
+                    isochronousOutGenerationCancellations.Add(nextGenerationCancellation);
                     isochronousOutInterfaces[interfaceNumber] =
-                        new IsochronousOutInterfaceState(alternateSetting, nextGeneration);
-                    if (IsIsochronousOutAltActive(interfaceNumber,
-                            previous.AlternateSetting) &&
-                        !IsIsochronousOutAltActive(interfaceNumber, alternateSetting))
+                        new IsochronousOutInterfaceState(alternateSetting, nextGeneration,
+                            nextGenerationCancellation);
+                    if (previousAltActive)
                     {
-                        long deadline = checked(Stopwatch.GetTimestamp() +
-                            ToStopwatchTicks(isochronousOutQuiesceTimeout));
-                        quiescedGeneration = new QuiescedIsochronousGeneration(
-                            interfaceNumber, previous.Generation, deadline);
-                        scheduleQuiesceWatchdog = true;
+                        quiescedGenerations.Add(new QuiescedIsochronousGeneration(
+                            interfaceNumber, previous.Generation, DeadlineTimestamp: 0));
                     }
                 }
             }
@@ -612,18 +640,43 @@ internal sealed class UsbIpDeviceSession
                 isochronousOutLifecycleGate.Release();
             }
 
-            if (scheduleQuiesceWatchdog)
+        }
+        else if (isDeconfigure)
+        {
+            await isochronousOutLifecycleGate.WaitAsync(cancellationToken);
+            try
             {
-                int parked = pendingIsochronous.Values.Count(pending =>
-                    pending.IsochronousOutInterfaceNumber ==
-                        quiescedGeneration.InterfaceNumber &&
-                    pending.IsochronousOutGeneration == quiescedGeneration.Generation);
-                quiescedIsochronousOut.Enqueue(quiescedGeneration);
-                quiescedIsochronousOutSignal.Release();
-                log($"ISO OUT quiesced interface {quiescedGeneration.InterfaceNumber} " +
-                    $"generation {quiescedGeneration.Generation}: parked {parked} pending " +
-                    $"transfer(s) for UNLINK; watchdog " +
-                    $"{isochronousOutQuiesceTimeout.TotalMilliseconds:0} ms.");
+                result = controlEndpoint.Handle(setup, submit.TransferBuffer);
+                if (result.Status == 0)
+                {
+                    foreach (KeyValuePair<byte, IsochronousOutInterfaceState> entry in
+                        isochronousOutInterfaces.ToArray())
+                    {
+                        byte interfaceNumber = entry.Key;
+                        IsochronousOutInterfaceState previous = entry.Value;
+                        if (!IsIsochronousOutAltActive(interfaceNumber,
+                                previous.AlternateSetting))
+                        {
+                            continue;
+                        }
+
+                        previous.GenerationCancellation.Cancel();
+                        long nextGeneration = checked(previous.Generation + 1);
+                        var nextGenerationCancellation = new CancellationTokenSource();
+                        isochronousOutGenerationCancellations.Add(
+                            nextGenerationCancellation);
+                        isochronousOutInterfaces[interfaceNumber] =
+                            new IsochronousOutInterfaceState(AlternateSetting: 0,
+                                nextGeneration, nextGenerationCancellation);
+                        quiescedGenerations.Add(new QuiescedIsochronousGeneration(
+                            interfaceNumber, previous.Generation, DeadlineTimestamp: 0));
+                    }
+                    controlEndpoint.ResetInterfaceAltSettings();
+                }
+            }
+            finally
+            {
+                isochronousOutLifecycleGate.Release();
             }
         }
         else
@@ -645,6 +698,27 @@ internal sealed class UsbIpDeviceSession
 
         await ReplySubmitAsync(submit.Basic.SequenceNumber, result.Status,
             result.Data, cancellationToken, actualLength);
+
+        if (quiescedGenerations.Count > 0)
+        {
+            long deadline = checked(Stopwatch.GetTimestamp() +
+                ToStopwatchTicks(isochronousOutQuiesceTimeout));
+            foreach (QuiescedIsochronousGeneration quiesced in quiescedGenerations)
+            {
+                QuiescedIsochronousGeneration armed = quiesced with
+                {
+                    DeadlineTimestamp = deadline,
+                };
+                int parked = pendingIsochronous.Values.Count(pending =>
+                    pending.IsochronousOutInterfaceNumber == armed.InterfaceNumber &&
+                    pending.IsochronousOutGeneration == armed.Generation);
+                quiescedIsochronousOut.Enqueue(armed);
+                quiescedIsochronousOutSignal.Release();
+                log($"ISO OUT quiesced interface {armed.InterfaceNumber} generation " +
+                    $"{armed.Generation}: parked {parked} pending transfer(s) for UNLINK; " +
+                    $"watchdog {isochronousOutQuiesceTimeout.TotalMilliseconds:0} ms after ACK.");
+            }
+        }
     }
 
     private async Task HandleUnlinkAsync(UsbIpUnlink unlink, CancellationToken cancellationToken)
@@ -653,7 +727,7 @@ internal sealed class UsbIpDeviceSession
             cancellationToken);
         if (status == 0)
         {
-            status = await UnlinkPendingAsync(pendingIsochronous, unlink.UnlinkSequenceNumber,
+            status = await UnlinkIsochronousOutAsync(unlink.UnlinkSequenceNumber,
                 cancellationToken);
         }
         if (status == 0)
@@ -661,9 +735,54 @@ internal sealed class UsbIpDeviceSession
             status = await UnlinkPendingAsync(pendingIsochronousIn, unlink.UnlinkSequenceNumber,
                 cancellationToken);
         }
-        await writer.WriteAsync(
-            UsbIpCodec.Encode(new UsbIpUnlinkReply(unlink.Basic.SequenceNumber, status)),
+        await WriteUnlinkReplyUnlessDoomedAsync(unlink.Basic.SequenceNumber, status,
             cancellationToken);
+    }
+
+    private async Task<int> UnlinkIsochronousOutAsync(uint sequenceNumber,
+        CancellationToken cancellationToken)
+    {
+        await isochronousOutLifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (isochronousOutSessionDoomed ||
+                !pendingIsochronous.TryGetValue(sequenceNumber,
+                    out PendingTransfer? pending))
+            {
+                return 0;
+            }
+
+            if (pending.TryCancel())
+            {
+                pendingIsochronous.TryRemove(sequenceNumber, out _);
+                return ConnectionReset;
+            }
+
+            return 0;
+        }
+        finally
+        {
+            isochronousOutLifecycleGate.Release();
+        }
+    }
+
+    private async Task WriteUnlinkReplyUnlessDoomedAsync(uint sequenceNumber, int status,
+        CancellationToken cancellationToken)
+    {
+        await isochronousOutLifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!isochronousOutSessionDoomed)
+            {
+                await writer.WriteAsync(
+                    UsbIpCodec.Encode(new UsbIpUnlinkReply(sequenceNumber, status)),
+                    cancellationToken);
+            }
+        }
+        finally
+        {
+            isochronousOutLifecycleGate.Release();
+        }
     }
 
     private static async Task<int> UnlinkPendingAsync(
@@ -761,6 +880,7 @@ internal sealed class UsbIpDeviceSession
             }
             if (!generationActive)
             {
+                nextCompletionTimestamp = 0;
                 continue;
             }
 
@@ -771,12 +891,30 @@ internal sealed class UsbIpDeviceSession
             long completionTimestamp = checked(
                 Math.Max(nextCompletionTimestamp, now) + durationTicks);
 
-            await DelayUntilAsync(completionTimestamp, cancellationToken);
+            using (var pacingCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, pending.IsochronousOutGenerationCancellation))
+            {
+                try
+                {
+                    await DelayUntilAsync(completionTimestamp, pacingCancellation.Token);
+                }
+                catch (OperationCanceledException) when (
+                    pending.IsochronousOutGenerationCancellation.IsCancellationRequested &&
+                    !cancellationToken.IsCancellationRequested)
+                {
+                    nextCompletionTimestamp = 0;
+                    continue;
+                }
+            }
             await isochronousOutLifecycleGate.WaitAsync(cancellationToken);
             try
             {
-                if (!IsIsochronousOutGenerationActive(pending) ||
-                    !pending.TryBeginCompletion())
+                if (!IsIsochronousOutGenerationActive(pending))
+                {
+                    nextCompletionTimestamp = 0;
+                    continue;
+                }
+                if (!pending.TryBeginCompletion())
                 {
                     continue;
                 }
@@ -827,50 +965,26 @@ internal sealed class UsbIpDeviceSession
                 out QuiescedIsochronousGeneration quiesced))
             {
                 await DelayUntilAsync(quiesced.DeadlineTimestamp, cancellationToken);
-                await CompleteQuiescedIsochronousOutAsync(quiesced,
+                await FailSessionIfQuiescedIsochronousOutRemainsAsync(quiesced,
                     cancellationToken);
             }
         }
     }
 
-    private async Task CompleteQuiescedIsochronousOutAsync(
+    private async Task FailSessionIfQuiescedIsochronousOutRemainsAsync(
         QuiescedIsochronousGeneration quiesced,
         CancellationToken cancellationToken)
     {
         await isochronousOutLifecycleGate.WaitAsync(cancellationToken);
-        int errorCompleted = 0;
+        int stranded;
         try
         {
-            PendingTransfer[] expired = pendingIsochronous.Values
-                .Where(pending =>
-                    pending.IsochronousOutInterfaceNumber == quiesced.InterfaceNumber &&
-                    pending.IsochronousOutGeneration == quiesced.Generation)
-                .OrderBy(pending => pending.Submit.Basic.SequenceNumber)
-                .ToArray();
-            foreach (PendingTransfer pending in expired)
+            stranded = pendingIsochronous.Values.Count(pending =>
+                pending.IsochronousOutInterfaceNumber == quiesced.InterfaceNumber &&
+                pending.IsochronousOutGeneration == quiesced.Generation);
+            if (stranded > 0)
             {
-                if (!pending.TryBeginCompletion())
-                {
-                    continue;
-                }
-
-                UsbIpSubmit submit = pending.Submit;
-                try
-                {
-                    await ReplyIsochronousAsync(submit, ConnectionReset,
-                        successful: false, cancellationToken);
-                    pending.Complete();
-                    errorCompleted++;
-                }
-                catch (Exception ex)
-                {
-                    pending.Fail(ex);
-                    throw;
-                }
-                finally
-                {
-                    pendingIsochronous.TryRemove(submit.Basic.SequenceNumber, out _);
-                }
+                isochronousOutSessionDoomed = true;
             }
         }
         finally
@@ -878,11 +992,12 @@ internal sealed class UsbIpDeviceSession
             isochronousOutLifecycleGate.Release();
         }
 
-        if (errorCompleted > 0)
+        if (stranded > 0)
         {
-            log($"ISO OUT quiesce watchdog error-completed {errorCompleted} " +
-                $"transfer(s) from interface {quiesced.InterfaceNumber} " +
-                $"generation {quiesced.Generation}.");
+            log($"ISO OUT quiesce watchdog found {stranded} unlinked transfer(s) " +
+                $"from interface {quiesced.InterfaceNumber} generation " +
+                $"{quiesced.Generation}; closing this USB/IP session without RET_SUBMIT.");
+            throw new IOException("ISO OUT quiesce timed out waiting for UNLINK.");
         }
     }
 
@@ -1016,7 +1131,8 @@ internal sealed class UsbIpDeviceSession
 
     private bool IsIsochronousOutGenerationActive(PendingTransfer pending)
     {
-        return pending.IsochronousOutInterfaceNumber is byte interfaceNumber &&
+        return !isochronousOutSessionDoomed &&
+            pending.IsochronousOutInterfaceNumber is byte interfaceNumber &&
             isochronousOutInterfaces.TryGetValue(interfaceNumber,
                 out IsochronousOutInterfaceState state) &&
             state.Generation == pending.IsochronousOutGeneration &&
@@ -1094,16 +1210,20 @@ internal sealed class UsbIpDeviceSession
 
         public PendingTransfer(UsbIpSubmit submit,
             byte? isochronousOutInterfaceNumber = null,
-            long isochronousOutGeneration = -1)
+            long isochronousOutGeneration = -1,
+            CancellationToken isochronousOutGenerationCancellation = default)
         {
             Submit = submit;
             IsochronousOutInterfaceNumber = isochronousOutInterfaceNumber;
             IsochronousOutGeneration = isochronousOutGeneration;
+            IsochronousOutGenerationCancellation =
+                isochronousOutGenerationCancellation;
         }
 
         public UsbIpSubmit Submit { get; }
         public byte? IsochronousOutInterfaceNumber { get; }
         public long IsochronousOutGeneration { get; }
+        public CancellationToken IsochronousOutGenerationCancellation { get; }
         public Task Completion => completion.Task;
 
         public bool TryCancel()
@@ -1135,7 +1255,8 @@ internal sealed class UsbIpDeviceSession
 
     private readonly record struct IsochronousOutInterfaceState(
         byte AlternateSetting,
-        long Generation);
+        long Generation,
+        CancellationTokenSource GenerationCancellation);
 
     private readonly record struct QuiescedIsochronousGeneration(
         byte InterfaceNumber,
