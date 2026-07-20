@@ -12,6 +12,8 @@ public class NativeModeLogClassifierTests
         NativeModeLogKind.PadOpenFailure)]
     [DataRow("Bluetooth input stopped after 750 valid reports (Win32 error 1167). The physical pad is gone; restart serve after it reconnects.",
         NativeModeLogKind.PadLost)]
+    [DataRow("FatalUsbIpSession: ISO OUT quiesce watchdog found 2 unlinked transfers.",
+        NativeModeLogKind.FatalUsbIpSession)]
     [DataRow("14:10:22.419 ISO OUT total=500 seq=28610 ep=1 urbs/s=98.7 KiB/s=370.1 packets=5000 current=10x384..384 gap-ms=9.1..17.0 rms%=0.00/0.00/15.90/15.90 peak%=0.0/0.0/35.0/35.0 start=5000 interval=1 bt36=461 btq=0 bt-underrun=90 bt-errors=0 bt-audio=420 spkq=5 spk-underrun=0",
         NativeModeLogKind.IsochronousOutStats)]
     [DataRow("14:10:25.000 AUDIO bt-audio=420 spkq=5 spk-underrun=0 spk-dropped=0 mic-rep=0 mic-rate=measuring micq=0 mic-underrun=0 mic-KiB=0.0 mic-decode-err=0 bt-errors=0",
@@ -39,6 +41,7 @@ public class NativeModeLogClassifierTests
     [DataRow(NativeModeLogKind.AudioStats, false, false)]
     [DataRow(NativeModeLogKind.ServerListening, false, true)]
     [DataRow(NativeModeLogKind.PadLost, false, true)]
+    [DataRow(NativeModeLogKind.FatalUsbIpSession, false, true)]
     [DataRow(NativeModeLogKind.SpeakerRebuffer, false, true)]
     [DataRow(NativeModeLogKind.Other, false, false)]
     [DataRow(NativeModeLogKind.Other, true, true)]
@@ -60,5 +63,26 @@ public class NativeModeLogClassifierTests
 
         Assert.IsFalse(forward);
         Assert.AreEqual(line, manager.LatestStats.IsochronousOut);
+    }
+
+    [TestMethod]
+    public void ProcessLogLine_FatalSessionMarkerFaultsServingManager()
+    {
+        var manager = new NativeModeManager();
+        NativeModeStateChangedEventArgs lastState = null;
+        manager.StateChanged += (_, e) => lastState = e;
+        manager.ProcessLogLine(
+            "USB/IP server listening on 127.0.0.1:3240; busid 1-1.",
+            warning: false);
+
+        const string fatal =
+            "FatalUsbIpSession: ISO OUT quiesce watchdog found 2 unlinked transfers.";
+        bool forward = manager.ProcessLogLine(fatal, warning: false);
+
+        Assert.IsTrue(forward);
+        Assert.AreEqual(NativeModeState.Faulted, manager.State);
+        Assert.IsNotNull(lastState);
+        Assert.AreEqual(NativeModeState.Faulted, lastState.State);
+        Assert.AreEqual(fatal, lastState.Detail);
     }
 }

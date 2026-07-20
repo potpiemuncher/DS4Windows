@@ -332,6 +332,14 @@ namespace DS4Windows
                     SetState(NativeModeState.PadLost,
                         "The physical pad was lost; press PS and start native mode again.");
                     break;
+                case NativeModeLogKind.FatalUsbIpSession:
+                    if (!stopping &&
+                        (State == NativeModeState.Serving ||
+                         State == NativeModeState.Attached))
+                    {
+                        SetState(NativeModeState.Faulted, line);
+                    }
+                    break;
                 case NativeModeLogKind.IsochronousOutStats:
                     UpdateStats(isochronousOut: line);
                     break;

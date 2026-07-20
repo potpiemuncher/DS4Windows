@@ -110,6 +110,7 @@ namespace DS4Windows
         private readonly object nativeModeDeferredCleanupGate = new object();
         private Task nativeModeDeferredCleanupTask = Task.CompletedTask;
         private long nativeModeProtectionGeneration;
+        private int nativeModeAutomaticCleanupInProgress;
         private volatile bool nativeModeProtectionReleasePending;
         private bool nativeModeDeferredRescanRequested;
         private volatile bool nativeModeShutdownRequested;
@@ -2553,10 +2554,7 @@ namespace DS4Windows
             Task renderReleaseTask, TimeSpan delay,
             CancellationToken cancellationToken)
         {
-            if (renderReleaseTask.IsCompletedSuccessfully)
-                return;
-
-            if (renderReleaseTask.IsCanceled || renderReleaseTask.IsFaulted)
+            if (renderReleaseTask.IsCompleted)
             {
                 await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
                 return;
@@ -2573,6 +2571,7 @@ namespace DS4Windows
             NativeModeStateChangedEventArgs e)
         {
             if (!nativeModeShutdownRequested &&
+                Volatile.Read(ref nativeModeAutomaticCleanupInProgress) == 0 &&
                 NativeModeLifecyclePolicy.RequiresAutomaticCleanup(e.State,
                 DS4Devices.NativeModeGuard.IsActive))
             {
@@ -2583,6 +2582,12 @@ namespace DS4Windows
         private async Task CleanupTerminatedNativeModeAsync(
             NativeModeState terminalState, string detail)
         {
+            if (Interlocked.CompareExchange(
+                ref nativeModeAutomaticCleanupInProgress, 1, 0) != 0)
+            {
+                return;
+            }
+
             await nativeModeLifecycleGate.WaitAsync().ConfigureAwait(false);
             try
             {
@@ -2620,6 +2625,7 @@ namespace DS4Windows
             finally
             {
                 nativeModeLifecycleGate.Release();
+                Volatile.Write(ref nativeModeAutomaticCleanupInProgress, 0);
             }
         }
 

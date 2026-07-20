@@ -26,6 +26,7 @@ namespace DS4Windows
         ServerListening,
         PadOpenFailure,
         PadLost,
+        FatalUsbIpSession,
         IsochronousOutStats,
         AudioStats,
         SpeakerRebuffer,
@@ -48,6 +49,12 @@ namespace DS4Windows
 
             if (line.Contains("No physical Bluetooth DualSense", StringComparison.Ordinal))
                 return NativeModeLogKind.PadOpenFailure;
+
+            if (line.Contains(nameof(NativeModeLogKind.FatalUsbIpSession),
+                StringComparison.Ordinal))
+            {
+                return NativeModeLogKind.FatalUsbIpSession;
+            }
 
             if (line.Contains("USB/IP server listening", StringComparison.Ordinal))
                 return NativeModeLogKind.ServerListening;
@@ -83,6 +90,7 @@ namespace DS4Windows
             return fromStandardError || kind == NativeModeLogKind.ServerListening ||
                 kind == NativeModeLogKind.PadOpenFailure ||
                 kind == NativeModeLogKind.PadLost ||
+                kind == NativeModeLogKind.FatalUsbIpSession ||
                 kind == NativeModeLogKind.SpeakerRebuffer;
         }
     }
