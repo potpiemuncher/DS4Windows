@@ -28,7 +28,19 @@ namespace DS4Windows
 {
     internal interface INativeModeRenderOutput : IDisposable
     {
+        event EventHandler<NativeModeRenderOutputTerminatedEventArgs>
+            UnexpectedTermination;
         void Start();
+    }
+
+    internal sealed class NativeModeRenderOutputTerminatedEventArgs : EventArgs
+    {
+        public NativeModeRenderOutputTerminatedEventArgs(Exception exception)
+        {
+            Exception = exception;
+        }
+
+        public Exception Exception { get; }
     }
 
     internal interface INativeModeRenderOutputFactory
@@ -36,9 +48,10 @@ namespace DS4Windows
         INativeModeRenderOutput Create(string endpointId);
     }
 
-    internal interface INativeModeVirtualDevicePresence
+    internal interface INativeModeVirtualDeviceIdentity
     {
         bool IsPresent();
+        bool OwnsEndpoint(NativeModeAudioEndpoint endpoint);
     }
 
     /// <summary>
@@ -56,7 +69,7 @@ namespace DS4Windows
         private readonly INativeModeAudioEndpointAccessor endpointAccessor;
         private readonly INativeModeAudioNotificationSource notificationSource;
         private readonly INativeModeRenderOutputFactory outputFactory;
-        private readonly INativeModeVirtualDevicePresence devicePresence;
+        private readonly INativeModeVirtualDeviceIdentity deviceIdentity;
         private readonly Action<string, bool> log;
         private Session currentSession;
 
@@ -64,7 +77,7 @@ namespace DS4Windows
             new WindowsNativeModeAudioEndpointAccessor(),
             new WindowsNativeModeAudioNotificationSource(),
             new WasapiNativeModeRenderOutputFactory(),
-            new WindowsNativeModeVirtualDevicePresence(),
+            new WindowsNativeModeVirtualDeviceIdentity(),
             (message, warning) => AppLogger.LogToGui(message, warning))
         {
         }
@@ -73,7 +86,7 @@ namespace DS4Windows
             INativeModeAudioEndpointAccessor endpointAccessor,
             INativeModeAudioNotificationSource notificationSource,
             INativeModeRenderOutputFactory outputFactory,
-            INativeModeVirtualDevicePresence devicePresence,
+            INativeModeVirtualDeviceIdentity deviceIdentity,
             Action<string, bool> log)
         {
             this.endpointAccessor = endpointAccessor ??
@@ -82,8 +95,8 @@ namespace DS4Windows
                 throw new ArgumentNullException(nameof(notificationSource));
             this.outputFactory = outputFactory ??
                 throw new ArgumentNullException(nameof(outputFactory));
-            this.devicePresence = devicePresence ??
-                throw new ArgumentNullException(nameof(devicePresence));
+            this.deviceIdentity = deviceIdentity ??
+                throw new ArgumentNullException(nameof(deviceIdentity));
             this.log = log ?? throw new ArgumentNullException(nameof(log));
         }
 
@@ -117,7 +130,7 @@ namespace DS4Windows
                 .Select(endpoint => endpoint.Id)
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             var session = new Session(activeBeforeAttach, endpointAccessor,
-                notificationSource, outputFactory, devicePresence, log,
+                notificationSource, outputFactory, deviceIdentity, log,
                 SessionReleased);
 
             lock (sessionGate)
@@ -167,6 +180,38 @@ namespace DS4Windows
         }
 
         /// <summary>
+        /// Completes with the fatal output error if the mandatory silent
+        /// render stream dies after readiness. Expected teardown cancels this
+        /// task. The keepalive never reopens the stream automatically.
+        /// </summary>
+        public Task<Exception> WaitForUnexpectedTerminationAsync()
+        {
+            Session session;
+            lock (sessionGate)
+                session = currentSession;
+            if (session == null)
+            {
+                throw new InvalidOperationException(
+                    "The native-mode render keepalive session has not started.");
+            }
+
+            return session.UnexpectedTermination;
+        }
+
+        /// <summary>
+        /// Completes only after endpoint and fixed virtual-parent removal have
+        /// both been confirmed and the retained output has been released.
+        /// Capture this task before starting teardown.
+        /// </summary>
+        public Task WaitForReleaseAsync()
+        {
+            Session session;
+            lock (sessionGate)
+                session = currentSession;
+            return session?.ReleaseCompletion ?? Task.CompletedTask;
+        }
+
+        /// <summary>
         /// Arms deferred release before the server process is killed. This does
         /// not stop or dispose the render client while the endpoint/device is
         /// still present.
@@ -204,26 +249,31 @@ namespace DS4Windows
 
         private sealed class Session
         {
-            private const string DualSenseEndpointMarker =
-                "DualSense Wireless Controller";
-
             private readonly object stateGate = new object();
             private readonly HashSet<string> activeBeforeAttach;
             private readonly INativeModeAudioEndpointAccessor endpointAccessor;
             private readonly INativeModeAudioNotificationSource notificationSource;
             private readonly INativeModeRenderOutputFactory outputFactory;
-            private readonly INativeModeVirtualDevicePresence devicePresence;
+            private readonly INativeModeVirtualDeviceIdentity deviceIdentity;
             private readonly Action<string, bool> log;
             private readonly Action<Session> released;
             private readonly SemaphoreSlim endpointChanged = new SemaphoreSlim(0, 1);
             private readonly SemaphoreSlim operationGate = new SemaphoreSlim(1, 1);
             private readonly CancellationTokenSource readinessCancellation =
                 new CancellationTokenSource();
+            private readonly TaskCompletionSource<Exception>
+                unexpectedTermination = new TaskCompletionSource<Exception>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+            private readonly TaskCompletionSource<bool> releaseCompletion =
+                new TaskCompletionSource<bool>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
 
             private IDisposable notificationRegistration;
             private INativeModeRenderOutput output;
             private string endpointId;
             private Exception startupFailure;
+            private Exception pendingOutputTermination;
+            private Exception outputTermination;
             private bool removalMonitorStarted;
             private bool ready;
             private bool teardownStarted;
@@ -234,17 +284,22 @@ namespace DS4Windows
                 INativeModeAudioEndpointAccessor endpointAccessor,
                 INativeModeAudioNotificationSource notificationSource,
                 INativeModeRenderOutputFactory outputFactory,
-                INativeModeVirtualDevicePresence devicePresence,
+                INativeModeVirtualDeviceIdentity deviceIdentity,
                 Action<string, bool> log, Action<Session> released)
             {
                 this.activeBeforeAttach = activeBeforeAttach;
                 this.endpointAccessor = endpointAccessor;
                 this.notificationSource = notificationSource;
                 this.outputFactory = outputFactory;
-                this.devicePresence = devicePresence;
+                this.deviceIdentity = deviceIdentity;
                 this.log = log;
                 this.released = released;
             }
+
+            public Task<Exception> UnexpectedTermination =>
+                unexpectedTermination.Task;
+
+            public Task ReleaseCompletion => releaseCompletion.Task;
 
             public void StartMonitoring()
             {
@@ -300,6 +355,7 @@ namespace DS4Windows
                     if (releaseCompleted || teardownStarted)
                         return;
                     teardownStarted = true;
+                    unexpectedTermination.TrySetCanceled();
                 }
 
                 readinessCancellation.Cancel();
@@ -331,6 +387,8 @@ namespace DS4Windows
             public void ReleaseBeforeOutputOpen()
             {
                 readinessCancellation.Cancel();
+                lock (stateGate)
+                    releaseCompleted = true;
                 ReleaseResources(null, null);
             }
 
@@ -344,6 +402,12 @@ namespace DS4Windows
                         if (releaseCompleted || teardownStarted)
                             throw new OperationCanceledException(
                                 "Native-mode render keepalive teardown has started.");
+                        if (outputTermination != null)
+                        {
+                            throw new InvalidOperationException(
+                                "The native-mode render keepalive stopped unexpectedly.",
+                                outputTermination);
+                        }
                         if (ready)
                             return true;
                         if (startupFailure != null)
@@ -358,8 +422,7 @@ namespace DS4Windows
                         .GetActiveEndpoints(NativeModeAudioFlow.Render)
                         .FirstOrDefault(endpoint =>
                             !activeBeforeAttach.Contains(endpoint.Id) &&
-                            endpoint.FriendlyName?.Contains(DualSenseEndpointMarker,
-                                StringComparison.OrdinalIgnoreCase) == true);
+                            deviceIdentity.OwnsEndpoint(endpoint));
                     if (candidate == null)
                         return false;
 
@@ -367,6 +430,8 @@ namespace DS4Windows
                     try
                     {
                         createdOutput = outputFactory.Create(candidate.Id);
+                        createdOutput.UnexpectedTermination +=
+                            OnOutputUnexpectedTermination;
                         lock (stateGate)
                         {
                             endpointId = candidate.Id;
@@ -377,10 +442,20 @@ namespace DS4Windows
                         }
 
                         createdOutput.Start();
+                        bool publishPendingTermination;
+                        Exception pendingTermination;
                         lock (stateGate)
+                        {
                             ready = true;
+                            pendingTermination = pendingOutputTermination;
+                            publishPendingTermination = pendingTermination != null &&
+                                PublishOutputTerminationUnderLock(
+                                    pendingTermination);
+                        }
                         log($"[native] Holding the virtual DualSense render pin open " +
                             $"on '{candidate.FriendlyName}'.", false);
+                        if (publishPendingTermination)
+                            LogUnexpectedTermination(pendingTermination);
                         return true;
                     }
                     catch (Exception ex)
@@ -400,6 +475,41 @@ namespace DS4Windows
                     operationGate.Release();
                 }
             }
+
+            private void OnOutputUnexpectedTermination(object sender,
+                NativeModeRenderOutputTerminatedEventArgs args)
+            {
+                Exception failure = args?.Exception ?? new InvalidOperationException(
+                    "The mandatory native-mode WASAPI render stream stopped.");
+                bool publish = false;
+                lock (stateGate)
+                {
+                    if (releaseCompleted || teardownStarted ||
+                        !ReferenceEquals(output, sender))
+                    {
+                        return;
+                    }
+
+                    if (!ready)
+                        pendingOutputTermination ??= failure;
+                    else
+                        publish = PublishOutputTerminationUnderLock(failure);
+                }
+
+                if (publish)
+                    LogUnexpectedTermination(failure);
+            }
+
+            private bool PublishOutputTerminationUnderLock(Exception failure)
+            {
+                outputTermination ??= failure;
+                return unexpectedTermination.TrySetResult(outputTermination);
+            }
+
+            private void LogUnexpectedTermination(Exception failure) =>
+                log("[native] The mandatory DualSense render keepalive stopped " +
+                    $"unexpectedly; Native Mode must be torn down: {failure.Message}",
+                    true);
 
             private async Task MonitorRemovalAsync()
             {
@@ -459,7 +569,7 @@ namespace DS4Windows
                             .Any(endpoint => string.Equals(endpoint.Id,
                                 trackedEndpointId,
                                 StringComparison.OrdinalIgnoreCase));
-                        virtualDevicePresent = devicePresence.IsPresent();
+                        virtualDevicePresent = deviceIdentity.IsPresent();
                     }
                     catch (Exception ex)
                     {
@@ -521,6 +631,11 @@ namespace DS4Windows
 
                 try
                 {
+                    if (outputToDispose != null)
+                    {
+                        outputToDispose.UnexpectedTermination -=
+                            OnOutputUnexpectedTermination;
+                    }
                     outputToDispose?.Dispose();
                 }
                 catch (Exception ex)
@@ -532,6 +647,8 @@ namespace DS4Windows
                 readinessCancellation.Dispose();
                 endpointChanged.Dispose();
                 released(this);
+                unexpectedTermination.TrySetCanceled();
+                releaseCompletion.TrySetResult(true);
             }
 
             private void SignalChanged()
@@ -581,6 +698,9 @@ namespace DS4Windows
                         nameof(endpointId));
             }
 
+            public event EventHandler<NativeModeRenderOutputTerminatedEventArgs>
+                UnexpectedTermination;
+
             public void Start()
             {
                 if (Interlocked.Exchange(ref started, 1) != 0)
@@ -593,6 +713,7 @@ namespace DS4Windows
 
                 output = new WasapiOut(endpoint, AudioClientShareMode.Shared,
                     useEventSync: true, latency: 20);
+                output.PlaybackStopped += OnPlaybackStopped;
                 output.Init(new SilenceProvider(mixFormat));
                 output.Play();
                 // WasapiOut.Play publishes Playing before its worker calls
@@ -627,6 +748,17 @@ namespace DS4Windows
                 }
             }
 
+            private void OnPlaybackStopped(object sender, StoppedEventArgs args)
+            {
+                if (Volatile.Read(ref disposed) != 0)
+                    return;
+
+                Exception failure = args.Exception ?? new InvalidOperationException(
+                    "The mandatory native-mode WASAPI render stream stopped.");
+                UnexpectedTermination?.Invoke(this,
+                    new NativeModeRenderOutputTerminatedEventArgs(failure));
+            }
+
             public void Dispose()
             {
                 if (Interlocked.Exchange(ref disposed, 1) != 0)
@@ -635,16 +767,79 @@ namespace DS4Windows
                 // Deliberately do not call Stop. The owner invokes Dispose only
                 // after endpoint and parent removal, when no alt-setting change
                 // can be sent to the virtual USB device.
+                if (output != null)
+                    output.PlaybackStopped -= OnPlaybackStopped;
                 output?.Dispose();
                 endpoint?.Dispose();
             }
         }
     }
 
-    internal sealed class WindowsNativeModeVirtualDevicePresence :
-        INativeModeVirtualDevicePresence
+    internal sealed class WindowsNativeModeVirtualDeviceIdentity :
+        INativeModeVirtualDeviceIdentity
     {
-        public bool IsPresent() =>
-            NativeModeDevicePresence.IsVirtualDualSensePresent();
+        private readonly Func<IReadOnlyList<string>>
+            getPresentVirtualInstanceIds;
+        private readonly Func<string, string> getParentInstanceId;
+        private readonly Func<string, Guid?> getContainerId;
+
+        public WindowsNativeModeVirtualDeviceIdentity() : this(
+            NativeModeDevicePresence.GetPresentVirtualDualSenseInstanceIds,
+            instanceId => Global.GetStringDeviceProperty(instanceId,
+                NativeMethods.DEVPKEY_Device_Parent),
+            NativeModeDevicePresence.TryGetContainerId)
+        {
+        }
+
+        internal WindowsNativeModeVirtualDeviceIdentity(
+            Func<IReadOnlyList<string>> getPresentVirtualInstanceIds,
+            Func<string, string> getParentInstanceId,
+            Func<string, Guid?> getContainerId)
+        {
+            this.getPresentVirtualInstanceIds = getPresentVirtualInstanceIds ??
+                throw new ArgumentNullException(nameof(getPresentVirtualInstanceIds));
+            this.getParentInstanceId = getParentInstanceId ??
+                throw new ArgumentNullException(nameof(getParentInstanceId));
+            this.getContainerId = getContainerId ??
+                throw new ArgumentNullException(nameof(getContainerId));
+        }
+
+        public bool IsPresent() => GetExactPresentParents().Count != 0;
+
+        public bool OwnsEndpoint(NativeModeAudioEndpoint endpoint)
+        {
+            if (endpoint == null)
+                throw new ArgumentNullException(nameof(endpoint));
+
+            IReadOnlyList<string> virtualParents = GetExactPresentParents();
+            if (virtualParents.Count == 0)
+                return false;
+
+            string current = endpoint.DeviceInstanceId;
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            for (int depth = 0; depth < 16 &&
+                !string.IsNullOrWhiteSpace(current) && visited.Add(current); depth++)
+            {
+                if (NativeModeDevicePresence
+                    .IsVirtualDualSenseInstanceOrDescendant(current))
+                {
+                    return true;
+                }
+                current = getParentInstanceId(current);
+            }
+
+            if (!endpoint.ContainerId.HasValue)
+                return false;
+
+            return virtualParents.Any(parent =>
+                getContainerId(parent) is Guid virtualContainer &&
+                virtualContainer == endpoint.ContainerId.Value);
+        }
+
+        private IReadOnlyList<string> GetExactPresentParents() =>
+            (getPresentVirtualInstanceIds() ?? Array.Empty<string>())
+                .Where(NativeModeDevicePresence
+                    .IsVirtualDualSenseParentInstanceId)
+                .ToArray();
     }
 }

@@ -41,14 +41,19 @@ namespace DS4Windows
 
     internal sealed class NativeModeAudioEndpoint
     {
-        public NativeModeAudioEndpoint(string id, string friendlyName)
+        public NativeModeAudioEndpoint(string id, string friendlyName,
+            string deviceInstanceId = null, Guid? containerId = null)
         {
             Id = id;
             FriendlyName = friendlyName;
+            DeviceInstanceId = deviceInstanceId;
+            ContainerId = containerId;
         }
 
         public string Id { get; }
         public string FriendlyName { get; }
+        public string DeviceInstanceId { get; }
+        public Guid? ContainerId { get; }
     }
 
     internal sealed class NativeModeAudioDefaultsSnapshot
@@ -629,6 +634,9 @@ namespace DS4Windows
     internal sealed class WindowsNativeModeAudioEndpointAccessor :
         INativeModeAudioEndpointAccessor
     {
+        private static readonly PropertyKey DeviceContainerIdProperty =
+            new PropertyKey(new Guid("8C7ED206-3F8A-4827-B3AB-AE9E1FAEFC6C"), 2);
+
         public IReadOnlyList<NativeModeAudioEndpoint> GetActiveEndpoints(
             NativeModeAudioFlow flow)
         {
@@ -641,10 +649,51 @@ namespace DS4Windows
                 using (device)
                 {
                     result.Add(new NativeModeAudioEndpoint(device.ID,
-                        device.FriendlyName ?? string.Empty));
+                        device.FriendlyName ?? string.Empty,
+                        TryGetStringProperty(device,
+                            PropertyKeys.PKEY_Device_InstanceId),
+                        TryGetGuidProperty(device, DeviceContainerIdProperty)));
                 }
             }
             return result;
+        }
+
+        private static string TryGetStringProperty(MMDevice device,
+            PropertyKey propertyKey)
+        {
+            try
+            {
+                return device.Properties.Contains(propertyKey)
+                    ? device.Properties[propertyKey]?.Value as string
+                    : null;
+            }
+            catch
+            {
+                // Identity correlation has a parent/container fallback. A
+                // missing optional endpoint property must not abort enumeration.
+                return null;
+            }
+        }
+
+        private static Guid? TryGetGuidProperty(MMDevice device,
+            PropertyKey propertyKey)
+        {
+            try
+            {
+                if (!device.Properties.Contains(propertyKey))
+                    return null;
+
+                object value = device.Properties[propertyKey]?.Value;
+                if (value is Guid guid)
+                    return guid;
+                return value is string text && Guid.TryParse(text, out guid)
+                    ? guid
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         public string GetDefaultEndpointId(NativeModeAudioFlow flow,

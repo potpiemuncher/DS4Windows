@@ -13,7 +13,7 @@ public class NativeModeRenderKeepaliveTests
         accessor.Add("existing-speakers", "SteelSeries Sonar - Gaming");
         var notifications = new FakeNotificationSource();
         var factory = new FakeOutputFactory();
-        var presence = new FakeDevicePresence { Present = true };
+        var presence = new FakeDeviceIdentity { Present = true };
         NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
             notifications, factory, presence);
 
@@ -41,7 +41,7 @@ public class NativeModeRenderKeepaliveTests
         var notifications = new FakeNotificationSource();
         var output = new FakeOutput { BlockStart = true };
         var factory = new FakeOutputFactory(output);
-        var presence = new FakeDevicePresence { Present = true };
+        var presence = new FakeDeviceIdentity { Present = true };
         NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
             notifications, factory, presence);
 
@@ -67,7 +67,7 @@ public class NativeModeRenderKeepaliveTests
         accessor.Add("preexisting-pad", "DualSense Wireless Controller");
         var notifications = new FakeNotificationSource();
         var factory = new FakeOutputFactory();
-        var presence = new FakeDevicePresence();
+        var presence = new FakeDeviceIdentity();
         NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
             notifications, factory, presence);
 
@@ -88,7 +88,7 @@ public class NativeModeRenderKeepaliveTests
         var accessor = new FakeEndpointAccessor();
         var notifications = new FakeNotificationSource();
         var factory = new FakeOutputFactory();
-        var presence = new FakeDevicePresence { Present = true };
+        var presence = new FakeDeviceIdentity { Present = true };
         NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
             notifications, factory, presence);
         keepalive.BeginSession();
@@ -123,7 +123,7 @@ public class NativeModeRenderKeepaliveTests
         var accessor = new FakeEndpointAccessor();
         var notifications = new FakeNotificationSource();
         var factory = new FakeOutputFactory();
-        var presence = new FakeDevicePresence { Present = true };
+        var presence = new FakeDeviceIdentity { Present = true };
         NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
             notifications, factory, presence);
         keepalive.BeginSession();
@@ -150,7 +150,7 @@ public class NativeModeRenderKeepaliveTests
         var notifications = new FakeNotificationSource();
         var output = new FakeOutput { StartException = new InvalidOperationException("init") };
         var factory = new FakeOutputFactory(output);
-        var presence = new FakeDevicePresence { Present = true };
+        var presence = new FakeDeviceIdentity { Present = true };
         NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
             notifications, factory, presence);
         keepalive.BeginSession();
@@ -175,7 +175,7 @@ public class NativeModeRenderKeepaliveTests
         var accessor = new FakeEndpointAccessor();
         var notifications = new FakeNotificationSource();
         var factory = new FakeOutputFactory();
-        var presence = new FakeDevicePresence { Present = true };
+        var presence = new FakeDeviceIdentity { Present = true };
         NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
             notifications, factory, presence);
         keepalive.BeginSession();
@@ -194,15 +194,165 @@ public class NativeModeRenderKeepaliveTests
             presence, factory.Output);
     }
 
+    [TestMethod]
+    public async Task PostReadyOutputDeath_CompletesFatalTaskWithoutReopening()
+    {
+        var accessor = new FakeEndpointAccessor();
+        var notifications = new FakeNotificationSource();
+        var factory = new FakeOutputFactory();
+        var identity = new FakeDeviceIdentity { Present = true };
+        NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
+            notifications, factory, identity);
+        keepalive.BeginSession();
+        accessor.Add("virtual-render", "DualSense Wireless Controller");
+        await keepalive.WaitForReadyAsync(TimeSpan.FromSeconds(1));
+        Task<Exception> fatalTermination =
+            keepalive.WaitForUnexpectedTerminationAsync();
+        Task releaseCompletion = keepalive.WaitForReleaseAsync();
+        var failure = new InvalidOperationException("device invalidated");
+
+        factory.Output.Terminate(failure);
+
+        Exception reported = await fatalTermination.WaitAsync(
+            TimeSpan.FromSeconds(1));
+        Assert.AreSame(failure, reported);
+        Assert.IsFalse(releaseCompletion.IsCompleted);
+        notifications.Notify();
+        await Task.Delay(50);
+        Assert.AreEqual(1, factory.EndpointIds.Count,
+            "A dead mandatory stream must never be reopened automatically.");
+
+        keepalive.BeginTeardown();
+        accessor.Remove("virtual-render");
+        identity.Present = false;
+        notifications.Notify();
+        await keepalive.CompleteTeardownAsync();
+        await releaseCompletion.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [TestMethod]
+    public async Task ExpectedTeardown_CancelsFatalTaskAndCompletesReleaseTask()
+    {
+        var accessor = new FakeEndpointAccessor();
+        var notifications = new FakeNotificationSource();
+        var factory = new FakeOutputFactory();
+        var identity = new FakeDeviceIdentity { Present = true };
+        NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
+            notifications, factory, identity);
+        keepalive.BeginSession();
+        accessor.Add("virtual-render", "DualSense Wireless Controller");
+        await keepalive.WaitForReadyAsync(TimeSpan.FromSeconds(1));
+        Task<Exception> fatalTermination =
+            keepalive.WaitForUnexpectedTerminationAsync();
+        Task releaseCompletion = keepalive.WaitForReleaseAsync();
+
+        keepalive.BeginTeardown();
+        accessor.Remove("virtual-render");
+        identity.Present = false;
+        notifications.Notify();
+        await keepalive.CompleteTeardownAsync();
+
+        await releaseCompletion.WaitAsync(TimeSpan.FromSeconds(1));
+        await Assert.ThrowsExceptionAsync<TaskCanceledException>(async () =>
+            await fatalTermination);
+        Assert.IsFalse(keepalive.HasSession);
+    }
+
+    [TestMethod]
+    public async Task NewPhysicalUsbDualSense_IsNotClaimedAsVirtualEndpoint()
+    {
+        var accessor = new FakeEndpointAccessor();
+        var notifications = new FakeNotificationSource();
+        var factory = new FakeOutputFactory();
+        var identity = new FakeDeviceIdentity { Present = true };
+        NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
+            notifications, factory, identity);
+        keepalive.BeginSession();
+        accessor.Add("physical-render", "DualSense Wireless Controller",
+            @"USB\VID_054C&PID_0CE6&MI_01\E82712345678");
+        accessor.Add("virtual-render", "DualSense Wireless Controller",
+            @"USB\VID_054C&PID_0CE6&MI_01\DS4WSPKCOMP001");
+
+        await keepalive.WaitForReadyAsync(TimeSpan.FromSeconds(1));
+
+        CollectionAssert.AreEqual(new[] { "virtual-render" },
+            factory.EndpointIds.ToArray());
+        await RemoveAndReleaseAsync(keepalive, accessor, notifications,
+            identity, factory.Output);
+    }
+
+    [TestMethod]
+    public void FixedIdentity_RejectsPhysicalPadWithSameVidPid()
+    {
+        var identity = new WindowsNativeModeVirtualDeviceIdentity(
+            () => new[]
+            {
+                NativeModeDevicePresence.VirtualDualSenseParentInstanceId,
+                @"USB\VID_054C&PID_0CE6\E82712345678",
+            },
+            _ => null,
+            _ => null);
+        var physical = new NativeModeAudioEndpoint("physical", "DualSense",
+            @"USB\VID_054C&PID_0CE6&MI_01\E82712345678");
+        var virtualEndpoint = new NativeModeAudioEndpoint("virtual", "DualSense",
+            @"USB\VID_054C&PID_0CE6&MI_01\DS4WSPKCOMP001");
+
+        Assert.IsTrue(identity.IsPresent());
+        Assert.IsFalse(identity.OwnsEndpoint(physical));
+        Assert.IsTrue(identity.OwnsEndpoint(virtualEndpoint));
+        Assert.IsFalse(NativeModeDevicePresence
+            .IsVirtualDualSenseInstanceOrDescendant(
+                @"USB\VID_054C&PID_0CE6\E82712345678"));
+        Assert.IsTrue(NativeModeDevicePresence
+            .IsVirtualDualSenseInstanceOrDescendant(
+                @"USB\VID_054C&PID_0CE6&MI_01\DS4WSPKCOMP001&0001"));
+    }
+
+    [TestMethod]
+    public void FixedIdentity_UsesParentChainAndContainerFallback()
+    {
+        Guid virtualContainer = Guid.NewGuid();
+        const string endpointInstance =
+            @"SWD\MMDEVAPI\{0.0.0.00000000}.{11111111-1111-1111-1111-111111111111}";
+        const string virtualInterface =
+            @"USB\VID_054C&PID_0CE6&MI_01\DS4WSPKCOMP001";
+        var parents = new Dictionary<string, string>(
+            StringComparer.OrdinalIgnoreCase)
+        {
+            [endpointInstance] = virtualInterface,
+        };
+        var identity = new WindowsNativeModeVirtualDeviceIdentity(
+            () => new[]
+            {
+                NativeModeDevicePresence.VirtualDualSenseParentInstanceId,
+            },
+            instance => parents.TryGetValue(instance, out string parent)
+                ? parent
+                : null,
+            instance => NativeModeDevicePresence
+                .IsVirtualDualSenseParentInstanceId(instance)
+                    ? virtualContainer
+                    : null);
+
+        Assert.IsTrue(identity.OwnsEndpoint(new NativeModeAudioEndpoint(
+            "via-parent", "DualSense", endpointInstance)));
+        Assert.IsTrue(identity.OwnsEndpoint(new NativeModeAudioEndpoint(
+            "via-container", "DualSense", "SWD\\MMDEVAPI\\unknown",
+            virtualContainer)));
+        Assert.IsFalse(identity.OwnsEndpoint(new NativeModeAudioEndpoint(
+            "other-container", "DualSense", "SWD\\MMDEVAPI\\other",
+            Guid.NewGuid())));
+    }
+
     private static NativeModeRenderKeepalive CreateKeepalive(
         FakeEndpointAccessor accessor, FakeNotificationSource notifications,
-        FakeOutputFactory factory, FakeDevicePresence presence) =>
+        FakeOutputFactory factory, FakeDeviceIdentity presence) =>
         new NativeModeRenderKeepalive(accessor, notifications, factory, presence,
             (_, _) => { });
 
     private static async Task RemoveAndReleaseAsync(
         NativeModeRenderKeepalive keepalive, FakeEndpointAccessor accessor,
-        FakeNotificationSource notifications, FakeDevicePresence presence,
+        FakeNotificationSource notifications, FakeDeviceIdentity presence,
         FakeOutput output)
     {
         keepalive.BeginTeardown();
@@ -241,10 +391,12 @@ public class NativeModeRenderKeepaliveTests
         public void SetDefaultEndpoint(string endpointId,
             NativeModeAudioRole role) => throw new NotSupportedException();
 
-        public void Add(string id, string name)
+        public void Add(string id, string name, string deviceInstanceId = null,
+            Guid? containerId = null)
         {
             lock (gate)
-                renderEndpoints.Add(new NativeModeAudioEndpoint(id, name));
+                renderEndpoints.Add(new NativeModeAudioEndpoint(id, name,
+                    deviceInstanceId, containerId));
         }
 
         public void Remove(string id)
@@ -331,6 +483,9 @@ public class NativeModeRenderKeepaliveTests
         public int StartCount;
         public int DisposeCount;
 
+        public event EventHandler<NativeModeRenderOutputTerminatedEventArgs>
+            UnexpectedTermination;
+
         public void Start()
         {
             Interlocked.Increment(ref StartCount);
@@ -342,17 +497,26 @@ public class NativeModeRenderKeepaliveTests
         }
 
         public void Dispose() => Interlocked.Increment(ref DisposeCount);
+
+        public void Terminate(Exception exception = null) =>
+            UnexpectedTermination?.Invoke(this,
+                new NativeModeRenderOutputTerminatedEventArgs(exception));
     }
 
-    private sealed class FakeDevicePresence : INativeModeVirtualDevicePresence
+    private sealed class FakeDeviceIdentity : INativeModeVirtualDeviceIdentity
     {
         public volatile bool Present;
         public int CheckCount;
+        public HashSet<string> OwnedEndpointIds { get; } =
+            new(StringComparer.OrdinalIgnoreCase) { "virtual-render" };
 
         public bool IsPresent()
         {
             Interlocked.Increment(ref CheckCount);
             return Present;
         }
+
+        public bool OwnsEndpoint(NativeModeAudioEndpoint endpoint) =>
+            OwnedEndpointIds.Contains(endpoint.Id);
     }
 }

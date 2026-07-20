@@ -405,20 +405,17 @@ namespace DS4Windows
 
     internal static class NativeModeDevicePresence
     {
-        private const string VirtualDualSenseHardwareIdPrefix =
+        internal const string VirtualDualSenseSerial = "DS4WSPKCOMP001";
+        internal const string VirtualDualSenseParentInstanceId =
+            @"USB\VID_054C&PID_0CE6\DS4WSPKCOMP001";
+        private const string DualSenseUsbInstancePrefix =
             @"USB\VID_054C&PID_0CE6";
 
         public static bool IsVirtualDualSensePresent()
         {
             try
             {
-                using var searcher = new ManagementObjectSearcher(
-                    "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID IS NOT NULL");
-                using ManagementObjectCollection devices = searcher.Get();
-                return devices.Cast<ManagementObject>().Any(device =>
-                    (device["DeviceID"] as string)?.StartsWith(
-                        VirtualDualSenseHardwareIdPrefix,
-                        StringComparison.OrdinalIgnoreCase) == true);
+                return GetPresentVirtualDualSenseInstanceIds().Count != 0;
             }
             catch (Exception ex) when (ex is ManagementException ||
                 ex is UnauthorizedAccessException)
@@ -426,6 +423,88 @@ namespace DS4Windows
                 AppLogger.LogToGui(
                     $"[native] Unable to query virtual DualSense presence: {ex.Message}", true);
                 return false;
+            }
+        }
+
+        internal static IReadOnlyList<string>
+            GetPresentVirtualDualSenseInstanceIds()
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID IS NOT NULL");
+            using ManagementObjectCollection devices = searcher.Get();
+            return devices.Cast<ManagementObject>()
+                .Select(device => device["DeviceID"] as string)
+                .Where(IsVirtualDualSenseParentInstanceId)
+                .ToArray();
+        }
+
+        internal static bool IsVirtualDualSenseParentInstanceId(
+            string instanceId) =>
+            string.Equals(instanceId, VirtualDualSenseParentInstanceId,
+                StringComparison.OrdinalIgnoreCase);
+
+        internal static bool IsVirtualDualSenseInstanceOrDescendant(
+            string instanceId)
+        {
+            if (string.IsNullOrWhiteSpace(instanceId) ||
+                !instanceId.StartsWith(DualSenseUsbInstancePrefix,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            int separator = instanceId.LastIndexOf('\\');
+            if (separator < 0 || separator == instanceId.Length - 1)
+                return false;
+
+            string instanceSuffix = instanceId.Substring(separator + 1);
+            return string.Equals(instanceSuffix, VirtualDualSenseSerial,
+                    StringComparison.OrdinalIgnoreCase) ||
+                instanceSuffix.StartsWith(VirtualDualSenseSerial + "&",
+                    StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static Guid? TryGetContainerId(string deviceInstanceId)
+        {
+            if (string.IsNullOrWhiteSpace(deviceInstanceId))
+                return null;
+
+            NativeMethods.SP_DEVINFO_DATA deviceInfo =
+                new NativeMethods.SP_DEVINFO_DATA
+                {
+                    cbSize = System.Runtime.InteropServices.Marshal.SizeOf(
+                        typeof(NativeMethods.SP_DEVINFO_DATA))
+                };
+            IntPtr deviceInfoSet = NativeMethods.SetupDiCreateDeviceInfoList(
+                IntPtr.Zero, 0);
+            if (deviceInfoSet == new IntPtr(-1))
+                return null;
+
+            try
+            {
+                if (!NativeMethods.SetupDiOpenDeviceInfo(deviceInfoSet,
+                    deviceInstanceId, IntPtr.Zero, 0, ref deviceInfo))
+                {
+                    return null;
+                }
+
+                ulong propertyType = 0;
+                int requiredSize = 0;
+                byte[] data = new byte[16];
+                NativeMethods.DEVPROPKEY key =
+                    NativeMethods.DEVPKEY_Device_ContainerId;
+                if (!NativeMethods.SetupDiGetDeviceProperty(deviceInfoSet,
+                    ref deviceInfo, ref key, ref propertyType, data,
+                    data.Length, ref requiredSize, 0) || requiredSize != 16)
+                {
+                    return null;
+                }
+
+                return new Guid(data);
+            }
+            finally
+            {
+                NativeMethods.SetupDiDestroyDeviceInfoList(deviceInfoSet);
             }
         }
     }
