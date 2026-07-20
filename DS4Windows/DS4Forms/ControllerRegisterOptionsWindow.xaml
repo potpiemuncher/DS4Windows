@@ -74,10 +74,13 @@
                         <ComboBox ItemsSource="{Binding Path=DsMuteLEDModes}" DisplayMemberPath="DisplayName" SelectedValuePath="ChoiceValue" SelectedValue="{Binding Options.MuteLedMode}" Margin="8,0,0,0" />
                     </StackPanel>
 
+                    <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,10,0,0"
+                               Text="The next two sections apply only in standard mode while DS4Windows directly manages the controller; they are inactive during Native Mode." />
+
                     <Separator Margin="0,12,0,4" />
-                    <TextBlock Text="Bluetooth Haptic Feedback (audio-based)" FontWeight="Bold" Margin="0,4,0,0" />
+                    <TextBlock Text="Standard mode — Bluetooth Haptic Feedback (audio-based)" FontWeight="Bold" Margin="0,4,0,0" />
                     <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,2,0,0"
-                               Text="Streams haptic audio to the controller's actuators over Bluetooth. System Audio converts what you hear into haptics; Rumble To Haptics re-voices game rumble through the haptic actuators." />
+                               Text="Useful for games without native DualSense haptics. System Audio converts what you hear into haptics; Rumble To Haptics re-voices game rumble through the haptic actuators." />
 
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                         <Label Content="Haptics mode:" />
@@ -102,9 +105,9 @@
                     </StackPanel>
 
                     <Separator Margin="0,12,0,4" />
-                    <TextBlock Text="Bluetooth Audio (headphones / speaker)" FontWeight="Bold" Margin="0,4,0,0" />
+                    <TextBlock Text="Standard mode — Bluetooth Audio (headphones / speaker)" FontWeight="Bold" Margin="0,4,0,0" />
                     <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,2,0,0"
-                               Text="Streams the selected audio source to the controller's headphone jack or built-in speaker over Bluetooth — no USB cable needed." />
+                               Text="Streams a selected PC audio source to the controller's headphone jack or built-in speaker over Bluetooth." />
 
                     <CheckBox Content="Send audio to controller" IsChecked="{Binding Options.BTAudioEnabled}" Margin="0,8,0,0" />
 
@@ -130,12 +133,24 @@
                     <GroupBox Header="Native passthrough (virtual wired DualSense)" Margin="0,16,0,4">
                         <StackPanel Margin="8">
                             <TextBlock TextWrapping="Wrap" Foreground="Gray"
-                                       Text="Lets games use their native wired DualSense support while this controller remains connected over Bluetooth." />
+                                       Text="Lets games use their native wired DualSense support while this controller remains connected over Bluetooth. While active, both standard-mode sections above are inactive." />
 
                             <CheckBox Content="Relay native game speaker audio"
                                       IsChecked="{Binding Options.NativeModeSpeakerAudio}"
                                       IsEnabled="{Binding NativeModeSettingsEnabled}"
                                       Margin="0,8,0,0" />
+
+                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                <Label Content="Speaker/headphone volume:" />
+                                <Slider x:Name="nativeModeSpeakerVolumeSlider"
+                                        Value="{Binding Options.NativeModeSpeakerVolume}"
+                                        Minimum="0" Maximum="100" TickFrequency="5"
+                                        IsSnapToTickEnabled="True" Width="180"
+                                        IsEnabled="{Binding NativeModeSettingsEnabled}"
+                                        Margin="8,4,0,0" VerticalAlignment="Center" />
+                                <TextBlock Text="{Binding ElementName=nativeModeSpeakerVolumeSlider, Path=Value}"
+                                           Margin="8,4,0,0" VerticalAlignment="Center" MinWidth="32" />
+                            </StackPanel>
 
                             <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
                                 <Label Content="Controller audio output:" />

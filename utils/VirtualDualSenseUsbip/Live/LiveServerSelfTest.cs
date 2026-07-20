@@ -126,13 +126,22 @@ public static class LiveServerSelfTest
         byte[] usbAudio = new byte[16 * 8];
         for (int frame = 0; frame < 16; frame++)
         {
+            BinaryPrimitives.WriteInt16LittleEndian(usbAudio.AsSpan(frame * 8, 2), 30000);
+            BinaryPrimitives.WriteInt16LittleEndian(usbAudio.AsSpan(frame * 8 + 2, 2), -30000);
             BinaryPrimitives.WriteInt16LittleEndian(usbAudio.AsSpan(frame * 8 + 4, 2), 16384);
             BinaryPrimitives.WriteInt16LittleEndian(usbAudio.AsSpan(frame * 8 + 6, 2), -16384);
         }
         byte[] bluetoothPcm = new byte[2];
         Require(BluetoothDualSenseInputSource.ConvertUsbHapticPcm(usbAudio, bluetoothPcm) == 2 &&
                 bluetoothPcm[0] == 0x40 && bluetoothPcm[1] == 0xC0,
-            "USB 48 kHz channels 3/4 did not decimate to signed 3 kHz stereo PCM");
+            "USB speaker channels or gain altered haptic channels 3/4");
+        Require(Math.Abs(BluetoothDualSenseInputSource.CombineSpeakerVolume(0.5f, 0.5f) -
+                    0.25f) < 0.0001f &&
+                Math.Abs(BluetoothDualSenseInputSource.CombineSpeakerVolume(2.0f, 0.5f) -
+                    0.5f) < 0.0001f &&
+                Math.Abs(BluetoothDualSenseInputSource.CombineSpeakerVolume(0.5f, 2.0f) -
+                    0.5f) < 0.0001f,
+            "configured speaker gain did not multiply/clamp host playback volume");
 
         byte[] hapticChunk = Enumerable.Range(0, 64).Select(value => (byte)value).ToArray();
         byte[] hapticReport = new byte[398];
@@ -311,7 +320,8 @@ public static class LiveServerSelfTest
     {
         using var server = new VirtualDualSenseServer(descriptors,
             new VirtualDualSenseServerOptions(Port: 0,
-                InputInterval: TimeSpan.FromMilliseconds(200)));
+                InputInterval: TimeSpan.FromMilliseconds(200),
+                IsochronousOutQuiesceTimeout: TimeSpan.FromMilliseconds(750)));
         var captured = new TaskCompletionSource<IsochronousOutCapture>(
             TaskCreationOptions.RunContinuationsAsynchronously);
         server.IsochronousOutReceived += output => captured.TrySetResult(output);
@@ -412,6 +422,8 @@ public static class LiveServerSelfTest
         {
         }
 
+        await TestIsochronousOutQuiescingAsync(stream);
+
         Console.WriteLine("servertest: microphone isochronous IN completion");
         byte[] setCaptureInterface = Setup(0x01, UsbStandardRequest.SetInterface,
             value: 1, index: 2, length: 0);
@@ -464,6 +476,97 @@ public static class LiveServerSelfTest
                 "canceled microphone ISO IN emitted a late RET_SUBMIT");
         }
         catch (OperationCanceledException) when (noLateMicrophoneCompletion.IsCancellationRequested)
+        {
+        }
+    }
+
+    private static async Task TestIsochronousOutQuiescingAsync(NetworkStream stream)
+    {
+        Console.WriteLine("servertest: ISO OUT alt-zero quiesce barrier and generation reopen");
+
+        byte[] longAudio = new byte[250 * 384];
+        UsbIpIsoPacket[] longPackets = Enumerable.Range(0, 250)
+            .Select(index => new UsbIpIsoPacket(
+                checked((uint)(index * 384)), 384, 0, 0))
+            .ToArray();
+        byte[] shortAudio = new byte[2 * 384];
+        UsbIpIsoPacket[] shortPackets = Enumerable.Range(0, 2)
+            .Select(index => new UsbIpIsoPacket(
+                checked((uint)(index * 384)), 384, 0, 0))
+            .ToArray();
+
+        await stream.WriteAsync(EncodeIsoSubmit(10, endpoint: 1, startFrame: 5000,
+            interval: 4, longAudio, longPackets));
+        await stream.WriteAsync(EncodeIsoSubmit(11, endpoint: 1, startFrame: 5250,
+            interval: 4, shortAudio, shortPackets));
+        await stream.WriteAsync(EncodeIsoSubmit(12, endpoint: 1, startFrame: 5252,
+            interval: 4, shortAudio, shortPackets));
+
+        byte[] setPlaybackInterfaceOff = Setup(0x01, UsbStandardRequest.SetInterface,
+            value: 0, index: 1, length: 0);
+        await stream.WriteAsync(EncodeSubmit(20, UsbIpConstants.DirectionOut,
+            endpoint: 0, transferLength: 0, setPlaybackInterfaceOff));
+        SubmitReply altZeroReply = await ReadSubmitReplyAsync(stream,
+            hasInputPayload: false);
+        Require(altZeroReply.SequenceNumber == 20 && altZeroReply.Status == 0,
+            nameof(TestIsochronousOutQuiescingAsync));
+        long quiescedAt = Stopwatch.GetTimestamp();
+
+        await stream.WriteAsync(EncodeUnlink(21, unlinkSequence: 10));
+        byte[] unlinkWon = await UsbIpCodec.ReadExactlyAsync(stream,
+            UsbIpConstants.UrbHeaderLength);
+        Require(U32(unlinkWon, 0) == UsbIpConstants.RetUnlink &&
+                U32(unlinkWon, 4) == 21 && I32(unlinkWon, 20) == -104,
+            nameof(TestIsochronousOutQuiescingAsync));
+
+        byte[] setPlaybackInterfaceOn = Setup(0x01, UsbStandardRequest.SetInterface,
+            value: 1, index: 1, length: 0);
+        await stream.WriteAsync(EncodeSubmit(22, UsbIpConstants.DirectionOut,
+            endpoint: 0, transferLength: 0, setPlaybackInterfaceOn));
+        SubmitReply reopenedAltReply = await ReadSubmitReplyAsync(stream,
+            hasInputPayload: false);
+        Require(reopenedAltReply.SequenceNumber == 22 && reopenedAltReply.Status == 0,
+            nameof(TestIsochronousOutQuiescingAsync));
+
+        await stream.WriteAsync(EncodeIsoSubmit(30, endpoint: 1, startFrame: 6000,
+            interval: 4, shortAudio, shortPackets));
+        IsoSubmitReply reopenedReply = await ReadIsoSubmitReplyAsync(stream);
+        Require(reopenedReply.SequenceNumber == 30 && reopenedReply.Status == 0 &&
+                reopenedReply.ActualLength == shortAudio.Length &&
+                reopenedReply.Packets.All(packet =>
+                    packet.ActualLength == 384 && packet.Status == 0),
+            nameof(TestIsochronousOutQuiescingAsync));
+
+        IsoSubmitReply expiredOne = await ReadIsoSubmitReplyAsync(stream);
+        IsoSubmitReply expiredTwo = await ReadIsoSubmitReplyAsync(stream);
+        IsoSubmitReply[] expired = new[] { expiredOne, expiredTwo };
+        double watchdogElapsedMs = (Stopwatch.GetTimestamp() - quiescedAt) * 1000.0 /
+            Stopwatch.Frequency;
+        Require(expired.Select(reply => reply.SequenceNumber).Order()
+                    .SequenceEqual(new uint[] { 11, 12 }) &&
+                expired.All(reply => reply.Status == -104 && reply.ActualLength == 0 &&
+                    reply.ErrorCount == 2 && reply.Packets.Count == 2 &&
+                    reply.Packets.All(packet =>
+                        packet.ActualLength == 0 && packet.Status == -104)) &&
+                watchdogElapsedMs >= 600,
+            nameof(TestIsochronousOutQuiescingAsync));
+
+        await stream.WriteAsync(EncodeUnlink(23, unlinkSequence: 11));
+        byte[] completionWon = await UsbIpCodec.ReadExactlyAsync(stream,
+            UsbIpConstants.UrbHeaderLength);
+        Require(U32(completionWon, 0) == UsbIpConstants.RetUnlink &&
+                U32(completionWon, 4) == 23 && I32(completionWon, 20) == 0,
+            nameof(TestIsochronousOutQuiescingAsync));
+
+        using var noDuplicateCompletion = new CancellationTokenSource(
+            TimeSpan.FromMilliseconds(120));
+        try
+        {
+            await UsbIpCodec.ReadExactlyAsync(stream, UsbIpConstants.UrbHeaderLength,
+                noDuplicateCompletion.Token);
+            throw new InvalidOperationException(nameof(TestIsochronousOutQuiescingAsync));
+        }
+        catch (OperationCanceledException) when (noDuplicateCompletion.IsCancellationRequested)
         {
         }
     }

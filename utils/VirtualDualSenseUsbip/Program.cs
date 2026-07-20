@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
+using System.Globalization;
 using System.Text.Json;
 using VirtualDualSenseUsbip.Device;
 using VirtualDualSenseUsbip.Live;
@@ -116,6 +117,8 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
     string inputMode = GetOption(args, "--input") ?? "neutral";
     string configurationMode = GetOption(args, "--configuration") ?? "hid";
     bool speakerAudio = ParseOnOff(GetOption(args, "--speaker-audio"), defaultValue: false);
+    int speakerVolume = ParsePercentage(GetOption(args, "--speaker-volume"),
+        defaultValue: 100, "--speaker-volume");
     string microphoneMode = (GetOption(args, "--mic") ?? "off").ToLowerInvariant();
     bool microphone = microphoneMode switch
     {
@@ -157,7 +160,8 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
         inputMode.Equals("bluetooth", StringComparison.OrdinalIgnoreCase)
             ? BluetoothDualSenseInputSource.Open(
                 message => Console.WriteLine($"{DateTime.Now:HH:mm:ss.fff} {message}"),
-                new BluetoothAudioOptions(speakerAudio, microphone, audioRoute))
+                new BluetoothAudioOptions(speakerAudio, microphone, audioRoute,
+                    SpeakerGain: speakerVolume / 100.0f))
             : inputMode.Equals("neutral", StringComparison.OrdinalIgnoreCase)
                 ? null
                 : throw new ArgumentException("--input must be 'neutral' or 'bluetooth'.");
@@ -351,8 +355,8 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
                 $"total={count} seq={capture.SequenceNumber} ep={capture.Endpoint} " +
                 $"{rate} " +
                 $"packets={totalPackets} current={capture.Packets.Count}x{minPacket}..{maxPacket} " +
-                $"gap-ms={gapRange} rms%={string.Join('/', rmsPercent.Select(value => value.ToString("0.00")))} " +
-                $"peak%={string.Join('/', peakPercent.Select(value => value.ToString("0.0")))} " +
+                $"gap-ms={gapRange} rms%={string.Join('/', rmsPercent.Select(value => value.ToString("0.00", CultureInfo.InvariantCulture)))} " +
+                $"peak%={string.Join('/', peakPercent.Select(value => value.ToString("0.0", CultureInfo.InvariantCulture)))} " +
                 $"start={capture.StartFrame} interval={capture.Interval}{bluetoothStats}");
         }
     };
@@ -416,7 +420,8 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
         if (speakerAudio || microphone)
         {
             Console.WriteLine($"Audio relay: speaker={(speakerAudio ? "on" : "off")} " +
-                $"mic={(microphone ? "on" : "off")} route={audioRoute.ToString().ToLowerInvariant()}");
+                $"speaker-volume={speakerVolume}% mic={(microphone ? "on" : "off")} " +
+                $"route={audioRoute.ToString().ToLowerInvariant()}");
         }
         Console.WriteLine($"Attach from an elevated terminal:");
         Console.WriteLine($"  usbip attach -r 127.0.0.1 -b {busId} --serial {suggestedSerial} --once");
@@ -443,7 +448,8 @@ Console.WriteLine("  inputtest [seconds]   validate physical BT input and USB re
 Console.WriteLine("  mictest [seconds] [--state masked|full]  standalone pad-mic probe (no USB/IP)");
 Console.WriteLine("  serve [--fixtures DIR] [--port 3240] [--busid 1-1] [--capture FILE]");
 Console.WriteLine("        [--input neutral|bluetooth] [--configuration hid|composite]");
-Console.WriteLine("        [--speaker-audio on|off] [--mic off|force] [--route auto|speaker|headphone]");
+Console.WriteLine("        [--speaker-audio on|off] [--speaker-volume 0..100] [--mic off|force]");
+Console.WriteLine("        [--route auto|speaker|headphone]");
 
 static string DefaultFixturesPath() => Path.Combine(AppContext.BaseDirectory,
     "..", "..", "..", "..", "DSCompatProbe", "fixtures", "dualsense_usb_0ce6");
@@ -477,6 +483,21 @@ static bool ParseOnOff(string? value, bool defaultValue)
         "off" or "false" or "0" => false,
         _ => throw new ArgumentException($"Expected 'on' or 'off', got '{value}'."),
     };
+}
+
+static int ParsePercentage(string? value, int defaultValue, string optionName)
+{
+    if (value == null)
+    {
+        return defaultValue;
+    }
+    if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture,
+            out int percentage) || percentage is < 0 or > 100)
+    {
+        throw new ArgumentOutOfRangeException(optionName,
+            $"{optionName} must be between 0 and 100.");
+    }
+    return percentage;
 }
 
 static int ParsePort(string? value)

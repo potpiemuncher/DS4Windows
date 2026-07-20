@@ -89,6 +89,7 @@ namespace DS4Windows
             new NativeModeStatsSnapshot(null, null, null, DateTimeOffset.MinValue);
 
         public event EventHandler<NativeModeStateChangedEventArgs> StateChanged;
+        public event EventHandler StatsChanged;
 
         public NativeModeState State
         {
@@ -368,6 +369,7 @@ namespace DS4Windows
         private void UpdateStats(string isochronousOut = null, string audio = null,
             string speakerRebuffer = null)
         {
+            EventHandler handler;
             lock (statsGate)
             {
                 latestStats = new NativeModeStatsSnapshot(
@@ -375,7 +377,10 @@ namespace DS4Windows
                     audio ?? latestStats.Audio,
                     speakerRebuffer ?? latestStats.SpeakerRebuffer,
                     DateTimeOffset.Now);
+                handler = StatsChanged;
             }
+
+            handler?.Invoke(this, EventArgs.Empty);
         }
 
         private void SetState(NativeModeState newState, string detail)

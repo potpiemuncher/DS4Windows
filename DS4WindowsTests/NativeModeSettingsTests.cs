@@ -16,6 +16,7 @@ public class NativeModeSettingsTests
         var options = new DualSenseControllerOptions(InputDeviceType.DualSense);
 
         Assert.IsTrue(options.NativeModeSpeakerAudio);
+        Assert.AreEqual(35, options.NativeModeSpeakerVolume);
         Assert.AreEqual(DualSenseControllerOptions.AudioOutputRoute.Auto,
             options.NativeModeRoute);
     }
@@ -26,6 +27,7 @@ public class NativeModeSettingsTests
         var source = new DualSenseControllerOptions(InputDeviceType.DualSense)
         {
             NativeModeSpeakerAudio = false,
+            NativeModeSpeakerVolume = 25,
             NativeModeRoute = DualSenseControllerOptions.AudioOutputRoute.Speaker,
         };
         var document = new XmlDocument();
@@ -37,6 +39,7 @@ public class NativeModeSettingsTests
         var destination = new DualSenseControllerOptions(InputDeviceType.DualSense);
         destination.LoadSettings(document, root);
         Assert.IsFalse(destination.NativeModeSpeakerAudio);
+        Assert.AreEqual(25, destination.NativeModeSpeakerVolume);
         Assert.AreEqual(DualSenseControllerOptions.AudioOutputRoute.Speaker,
             destination.NativeModeRoute);
     }
@@ -47,6 +50,7 @@ public class NativeModeSettingsTests
         var options = new DualSenseControllerOptions(InputDeviceType.DualSense)
         {
             NativeModeSpeakerAudio = false,
+            NativeModeSpeakerVolume = 30,
             NativeModeRoute = DualSenseControllerOptions.AudioOutputRoute.Headphone,
         };
 
@@ -56,8 +60,22 @@ public class NativeModeSettingsTests
             "--configuration", "composite",
             "--input", "bluetooth",
             "--speaker-audio", "off",
+            "--speaker-volume", "30",
             "--route", "headphone",
         }, ControlService.BuildNativeModeServerArguments(options));
+    }
+
+    [DataTestMethod]
+    [DataRow(-1, 0)]
+    [DataRow(101, 100)]
+    public void NativeModeSpeakerVolume_ClampsToValidRange(int value, int expected)
+    {
+        var options = new DualSenseControllerOptions(InputDeviceType.DualSense)
+        {
+            NativeModeSpeakerVolume = value,
+        };
+
+        Assert.AreEqual(expected, options.NativeModeSpeakerVolume);
     }
 
     [TestMethod]

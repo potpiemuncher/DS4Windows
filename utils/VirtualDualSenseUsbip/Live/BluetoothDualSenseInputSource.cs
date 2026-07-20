@@ -24,6 +24,7 @@ public sealed record BluetoothAudioOptions(
     bool SpeakerAudio = false,
     bool Microphone = false,
     SpeakerAudioRoute Route = SpeakerAudioRoute.Auto,
+    float SpeakerGain = 1.0f,
     bool MaskStateWhileMicrophoneActive = true)
 {
     public static BluetoothAudioOptions Disabled { get; } = new();
@@ -445,7 +446,7 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
 
     private void ExtractSpeakerAudio(ReadOnlySpan<byte> usbFourChannelPcm16)
     {
-        float volume = PlaybackVolume;
+        float volume = CombineSpeakerVolume(PlaybackVolume, audioOptions.SpeakerGain);
         int totalFrames = usbFourChannelPcm16.Length / UsbAudioBytesPerFrame;
         int frameOffset = 0;
         bool hasEnergy = false;
@@ -497,6 +498,13 @@ public sealed class BluetoothDualSenseInputSource : IInputReportSource, IUsbAudi
     private static short ScaleSample(int sample, float volume)
     {
         return (short)Math.Clamp((int)MathF.Round(sample * volume), short.MinValue, short.MaxValue);
+    }
+
+    internal static float CombineSpeakerVolume(float hostPlaybackVolume,
+        float configuredSpeakerGain)
+    {
+        return Math.Clamp(hostPlaybackVolume, 0.0f, 1.0f) *
+            Math.Clamp(configuredSpeakerGain, 0.0f, 1.0f);
     }
 
     internal static int ConvertUsbHapticPcm(ReadOnlySpan<byte> usbFourChannelPcm16,

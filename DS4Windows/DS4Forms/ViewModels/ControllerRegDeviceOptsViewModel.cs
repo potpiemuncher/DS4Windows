@@ -286,6 +286,10 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         private readonly SynchronizationContext uiContext;
         private bool nativeModeOperationInProgress;
         private string nativeModeStatus;
+        private bool nativeHapticsDetected;
+        private double nativeHapticsLeftRmsPercent;
+        private double nativeHapticsRightRmsPercent;
+        private long nativeHapticsBluetoothErrors;
 
         private DualSenseDeviceOptions parentOptions;
         public bool Visible { get => parentOptions.Enabled; }
@@ -369,6 +373,7 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             uiContext = SynchronizationContext.Current;
             parentOptions.EnabledChanged += (sender, e) => { VisibleChanged?.Invoke(this, EventArgs.Empty); };
             service.NativeModeManager.StateChanged += NativeModeManager_StateChanged;
+            service.NativeModeManager.StatsChanged += NativeModeManager_StatsChanged;
             nativeModeStatus = StatusForState(service.NativeModeManager.State, null);
 
             PopulateHapticsAudioDevices();
@@ -440,6 +445,7 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         public void Dispose()
         {
             service.NativeModeManager.StateChanged -= NativeModeManager_StateChanged;
+            service.NativeModeManager.StatsChanged -= NativeModeManager_StatsChanged;
         }
 
         private bool IsNativeModeSessionActive => service.IsNativeModeSessionActive;
@@ -453,6 +459,7 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             }
 
             device.NativeOptionsStore.NativeModeSpeakerAudio = options.NativeModeSpeakerAudio;
+            device.NativeOptionsStore.NativeModeSpeakerVolume = options.NativeModeSpeakerVolume;
             device.NativeOptionsStore.NativeModeRoute = options.NativeModeRoute;
         }
 
@@ -469,11 +476,61 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             }
         }
 
+        private void NativeModeManager_StatsChanged(object sender, EventArgs e)
+        {
+            if (uiContext != null && SynchronizationContext.Current != uiContext)
+            {
+                uiContext.Post(_ => ApplyNativeModeStats(), null);
+            }
+            else
+            {
+                ApplyNativeModeStats();
+            }
+        }
+
         private void ApplyNativeModeState(NativeModeStateChangedEventArgs e)
         {
-            nativeModeStatus = StatusForState(e.State, e.Detail);
+            if (e.State == NativeModeState.Starting)
+            {
+                nativeHapticsDetected = false;
+                nativeHapticsLeftRmsPercent = 0.0;
+                nativeHapticsRightRmsPercent = 0.0;
+                nativeHapticsBluetoothErrors = 0;
+            }
+
+            nativeModeStatus = e.State == NativeModeState.Attached
+                ? StatusForAttachedHaptics(nativeHapticsDetected,
+                    nativeHapticsLeftRmsPercent, nativeHapticsRightRmsPercent,
+                    nativeHapticsBluetoothErrors)
+                : StatusForState(e.State, e.Detail);
             NativeModeStatusChanged?.Invoke(this, EventArgs.Empty);
             NotifyNativeModeProperties();
+        }
+
+        private void ApplyNativeModeStats()
+        {
+            if (!NativeModeIsoTelemetryParser.TryParse(
+                service.NativeModeManager.LatestStats.IsochronousOut,
+                out NativeModeIsoTelemetry telemetry))
+            {
+                return;
+            }
+
+            nativeHapticsBluetoothErrors = telemetry.BluetoothErrorCount;
+            if (telemetry.HasNativeHapticSignal)
+            {
+                nativeHapticsDetected = true;
+                nativeHapticsLeftRmsPercent = telemetry.Channel3RmsPercent;
+                nativeHapticsRightRmsPercent = telemetry.Channel4RmsPercent;
+            }
+
+            if (service.NativeModeManager.State != NativeModeState.Attached)
+                return;
+
+            nativeModeStatus = StatusForAttachedHaptics(nativeHapticsDetected,
+                nativeHapticsLeftRmsPercent, nativeHapticsRightRmsPercent,
+                nativeHapticsBluetoothErrors);
+            NativeModeStatusChanged?.Invoke(this, EventArgs.Empty);
         }
 
         private void NotifyNativeModeProperties()
@@ -482,6 +539,17 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             NativeModeCanToggleChanged?.Invoke(this, EventArgs.Empty);
             NativeModeSettingsEnabledChanged?.Invoke(this, EventArgs.Empty);
             NativeModeSetupCanRunChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        internal static string StatusForAttachedHaptics(bool detected,
+            double leftRmsPercent, double rightRmsPercent, long bluetoothErrors)
+        {
+            return detected
+                ? $"Native mode attached — native haptics detected " +
+                  $"(L {leftRmsPercent:0.00}%, R {rightRmsPercent:0.00}%; " +
+                  $"BT errors {bluetoothErrors})."
+                : $"Native mode attached — waiting for native haptics " +
+                  $"(channels 3/4 silent; BT errors {bluetoothErrors}).";
         }
 
         internal static string StatusForState(NativeModeState state, string detail)

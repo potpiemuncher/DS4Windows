@@ -94,6 +94,12 @@ namespace DS4WinWPF.DS4Control.DTOXml
             get; set;
         } = true;
 
+        [XmlElement("NativeModeSpeakerVolume")]
+        public int NativeModeSpeakerVolume
+        {
+            get; set;
+        } = 35;
+
         [XmlElement("NativeModeRoute")]
         public AudioOutputRoute NativeModeRoute
         {
@@ -113,6 +119,7 @@ namespace DS4WinWPF.DS4Control.DTOXml
             BTAudioVolume = source.BTAudioVolume;
             BTAudioLatency = source.BTAudioLatency;
             NativeModeSpeakerAudio = source.NativeModeSpeakerAudio;
+            NativeModeSpeakerVolume = source.NativeModeSpeakerVolume;
             NativeModeRoute = source.NativeModeRoute;
         }
 
@@ -129,6 +136,7 @@ namespace DS4WinWPF.DS4Control.DTOXml
             destination.BTAudioVolume = BTAudioVolume;
             destination.BTAudioLatency = BTAudioLatency;
             destination.NativeModeSpeakerAudio = NativeModeSpeakerAudio;
+            destination.NativeModeSpeakerVolume = NativeModeSpeakerVolume;
             destination.NativeModeRoute = NativeModeRoute;
         }
     }

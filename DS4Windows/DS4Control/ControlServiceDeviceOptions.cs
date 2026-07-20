@@ -394,6 +394,19 @@ namespace DS4Windows
             }
         }
 
+        private int nativeModeSpeakerVolume = 35;
+        public int NativeModeSpeakerVolume
+        {
+            get => nativeModeSpeakerVolume;
+            set
+            {
+                value = Math.Clamp(value, 0, 100);
+                if (nativeModeSpeakerVolume == value) return;
+                nativeModeSpeakerVolume = value;
+                NativeModeOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
         private AudioOutputRoute nativeModeRoute = AudioOutputRoute.Auto;
         public AudioOutputRoute NativeModeRoute
         {

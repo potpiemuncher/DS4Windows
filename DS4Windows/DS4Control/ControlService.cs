@@ -25,6 +25,7 @@ using SharpOSC;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -96,6 +97,10 @@ namespace DS4Windows
         private readonly NativeModeManager nativeModeManager = new NativeModeManager();
         private readonly NativeModeElevationBroker nativeModeElevationBroker =
             new NativeModeElevationBroker();
+        private readonly NativeModeAudioDefaultGuard nativeModeAudioDefaultGuard =
+            new NativeModeAudioDefaultGuard();
+        private readonly NativeModeRenderKeepalive nativeModeRenderKeepalive =
+            new NativeModeRenderKeepalive();
         private readonly SemaphoreSlim nativeModeLifecycleGate = new SemaphoreSlim(1, 1);
         private volatile bool nativeModeShutdownRequested;
         public NativeModeManager NativeModeManager => nativeModeManager;
@@ -104,7 +109,8 @@ namespace DS4Windows
         public bool IsNativeModeSessionActive =>
             NativeModeLifecyclePolicy.IsSessionActive(nativeModeManager.State,
                 DS4Devices.NativeModeGuard.IsActive,
-                nativeModeManager.HasOwnedProcess);
+                nativeModeManager.HasOwnedProcess) ||
+            nativeModeRenderKeepalive.HasSession;
 
         private DS4WinWPF.ArgumentParser cmdParser;
 
@@ -2110,11 +2116,14 @@ namespace DS4Windows
                     dualSense.NativeOptionsStore);
                 serverArguments = AppendFixturesArgumentIfPackaged(serverArguments,
                     NativeModeManager.LocateServerExecutable(), File.Exists);
+                NativeModeAudioDefaultsSnapshot audioDefaults =
+                    nativeModeAudioDefaultGuard.Capture();
                 NativeModeAttachResult attachFailure = null;
-                DS4Devices.BeginNativeModeSuppression(macAddress, devicePath);
 
                 try
                 {
+                    nativeModeRenderKeepalive.BeginSession();
+                    DS4Devices.BeginNativeModeSuppression(macAddress, devicePath);
                     await Task.Run(() => ReleaseControllerForNativeMode(device, deviceIndex))
                         .ConfigureAwait(false);
 
@@ -2139,10 +2148,16 @@ namespace DS4Windows
                         throw new InvalidOperationException(attachResult.Reason);
                     }
 
+                    await nativeModeRenderKeepalive.WaitForReadyAsync(
+                        TimeSpan.FromSeconds(10), cancellationToken)
+                        .ConfigureAwait(false);
+                    nativeModeAudioDefaultGuard.BeginSession(audioDefaults);
+                    nativeModeAudioDefaultGuard.ReconcileNow();
                     nativeModeManager.MarkAttached();
                 }
                 catch (Exception ex)
                 {
+                    nativeModeAudioDefaultGuard.ReconcileNow();
                     NativeModeState failedState = nativeModeManager.State;
                     await RecoverControllerAfterFailedNativeStartAsync().ConfigureAwait(false);
                     if (!nativeModeShutdownRequested)
@@ -2183,6 +2198,7 @@ namespace DS4Windows
                 "--configuration", "composite",
                 "--input", "bluetooth",
                 "--speaker-audio", options.NativeModeSpeakerAudio ? "on" : "off",
+                "--speaker-volume", options.NativeModeSpeakerVolume.ToString(CultureInfo.InvariantCulture),
                 "--route", options.NativeModeRoute.ToString().ToLowerInvariant(),
             };
         }
@@ -2253,7 +2269,10 @@ namespace DS4Windows
             try
             {
                 if (!IsNativeModeSessionActive)
+                {
+                    nativeModeAudioDefaultGuard.EndSession(restoreDefaultsNow: true);
                     return;
+                }
 
                 await StopNativeModeUnderGateAsync(rescanAfterStop)
                     .ConfigureAwait(false);
@@ -2266,6 +2285,8 @@ namespace DS4Windows
 
         private async Task StopNativeModeUnderGateAsync(bool rescanAfterStop)
         {
+            nativeModeAudioDefaultGuard.ReconcileNow();
+            nativeModeRenderKeepalive.BeginTeardown();
             try
             {
                 await nativeModeManager.StopAsync(CancellationToken.None)
@@ -2273,9 +2294,18 @@ namespace DS4Windows
             }
             finally
             {
-                DS4Devices.EndNativeModeSuppression();
-                if (rescanAfterStop && running)
-                    HotPlug();
+                try
+                {
+                    await nativeModeRenderKeepalive.CompleteTeardownAsync()
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    nativeModeAudioDefaultGuard.EndSession(restoreDefaultsNow: true);
+                    DS4Devices.EndNativeModeSuppression();
+                    if (rescanAfterStop && running)
+                        HotPlug();
+                }
             }
         }
 
@@ -2359,6 +2389,7 @@ namespace DS4Windows
 
         private async Task RecoverControllerAfterFailedNativeStartAsync()
         {
+            nativeModeRenderKeepalive.BeginTeardown();
             try
             {
                 await nativeModeManager.StopAsync(CancellationToken.None)
@@ -2371,9 +2402,18 @@ namespace DS4Windows
             }
             finally
             {
-                DS4Devices.EndNativeModeSuppression();
-                if (running)
-                    HotPlug();
+                try
+                {
+                    await nativeModeRenderKeepalive.CompleteTeardownAsync()
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    nativeModeAudioDefaultGuard.EndSession(restoreDefaultsNow: true);
+                    DS4Devices.EndNativeModeSuppression();
+                    if (running)
+                        HotPlug();
+                }
             }
         }
 
