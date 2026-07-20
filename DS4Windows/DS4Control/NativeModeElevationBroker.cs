@@ -22,7 +22,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Management;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -307,9 +307,21 @@ namespace DS4Windows
                     CommandFailure("USB/IP attach could not be started", commandResult));
             }
 
-            bool arrived = await WaitForDeviceArrivalAsync(virtualDevicePresent,
-                delay, DefaultArrivalTimeout, ArrivalPollInterval,
-                cancellationToken).ConfigureAwait(false);
+            bool arrived;
+            try
+            {
+                arrived = await WaitForDeviceArrivalAsync(virtualDevicePresent,
+                    delay, DefaultArrivalTimeout, ArrivalPollInterval,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is Win32Exception ||
+                ex is UnauthorizedAccessException)
+            {
+                return NativeModeAttachResult.Failed(
+                    NativeModeAttachFailureKind.DeviceArrivalTimeout,
+                    "Could not query present devices while confirming the " +
+                    $"virtual DualSense attachment: {ex.Message}");
+            }
             return arrived
                 ? NativeModeAttachResult.Succeeded("Virtual DualSense attached.")
                 : NativeModeAttachResult.Failed(
@@ -410,32 +422,113 @@ namespace DS4Windows
             @"USB\VID_054C&PID_0CE6\DS4WSPKCOMP001";
         private const string DualSenseUsbInstancePrefix =
             @"USB\VID_054C&PID_0CE6";
+        private const int ErrorInsufficientBuffer = 122;
+        private const int ErrorNoMoreItems = 259;
+        internal const int PresentAllClassesFlags =
+            NativeMethods.DIGCF_PRESENT | NativeMethods.DIGCF_ALLCLASSES;
+        private static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
 
-        public static bool IsVirtualDualSensePresent()
-        {
-            try
-            {
-                return GetPresentVirtualDualSenseInstanceIds().Count != 0;
-            }
-            catch (Exception ex) when (ex is ManagementException ||
-                ex is UnauthorizedAccessException)
-            {
-                AppLogger.LogToGui(
-                    $"[native] Unable to query virtual DualSense presence: {ex.Message}", true);
-                return false;
-            }
-        }
+        // Cleanup callers deliberately receive probe failures. Treating a failed
+        // query as "absent" could release the retained render pin while a stale
+        // or still-removing composite child exists. The attach broker catches
+        // expected SetupAPI failures and returns a normal attach failure instead.
+        public static bool IsVirtualDualSensePresent() =>
+            GetPresentVirtualDualSenseInstanceIds().Count != 0;
 
         internal static IReadOnlyList<string>
-            GetPresentVirtualDualSenseInstanceIds()
+            GetPresentVirtualDualSenseInstanceIds() =>
+            GetPresentVirtualDualSenseInstanceIds(
+                EnumeratePresentDeviceInstanceIds);
+
+        internal static IReadOnlyList<string>
+            GetPresentVirtualDualSenseInstanceIds(
+                Func<int, IReadOnlyList<string>> enumerateDeviceInstanceIds)
         {
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT DeviceID FROM Win32_PnPEntity WHERE DeviceID IS NOT NULL");
-            using ManagementObjectCollection devices = searcher.Get();
-            return devices.Cast<ManagementObject>()
-                .Select(device => device["DeviceID"] as string)
+            if (enumerateDeviceInstanceIds == null)
+            {
+                throw new ArgumentNullException(
+                    nameof(enumerateDeviceInstanceIds));
+            }
+
+            return (enumerateDeviceInstanceIds(PresentAllClassesFlags) ??
+                    Array.Empty<string>())
                 .Where(IsVirtualDualSenseParentInstanceId)
                 .ToArray();
+        }
+
+        private static IReadOnlyList<string>
+            EnumeratePresentDeviceInstanceIds(int flags)
+        {
+            IntPtr deviceInfoSet = NativeMethods.SetupDiGetClassDevs(
+                IntPtr.Zero, null, 0, flags);
+            if (deviceInfoSet == InvalidHandleValue)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "SetupDiGetClassDevs could not enumerate present devices.");
+            }
+
+            var instanceIds = new List<string>();
+            try
+            {
+                for (int index = 0; ; index++)
+                {
+                    var deviceInfo = new NativeMethods.SP_DEVINFO_DATA
+                    {
+                        cbSize = Marshal.SizeOf<NativeMethods.SP_DEVINFO_DATA>(),
+                    };
+                    if (!NativeMethods.SetupDiEnumDeviceInfo(deviceInfoSet,
+                        index, ref deviceInfo))
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error == ErrorNoMoreItems)
+                            break;
+                        throw new Win32Exception(error,
+                            "SetupDiEnumDeviceInfo could not enumerate a present device.");
+                    }
+
+                    instanceIds.Add(GetDeviceInstanceId(deviceInfoSet,
+                        ref deviceInfo));
+                }
+            }
+            finally
+            {
+                NativeMethods.SetupDiDestroyDeviceInfoList(deviceInfoSet);
+            }
+
+            return instanceIds;
+        }
+
+        private static string GetDeviceInstanceId(IntPtr deviceInfoSet,
+            ref NativeMethods.SP_DEVINFO_DATA deviceInfo)
+        {
+            int requiredSize = 0;
+            if (!NativeMethods.SetupDiGetDeviceInstanceId(deviceInfoSet,
+                ref deviceInfo, null, 0, ref requiredSize))
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error != ErrorInsufficientBuffer)
+                {
+                    throw new Win32Exception(error,
+                        "SetupDiGetDeviceInstanceId could not size an instance ID.");
+                }
+            }
+
+            if (requiredSize <= 1)
+            {
+                throw new Win32Exception(
+                    "SetupDiGetDeviceInstanceId returned an empty instance ID.");
+            }
+
+            var instanceId = new StringBuilder(requiredSize);
+            if (!NativeMethods.SetupDiGetDeviceInstanceId(deviceInfoSet,
+                ref deviceInfo, instanceId, instanceId.Capacity,
+                ref requiredSize))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "SetupDiGetDeviceInstanceId could not read an instance ID.");
+            }
+
+            return instanceId.ToString();
         }
 
         internal static bool IsVirtualDualSenseParentInstanceId(

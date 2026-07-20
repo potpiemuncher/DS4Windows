@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Xml.Linq;
 using DS4Windows;
 
@@ -135,6 +136,55 @@ public class NativeModeElevationBrokerTests
         {
             "/Run", "/TN", NativeModeElevationBroker.AttachTaskName,
         }, runner.AsyncCalls[0].Arguments);
+    }
+
+    [TestMethod]
+    public async Task RunAttach_PresenceQueryFailureReturnsSafeAttachFailure()
+    {
+        var runner = new FakeCommandRunner();
+        var broker = CreateBroker(runner, administrator: true,
+            devicePresent: () => throw new Win32Exception(5, "access denied"));
+
+        NativeModeAttachResult result = await broker.RunAttachAsync(
+            @"C:\Program Files\USBip\usbip.exe");
+
+        Assert.IsFalse(result.Success);
+        Assert.AreEqual(NativeModeAttachFailureKind.DeviceArrivalTimeout,
+            result.FailureKind);
+        StringAssert.Contains(result.Reason, "Could not query present devices");
+    }
+
+    [TestMethod]
+    public void PresentEnumeration_UsesAllClassesAndExactVirtualParentOnly()
+    {
+        int observedFlags = 0;
+
+        IReadOnlyList<string> matches = NativeModeDevicePresence
+            .GetPresentVirtualDualSenseInstanceIds(flags =>
+            {
+                observedFlags = flags;
+                return new[]
+                {
+                    NativeModeDevicePresence.VirtualDualSenseParentInstanceId,
+                    @"USB\VID_054C&PID_0CE6\E82712345678",
+                    @"USB\VID_054C&PID_0CE6&MI_01\DS4WSPKCOMP001&0001",
+                };
+            });
+
+        Assert.AreEqual(NativeMethods.DIGCF_PRESENT |
+            NativeMethods.DIGCF_ALLCLASSES, observedFlags);
+        CollectionAssert.AreEqual(new[]
+        {
+            NativeModeDevicePresence.VirtualDualSenseParentInstanceId,
+        }, matches.ToArray());
+    }
+
+    [TestMethod]
+    public void DirectPresenceEnumeration_PropagatesFailureForFailClosedCleanup()
+    {
+        Assert.ThrowsException<Win32Exception>(() =>
+            NativeModeDevicePresence.GetPresentVirtualDualSenseInstanceIds(
+                _ => throw new Win32Exception(5, "probe failed")));
     }
 
     [TestMethod]

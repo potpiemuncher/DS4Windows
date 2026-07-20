@@ -14,7 +14,7 @@ public class NativeModeLifecycleOrchestrationTests
             () =>
             {
                 calls.Add("capture");
-                return null;
+                return CreateSnapshot();
             },
             _ => calls.Add("register"),
             () =>
@@ -28,6 +28,48 @@ public class NativeModeLifecycleOrchestrationTests
         {
             "capture", "register", "attach", "keepalive-ready",
         }, calls);
+    }
+
+    [TestMethod]
+    public async Task Startup_NullSnapshotAbortsBeforeGuardAndProtectedStartup()
+    {
+        int guardStarts = 0;
+        int protectedStarts = 0;
+
+        await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
+            NativeModeStartupOrchestration.RunWithAudioDefaultProtectionAsync(
+                () => null,
+                _ => guardStarts++,
+                () =>
+                {
+                    protectedStarts++;
+                    return Task.CompletedTask;
+                }));
+
+        Assert.AreEqual(0, guardStarts);
+        Assert.AreEqual(0, protectedStarts);
+    }
+
+    [TestMethod]
+    public async Task Startup_GuardRegistrationFailureWithSnapshotPreventsProtectedStartup()
+    {
+        var registrationFailure = new InvalidOperationException(
+            "notification registration failed");
+        int protectedStarts = 0;
+
+        InvalidOperationException observed =
+            await Assert.ThrowsExceptionAsync<InvalidOperationException>(() =>
+                NativeModeStartupOrchestration.RunWithAudioDefaultProtectionAsync(
+                    CreateSnapshot,
+                    _ => throw registrationFailure,
+                    () =>
+                    {
+                        protectedStarts++;
+                        return Task.CompletedTask;
+                    }));
+
+        Assert.AreSame(registrationFailure, observed);
+        Assert.AreEqual(0, protectedStarts);
     }
 
     [TestMethod]
@@ -228,4 +270,15 @@ public class NativeModeLifecycleOrchestrationTests
         Assert.AreEqual(3, attempts);
         Assert.AreEqual(2, delays);
     }
+
+    private static NativeModeAudioDefaultsSnapshot CreateSnapshot() => new(
+        new Dictionary<
+            (NativeModeAudioFlow Flow, NativeModeAudioRole Role), string>(),
+        new Dictionary<NativeModeAudioFlow, HashSet<string>>
+        {
+            [NativeModeAudioFlow.Render] = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase),
+            [NativeModeAudioFlow.Capture] = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase),
+        });
 }

@@ -399,7 +399,7 @@ public class NativeModeAudioDefaultGuardTests
     }
 
     [TestMethod]
-    public void NotificationRegistrationFailureIsNonfatalAndManualReconcileWorks()
+    public void NotificationRegistrationFailureAbortsAndClearsPartialSession()
     {
         var accessor = CreateAccessor();
         var notifications = new FakeNotificationSource { ThrowOnSubscribe = true };
@@ -412,18 +412,19 @@ public class NativeModeAudioDefaultGuardTests
                     warnings.Add(message);
             });
 
-        guard.BeginSession(guard.Capture());
-        accessor.AddEndpoint(NativeModeAudioFlow.Render, "virtual-render",
-            "Speakers (DualSense Wireless Controller)");
-        accessor.Defaults[(NativeModeAudioFlow.Render,
-            NativeModeAudioRole.Console)] = "virtual-render";
-        guard.ReconcileNow();
+        NativeModeAudioDefaultsSnapshot snapshot = guard.Capture();
+        InvalidOperationException failure = Assert.ThrowsException<
+            InvalidOperationException>(() => guard.BeginSession(snapshot));
 
-        Assert.AreEqual("sonar-gaming", accessor.Defaults[(
-            NativeModeAudioFlow.Render, NativeModeAudioRole.Console)]);
+        StringAssert.Contains(failure.Message, "cannot start");
         Assert.AreEqual(1, warnings.Count(message =>
             message.Contains("Could not monitor", StringComparison.Ordinal)));
+
+        // A clean retry proves the failed Session was unpublished and stopped.
+        notifications.ThrowOnSubscribe = false;
+        guard.BeginSession(snapshot);
         guard.EndSession(restoreDefaultsNow: false);
+        Assert.AreEqual(1, notifications.DisposeCount);
     }
 
     [TestMethod]
@@ -455,7 +456,7 @@ public class NativeModeAudioDefaultGuardTests
     }
 
     [TestMethod]
-    public void Capture_UnexpectedAudioApiFailureIsNonfatal()
+    public void Capture_UnexpectedAudioApiFailureAbortsStartup()
     {
         var accessor = CreateAccessor();
         var notifications = new FakeNotificationSource();
@@ -469,11 +470,22 @@ public class NativeModeAudioDefaultGuardTests
             });
         accessor.ThrowOnEnumeration = true;
 
-        NativeModeAudioDefaultsSnapshot snapshot = guard.Capture();
+        InvalidOperationException failure = Assert.ThrowsException<
+            InvalidOperationException>(() => guard.Capture());
 
-        Assert.IsNull(snapshot);
+        StringAssert.Contains(failure.Message, "cannot start");
         Assert.AreEqual(1, warnings.Count);
         StringAssert.Contains(warnings[0], "Could not snapshot");
+    }
+
+    [TestMethod]
+    public void BeginSession_RejectsMissingSnapshot()
+    {
+        var guard = CreateGuard(CreateAccessor(), new FakeNotificationSource(),
+            new ManualWorkQueue());
+
+        Assert.ThrowsException<ArgumentNullException>(() =>
+            guard.BeginSession(null));
     }
 
     private static NativeModeAudioDefaultGuard CreateGuard(FakeAccessor accessor,

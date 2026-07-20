@@ -62,8 +62,10 @@ namespace DS4Windows
     /// </summary>
     internal sealed class NativeModeRenderKeepalive
     {
-        private static readonly TimeSpan EndpointPollInterval =
+        private static readonly TimeSpan DefaultReadinessPollInterval =
             TimeSpan.FromMilliseconds(100);
+        private static readonly TimeSpan DefaultRemovalPollInterval =
+            TimeSpan.FromSeconds(1);
 
         private readonly object sessionGate = new object();
         private readonly INativeModeAudioEndpointAccessor endpointAccessor;
@@ -71,6 +73,8 @@ namespace DS4Windows
         private readonly INativeModeRenderOutputFactory outputFactory;
         private readonly INativeModeVirtualDeviceIdentity deviceIdentity;
         private readonly Action<string, bool> log;
+        private readonly TimeSpan readinessPollInterval;
+        private readonly TimeSpan removalPollInterval;
         private Session currentSession;
 
         public NativeModeRenderKeepalive() : this(
@@ -78,7 +82,8 @@ namespace DS4Windows
             new WindowsNativeModeAudioNotificationSource(),
             new WasapiNativeModeRenderOutputFactory(),
             new WindowsNativeModeVirtualDeviceIdentity(),
-            (message, warning) => AppLogger.LogToGui(message, warning))
+            (message, warning) => AppLogger.LogToGui(message, warning),
+            DefaultReadinessPollInterval, DefaultRemovalPollInterval)
         {
         }
 
@@ -87,7 +92,9 @@ namespace DS4Windows
             INativeModeAudioNotificationSource notificationSource,
             INativeModeRenderOutputFactory outputFactory,
             INativeModeVirtualDeviceIdentity deviceIdentity,
-            Action<string, bool> log)
+            Action<string, bool> log,
+            TimeSpan? readinessPollInterval = null,
+            TimeSpan? removalPollInterval = null)
         {
             this.endpointAccessor = endpointAccessor ??
                 throw new ArgumentNullException(nameof(endpointAccessor));
@@ -98,6 +105,17 @@ namespace DS4Windows
             this.deviceIdentity = deviceIdentity ??
                 throw new ArgumentNullException(nameof(deviceIdentity));
             this.log = log ?? throw new ArgumentNullException(nameof(log));
+            this.readinessPollInterval = readinessPollInterval ??
+                DefaultReadinessPollInterval;
+            this.removalPollInterval = removalPollInterval ??
+                DefaultRemovalPollInterval;
+            if (this.readinessPollInterval <= TimeSpan.Zero)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(readinessPollInterval));
+            }
+            if (this.removalPollInterval <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(removalPollInterval));
         }
 
         public bool HasSession
@@ -131,7 +149,7 @@ namespace DS4Windows
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             var session = new Session(activeBeforeAttach, endpointAccessor,
                 notificationSource, outputFactory, deviceIdentity, log,
-                SessionReleased);
+                SessionReleased, readinessPollInterval, removalPollInterval);
 
             lock (sessionGate)
             {
@@ -227,8 +245,9 @@ namespace DS4Windows
         /// <summary>
         /// Rechecks removal after the child-process teardown has completed. If
         /// removal timed out, the session remains subscribed and owns the
-        /// playing output until a later notification/poll confirms that both
-        /// the endpoint and virtual parent are gone.
+        /// playing output. One deliberately retained, rate-limited monitor then
+        /// survives the caller's timeout until a later notification/poll confirms
+        /// that both the endpoint and present virtual parent are gone.
         /// </summary>
         public Task CompleteTeardownAsync()
         {
@@ -257,6 +276,8 @@ namespace DS4Windows
             private readonly INativeModeVirtualDeviceIdentity deviceIdentity;
             private readonly Action<string, bool> log;
             private readonly Action<Session> released;
+            private readonly TimeSpan readinessPollInterval;
+            private readonly TimeSpan removalPollInterval;
             private readonly SemaphoreSlim endpointChanged = new SemaphoreSlim(0, 1);
             private readonly SemaphoreSlim operationGate = new SemaphoreSlim(1, 1);
             private readonly CancellationTokenSource readinessCancellation =
@@ -279,13 +300,16 @@ namespace DS4Windows
             private bool teardownStarted;
             private bool releaseCompleted;
             private bool retentionLogged;
+            private bool probeFailureLogged;
 
             public Session(HashSet<string> activeBeforeAttach,
                 INativeModeAudioEndpointAccessor endpointAccessor,
                 INativeModeAudioNotificationSource notificationSource,
                 INativeModeRenderOutputFactory outputFactory,
                 INativeModeVirtualDeviceIdentity deviceIdentity,
-                Action<string, bool> log, Action<Session> released)
+                Action<string, bool> log, Action<Session> released,
+                TimeSpan readinessPollInterval,
+                TimeSpan removalPollInterval)
             {
                 this.activeBeforeAttach = activeBeforeAttach;
                 this.endpointAccessor = endpointAccessor;
@@ -294,6 +318,8 @@ namespace DS4Windows
                 this.deviceIdentity = deviceIdentity;
                 this.log = log;
                 this.released = released;
+                this.readinessPollInterval = readinessPollInterval;
+                this.removalPollInterval = removalPollInterval;
             }
 
             public Task<Exception> UnexpectedTermination =>
@@ -334,7 +360,7 @@ namespace DS4Windows
                         if (await TryStartOutputAsync().ConfigureAwait(false))
                             return;
 
-                        await endpointChanged.WaitAsync(EndpointPollInterval,
+                        await endpointChanged.WaitAsync(readinessPollInterval,
                             linkedCancellation.Token).ConfigureAwait(false);
                     }
                 }
@@ -359,13 +385,11 @@ namespace DS4Windows
                 }
 
                 readinessCancellation.Cancel();
-                SignalChanged();
             }
 
             public async Task CheckRemovalNowAsync()
             {
                 BeginTeardown();
-                SignalChanged();
                 if (await TryReleaseAfterRemovalAsync().ConfigureAwait(false))
                     return;
 
@@ -380,8 +404,23 @@ namespace DS4Windows
                 }
 
                 if (startMonitor)
+                {
+                    // Discard attach/readiness pulses already reflected in the
+                    // explicit probe above. Fresh removal notifications still
+                    // wake the slower retained monitor immediately.
+                    try
+                    {
+                        endpointChanged.Wait(0);
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        return;
+                    }
+                    // Intentional fire-and-retain: the Task roots this Session
+                    // and is not canceled merely because a stop caller timed
+                    // out. Confirmed removal is its only successful terminus.
                     _ = Task.Run(MonitorRemovalAsync);
-                SignalChanged();
+                }
             }
 
             public void ReleaseBeforeOutputOpen()
@@ -513,17 +552,20 @@ namespace DS4Windows
 
             private async Task MonitorRemovalAsync()
             {
-                while (!await TryReleaseAfterRemovalAsync().ConfigureAwait(false))
+                while (true)
                 {
                     try
                     {
-                        await endpointChanged.WaitAsync(EndpointPollInterval)
+                        await endpointChanged.WaitAsync(removalPollInterval)
                             .ConfigureAwait(false);
                     }
                     catch (ObjectDisposedException)
                     {
                         return;
                     }
+
+                    if (await TryReleaseAfterRemovalAsync().ConfigureAwait(false))
+                        return;
                 }
             }
 
@@ -573,10 +615,23 @@ namespace DS4Windows
                     }
                     catch (Exception ex)
                     {
-                        log($"[native] Could not confirm virtual audio removal; " +
-                            $"the render keepalive remains active: {ex.Message}", true);
+                        bool shouldLog;
+                        lock (stateGate)
+                        {
+                            shouldLog = !probeFailureLogged;
+                            probeFailureLogged = true;
+                        }
+                        if (shouldLog)
+                        {
+                            log($"[native] Could not confirm virtual audio removal; " +
+                                $"the render keepalive remains active: {ex.Message}",
+                                true);
+                        }
                         return false;
                     }
+
+                    lock (stateGate)
+                        probeFailureLogged = false;
 
                     // Require both signals. An endpoint can become inactive while
                     // the parent still exists; disposing at that point could be

@@ -259,6 +259,80 @@ public class NativeModeRenderKeepaliveTests
     }
 
     [TestMethod]
+    public async Task RetainedRemovalMonitor_PollsAtRemovalIntervalNotReadinessInterval()
+    {
+        var accessor = new FakeEndpointAccessor();
+        var notifications = new FakeNotificationSource();
+        var factory = new FakeOutputFactory();
+        var presence = new FakeDeviceIdentity { Present = true };
+        NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
+            notifications, factory, presence,
+            removalPollInterval: TimeSpan.FromMilliseconds(400));
+        keepalive.BeginSession();
+        accessor.Add("virtual-render", "DualSense Wireless Controller");
+        await keepalive.WaitForReadyAsync(TimeSpan.FromSeconds(1));
+
+        keepalive.BeginTeardown();
+        await keepalive.CompleteTeardownAsync();
+        int checksAfterExplicitProbe = presence.CheckCount;
+
+        await Task.Delay(150);
+        Assert.AreEqual(checksAfterExplicitProbe, presence.CheckCount,
+            "The retained monitor must not continue the 100 ms readiness poll.");
+        await WaitUntilAsync(() => presence.CheckCount > checksAfterExplicitProbe);
+
+        accessor.Remove("virtual-render");
+        presence.Present = false;
+        notifications.Notify();
+        await WaitUntilAsync(() => factory.Output.DisposeCount == 1);
+    }
+
+    [TestMethod]
+    public async Task RemovalProbeFailure_LogsOnceUntilAProbeRecovers()
+    {
+        var accessor = new FakeEndpointAccessor();
+        var notifications = new FakeNotificationSource();
+        var factory = new FakeOutputFactory();
+        var presence = new FakeDeviceIdentity { Present = true };
+        var warnings = new ConcurrentQueue<string>();
+        NativeModeRenderKeepalive keepalive = CreateKeepalive(accessor,
+            notifications, factory, presence,
+            (message, warning) =>
+            {
+                if (warning)
+                    warnings.Enqueue(message);
+            }, removalPollInterval: TimeSpan.FromMilliseconds(30));
+        keepalive.BeginSession();
+        accessor.Add("virtual-render", "DualSense Wireless Controller");
+        await keepalive.WaitForReadyAsync(TimeSpan.FromSeconds(1));
+
+        presence.ThrowOnIsPresent = true;
+        keepalive.BeginTeardown();
+        await keepalive.CompleteTeardownAsync();
+        await WaitUntilAsync(() => presence.CheckCount >= 3);
+        Assert.AreEqual(1, warnings.Count(message =>
+            message.Contains("Could not confirm virtual audio removal",
+                StringComparison.Ordinal)));
+
+        presence.ThrowOnIsPresent = false;
+        int beforeRecovery = presence.CheckCount;
+        await WaitUntilAsync(() => presence.CheckCount > beforeRecovery);
+
+        presence.ThrowOnIsPresent = true;
+        int beforeSecondFailure = presence.CheckCount;
+        await WaitUntilAsync(() => presence.CheckCount > beforeSecondFailure);
+        await WaitUntilAsync(() => warnings.Count(message =>
+            message.Contains("Could not confirm virtual audio removal",
+                StringComparison.Ordinal)) == 2);
+
+        presence.ThrowOnIsPresent = false;
+        presence.Present = false;
+        accessor.Remove("virtual-render");
+        notifications.Notify();
+        await WaitUntilAsync(() => factory.Output.DisposeCount == 1);
+    }
+
+    [TestMethod]
     public async Task NewPhysicalUsbDualSense_IsNotClaimedAsVirtualEndpoint()
     {
         var accessor = new FakeEndpointAccessor();
@@ -346,9 +420,13 @@ public class NativeModeRenderKeepaliveTests
 
     private static NativeModeRenderKeepalive CreateKeepalive(
         FakeEndpointAccessor accessor, FakeNotificationSource notifications,
-        FakeOutputFactory factory, FakeDeviceIdentity presence) =>
+        FakeOutputFactory factory, FakeDeviceIdentity presence,
+        Action<string, bool> log = null,
+        TimeSpan? readinessPollInterval = null,
+        TimeSpan? removalPollInterval = null) =>
         new NativeModeRenderKeepalive(accessor, notifications, factory, presence,
-            (_, _) => { });
+            log ?? ((_, _) => { }), readinessPollInterval,
+            removalPollInterval);
 
     private static async Task RemoveAndReleaseAsync(
         NativeModeRenderKeepalive keepalive, FakeEndpointAccessor accessor,
@@ -506,6 +584,7 @@ public class NativeModeRenderKeepaliveTests
     private sealed class FakeDeviceIdentity : INativeModeVirtualDeviceIdentity
     {
         public volatile bool Present;
+        public volatile bool ThrowOnIsPresent;
         public int CheckCount;
         public HashSet<string> OwnedEndpointIds { get; } =
             new(StringComparer.OrdinalIgnoreCase) { "virtual-render" };
@@ -513,6 +592,8 @@ public class NativeModeRenderKeepaliveTests
         public bool IsPresent()
         {
             Interlocked.Increment(ref CheckCount);
+            if (ThrowOnIsPresent)
+                throw new InvalidOperationException("present-device probe failed");
             return Present;
         }
 

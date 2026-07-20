@@ -43,7 +43,9 @@ namespace DS4Windows
             if (protectedStartup == null)
                 throw new ArgumentNullException(nameof(protectedStartup));
 
-            NativeModeAudioDefaultsSnapshot snapshot = captureAudioDefaults();
+            NativeModeAudioDefaultsSnapshot snapshot = captureAudioDefaults() ??
+                throw new InvalidOperationException(
+                    "Native Mode cannot start without an audio-default snapshot.");
             beginAudioDefaultGuard(snapshot);
             await protectedStartup().ConfigureAwait(false);
         }

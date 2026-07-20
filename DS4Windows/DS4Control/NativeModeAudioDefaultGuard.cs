@@ -182,7 +182,9 @@ namespace DS4Windows
             {
                 log($"[native] Could not snapshot the current audio defaults: {ex.Message}",
                     true);
-                return null;
+                throw new InvalidOperationException(
+                    "Native Mode cannot start without a complete audio-default " +
+                    "endpoint snapshot.", ex);
             }
         }
 
@@ -194,16 +196,30 @@ namespace DS4Windows
         /// </summary>
         public void BeginSession(NativeModeAudioDefaultsSnapshot snapshot)
         {
-            EndSession(restoreDefaultsNow: false);
             if (snapshot == null)
-                return;
+                throw new ArgumentNullException(nameof(snapshot));
+
+            EndSession(restoreDefaultsNow: false);
 
             var session = new NativeModeAudioDefaultSession(snapshot, accessor,
                 notificationSource, workQueue, log);
             lock (sessionGate)
                 currentSession = session;
 
-            session.Start();
+            try
+            {
+                session.Start();
+            }
+            catch
+            {
+                lock (sessionGate)
+                {
+                    if (ReferenceEquals(currentSession, session))
+                        currentSession = null;
+                }
+                session.Stop(restoreDefaultsNow: false);
+                throw;
+            }
         }
 
         /// <summary>
@@ -280,13 +296,17 @@ namespace DS4Windows
                 IDisposable newRegistration;
                 try
                 {
-                    newRegistration = notificationSource.Subscribe(QueueReconcile);
+                    newRegistration = notificationSource.Subscribe(QueueReconcile) ??
+                        throw new InvalidOperationException(
+                            "The audio notification source returned no registration.");
                 }
                 catch (Exception ex)
                 {
                     log($"[native] Could not monitor Windows audio defaults: {ex.Message}",
                         true);
-                    return;
+                    throw new InvalidOperationException(
+                        "Native Mode cannot start without Windows audio-default " +
+                        "change monitoring.", ex);
                 }
 
                 bool discardRegistration;
@@ -388,8 +408,9 @@ namespace DS4Windows
                 }
                 catch (Exception ex)
                 {
-                    // Audio policy is best effort and must never fail native
-                    // mode startup or teardown.
+                    // Establishing the snapshot and notification subscription is
+                    // mandatory. After that boundary, an individual policy call
+                    // remains retryable and must not escape a COM callback.
                     log($"[native] Could not preserve Windows audio defaults: " +
                         ex.Message, true);
                 }

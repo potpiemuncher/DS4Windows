@@ -72,6 +72,19 @@ DS4Windows (WPF, may be non-elevated)
 
 ### Elevation broker: pre-authorized scheduled task (one UAC, ever)
 
+Current lifecycle guarantees implemented around that architecture:
+
+- Before any protected startup action, DS4Windows must capture a non-null
+  render/capture default-endpoint snapshot and register the Windows audio
+  notification monitor. Failure of either prerequisite aborts Native Mode.
+- Arrival and removal use `SetupDiGetClassDevs` with
+  `DIGCF_PRESENT | DIGCF_ALLCLASSES`, then match only the fixed parent instance
+  `USB\VID_054C&PID_0CE6\DS4WSPKCOMP001`; cached/phantom devnodes do not count.
+- Teardown keeps the render stream and other protections when a removal probe
+  fails or either the endpoint or exact present parent remains. A deliberately
+  retained monitor handles notifications and a slower one-second removal poll;
+  probe failures log once until a successful probe recovers.
+
 `usbip attach` requires admin. To avoid a UAC prompt per session:
 
 - First Start Native Mode run (or an explicit "Set up native mode" button)
