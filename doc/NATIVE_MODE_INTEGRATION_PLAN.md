@@ -1,26 +1,28 @@
 # One-Click Native DualSense Mode — Integration Plan
 
-Status: IMPLEMENTED 2026-07-19 — all five phases coded by Codex (GPT-5.6) via
-codex-bridge, each phase reviewed, independently rebuilt/retested, and pushed
-by Claude (commits 7af4df3, dc0740b, 9a2ab5e, 5459065, 0830efc; 61 NativeMode
-tests + 12 haptics tests green; whole-feature audit: no detach calls, no mic
-flags, schtasks via absolute System32 path, only the intended child-tree
-kill). LIVE VALIDATION PENDING — checklist at the bottom; also still pending:
-one `dotnet publish utils/VirtualDualSenseUsbip -c Release -o
-utils/VirtualDualSenseUsbip/obj/native-staging` run (blocked today only
-because the live gameplay session locks the emulator's bin output) followed
-by a packaged release-shaped build.
+Status: OFFLINE CANDIDATE BUILT AND VALIDATED 2026-07-20. The isolated branch
+`feature/native-mode-bsod-mitigation` contains the authorized checkpoint plus
+the reviewed BSOD mitigations through code commit
+`6cc5ae731ef3592ab34a5be2251a6779ab2f674f`. The unapproved Bluetooth-streamer
+overhaul `9e9872b` is excluded. The fresh package is
+`C:\Users\patri\PS5Haptics\native-mode-bsod-guarded-build-20260720`.
+Live validation has not been performed and still requires Patrick's explicit
+approval.
 
-Live validation checklist (Claude + Patrick, next session):
-1. Publish staging + rebuild app; confirm native\ payload lands in output.
-2. First run: Set up native mode (single UAC creates the scheduled task).
+Controlled live-validation checklist:
+1. Confirm explicit approval, the package hashes in `BUILD-INFO.txt`, trace
+   readiness, the bounded scenario, and the stop procedure.
+2. Confirm the existing elevation task. Re-run setup only if it is missing or
+   `UsbipExePath` changed.
 3. Start Native Mode: pad releases, child serves, silent attach, status
-   Attached; Black Flag full-native check (input/triggers/haptics/speaker).
-4. Stop: unplug + reclaim, mapping works again. App-exit-while-active also
-   tears down. Rapid Start/Stop clicking stays sane.
-5. Pad idle-timeout: auto-stop, pad reclaims on PS press, status hint shown.
-6. Elevated-DS4Windows direct-attach bypass path.
-7. GUI log stays free of periodic ISO/AUDIO stat lines.
+   Attached; confirm Windows render/capture defaults remain on Sonar.
+4. Black Flag: input, triggers, native haptics telemetry, speaker effect, and
+   the independent native speaker-volume control.
+5. Stop Native Mode: virtual child disappears before the render keepalive and
+   default-audio protections release; DS4Windows then reclaims the pad.
+6. Only after the initial checks pass, run one bounded alt-tab/pin-cycle drill.
+7. Exercise app-exit, pad-loss, and rapid Start/Stop only as separately agreed
+   follow-ups, not in the first validation run.
 
 ## Goal
 
@@ -159,29 +161,28 @@ If DS4Windows itself is elevated, skip the task and invoke usbip directly.
   reappears within 60 s — only if clean to implement.)
 - Only ONE native session at a time; Start disabled while a session exists.
 
-## Build & test contract (Codex: follow exactly)
+## Build & test contract
 
-- Main app: `dotnet build .\DS4Windows\DS4WinWPF.csproj -c Release /p:platform=x64`
-  from `C:\Users\patri\PS5Haptics\DS4Windows`.
-- **VirtualDualSenseUsbip: build ONLY with `-o <temp dir>`** — its default
-  bin exe is LOCKED by the live gameplay session right now. Do not kill any
-  running VirtualDualSenseUsbip/DS4Windows process; do not run serve/attach;
-  do not touch the Bluetooth pad. Offline validation only:
-  `<tempout>\VirtualDualSenseUsbip.exe servertest utils\DSCompatProbe\fixtures\dualsense_usb_0ce6`.
-- Focused tests: `dotnet test .\DS4WindowsTests\DS4WindowsTests.csproj
-  --filter FullyQualifiedName~DualSenseHapticsStreamerTests` must stay green
-  (12/12); add NativeModeManager parser tests beside them. The 3 profile-XML
-  snapshot failures in the FULL suite are pre-existing upstream — ignore.
-- Commit per phase on `feature/bt-audio-haptics`, imperative messages,
-  crediting line: `Co-Authored-By: Codex (GPT-5.6) <noreply@openai.com>`.
+- Always publish the server to a new commit-keyed staging directory and give
+  it a separate `BaseOutputPath`; `dotnet publish -o` reuses stale files.
+- Build the app to a new commit-keyed output and pass
+  `NativeDualSensePublishDir` explicitly. Refuse to reuse an existing package
+  directory.
+- Required package payloads are `native\VirtualDualSenseUsbip.exe`,
+  `native\VirtualDualSenseUsbip.dll`, and
+  `native\fixtures\dualsense_usb_0ce6\configuration.bin`.
+- Run server `selftest`, `devicetest`, and repeated `servertest` from the
+  fresh publish output. Do not validate a stale default `bin` output.
+- Run the focused filter
+  `FullyQualifiedName~NativeMode|FullyQualifiedName~Haptics` and the complete
+  DS4WindowsTests assembly. At the 2026-07-20 checkpoint these were 143/143
+  focused and 150/153 full; the three full-suite failures are the pre-existing
+  XML snapshots.
+- Offline builds and tests do not require or access a connected controller.
+  Never run `serve`, attach, a scheduled attach task, or a hardware/game test
+  without explicit approval.
 
-## Live validation (after Patrick's session — Claude + Patrick)
+## Live validation (explicit approval required)
 
-1. Fresh boot of DS4Windows build → DualSense tab → Set up elevation (one
-   UAC) → Start Native Mode → pad releases, child serves, attach lands,
-   status Attached.
-2. Black Flag: input + triggers + haptics + sail-through-speaker all work.
-3. Stop Native Mode → virtual pad unplugs, DS4Windows reclaims the pad,
-   mapping works again. App-exit-while-active also tears down.
-4. Pad idle-timeout drill: let it power off → status shows pad lost →
-   press PS → Start again.
+Use the controlled checklist at the top of this document. The first run is
+intentionally bounded; later lifecycle drills are separate validation steps.
