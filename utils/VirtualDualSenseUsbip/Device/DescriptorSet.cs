@@ -32,6 +32,7 @@ public sealed class DescriptorSet
     public ushort DeviceBcd { get; }
     public byte NumConfigurations { get; }
     public byte NumInterfaces { get; }
+    public byte ConfigurationDescriptorValue { get; }
     public int ConfigurationDescriptorLength => configuration.Length;
     public IReadOnlyList<UsbInterfaceDescriptorInfo> Interfaces { get; }
     public IReadOnlyList<UsbEndpointDescriptorInfo> Endpoints { get; }
@@ -51,6 +52,7 @@ public sealed class DescriptorSet
         DeviceBcd = (ushort)(device[12] | (device[13] << 8));
         NumConfigurations = device[17];
         NumInterfaces = configuration[4];
+        ConfigurationDescriptorValue = configuration[5];
         (Interfaces, Endpoints) = ParseTopology(configuration, NumInterfaces);
     }
 

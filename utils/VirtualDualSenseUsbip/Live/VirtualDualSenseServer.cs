@@ -591,11 +591,10 @@ internal sealed class UsbIpDeviceSession
             setup.Recipient == UsbSetupPacket.RecipientInterface &&
             setup.Request == UsbStandardRequest.SetInterface &&
             isochronousOutInterfaces.ContainsKey((byte)setup.Index);
-        bool isDeconfigure =
+        bool isSetConfiguration =
             setup.Type == UsbSetupPacket.TypeStandard &&
             setup.Recipient == UsbSetupPacket.RecipientDevice &&
-            setup.Request == UsbStandardRequest.SetConfiguration &&
-            setup.Value == 0;
+            setup.Request == UsbStandardRequest.SetConfiguration;
         if (isPlaybackSetInterface)
         {
             byte interfaceNumber = (byte)setup.Index;
@@ -641,7 +640,7 @@ internal sealed class UsbIpDeviceSession
             }
 
         }
-        else if (isDeconfigure)
+        else if (isSetConfiguration)
         {
             await isochronousOutLifecycleGate.WaitAsync(cancellationToken);
             try
@@ -671,7 +670,6 @@ internal sealed class UsbIpDeviceSession
                         quiescedGenerations.Add(new QuiescedIsochronousGeneration(
                             interfaceNumber, previous.Generation, DeadlineTimestamp: 0));
                     }
-                    controlEndpoint.ResetInterfaceAltSettings();
                 }
             }
             finally
@@ -994,7 +992,7 @@ internal sealed class UsbIpDeviceSession
 
         if (stranded > 0)
         {
-            log($"ISO OUT quiesce watchdog found {stranded} unlinked transfer(s) " +
+            log($"FatalUsbIpSession: ISO OUT quiesce watchdog found {stranded} unlinked transfer(s) " +
                 $"from interface {quiesced.InterfaceNumber} generation " +
                 $"{quiesced.Generation}; closing this USB/IP session without RET_SUBMIT.");
             throw new IOException("ISO OUT quiesce timed out waiting for UNLINK.");

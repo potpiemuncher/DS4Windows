@@ -71,7 +71,18 @@ public sealed class ControlEndpoint
                 return descriptors.GetDescriptor(setup);
 
             case UsbStandardRequest.SetConfiguration:
+                if (setup.DeviceToHost ||
+                    setup.Recipient != UsbSetupPacket.RecipientDevice ||
+                    setup.Index != 0 || setup.Length != 0 ||
+                    setup.Value > byte.MaxValue ||
+                    (setup.Value != 0 &&
+                     setup.Value != descriptors.ConfigurationDescriptorValue))
+                {
+                    return ControlResult.Stalled();
+                }
+
                 ConfigurationValue = (byte)setup.Value;
+                ResetInterfaceAltSettings();
                 return ControlResult.Ack();
 
             case UsbStandardRequest.GetConfiguration:
