@@ -317,6 +317,21 @@ namespace DS4Windows
             }
         }
 
+        // Transposes the envelope of high-frequency content (above the
+        // low-pass cutoff) onto a tactile carrier instead of discarding it,
+        // so sharp transients like gunshots stay feelable. Experimental.
+        private bool btHapticsHFTexture = false;
+        public bool BTHapticsHFTexture
+        {
+            get => btHapticsHFTexture;
+            set
+            {
+                if (btHapticsHFTexture == value) return;
+                btHapticsHFTexture = value;
+                BTHapticsOptionChanged?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
         private string btHapticsAudioDeviceId = string.Empty;
         public string BTHapticsAudioDeviceId
         {

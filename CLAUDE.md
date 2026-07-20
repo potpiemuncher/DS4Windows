@@ -1,6 +1,8 @@
 # DS4Windows Bluetooth Audio/Haptics Project Handoff
 
-Last updated: 2026-07-19 (second session: native speaker audio + microphone)
+Last updated: 2026-07-19 (third session: in-app streamer audio-quality
+overhaul — see "In-App Streamer Audio Quality Overhaul" below; NEEDS one
+live listen test before the new build is trusted)
 
 ## Mission
 
@@ -223,6 +225,79 @@ At 10:50:45 the controller logged read failure 1167 and Windows `HidBth` event 2
 (out of range or unresponsive). The user confirmed the controller had reached
 its idle timeout and powered off, then manually turned it back on. It reconnected
 normally; this event is not evidence of a writer or teardown regression.
+
+## In-App Streamer Audio Quality Overhaul (2026-07-19, third session)
+
+`DualSenseHapticsStreamer` was rebuilt around the delivery design the usbip
+speaker relay already proved live ("99%", zero underruns). Full analysis in
+`C:\Users\patri\PS5Haptics\AUDIO-QUALITY-IDEAS-20260719.md`. The 0x36
+container, Opus contract (160 kbps CBR, 200-byte frames), 45 kHz delivery
+rule, and amp setup are all unchanged. What changed:
+
+Reliability (ported from the validated usbip relay):
+
+- **Adaptive rate servo**: integral servo (gain 3e-5/frame-error, authority
+  ±2.5 %) trims the capture resampler's output rate onto the pad's real
+  consumption clock using the PCM backlog as the error signal. This removes
+  the capture-clock/Stopwatch drift that caused periodic underrun/overflow
+  hiccups no buffer depth could fix. Trim applied via `SetRates` on the
+  capture callback thread only.
+- **Stall-skip**: with audio enabled, missed slots beyond two are skipped
+  instead of burst-caught-up (a burst dequeues one frame per report and
+  drains the prebuffer). Haptics-only keeps the `MaxCatchupMs` catch-up for
+  rumble timing.
+- **Silence gate**: when neither the source (-46 dBFS, 2 s window) nor the
+  haptic channel is active, the stream stops after a 6-report tail instead
+  of burning ~37 kB/s forever; the local PCM ring is trimmed to the
+  prebuffer target so resume latency stays nominal. Pure-rumble-synth idle
+  suppression is unchanged.
+- **Encode-on-demand, state-coherent silence**: the OpusFrameQueue is gone;
+  exactly one frame is encoded per tick at send time. Underrun fillers are
+  decay-to-zero frames encoded through the LIVE encoder (the old
+  pre-encoded silence frame desynchronized the pad's decoder state and
+  clicked at every underrun), and the first content frame after a rebuffer
+  or backlog drop gets a ~5 ms fade-in.
+- **Adaptive prebuffer**: underruns escalate the local prebuffer target one
+  frame (bounded by ring headroom); ~3 clean minutes decay it back toward
+  the profile base. LowLatency users get automatic stability on bad links.
+- **Scheduling**: MMCSS "Pro Audio" registration, high-resolution waitable
+  timer (fallback Thread.Sleep), and refcounted
+  `GCLatencyMode.SustainedLowLatency` while any streamer runs (GC pauses
+  were an observed stall source in the usbip relay logs).
+- **Health telemetry**: a ~30 s interval line logs underruns / ring drops /
+  stall-skips / slow writes / max write ms / servo trim ppm / prebuffer
+  target, only when something was nonzero.
+
+Quality (same bits, spent better):
+
+- Opus encoder complexity 5 → 10 (pure quality dial at fixed CBR).
+- WdlResampler linear-interp mode → sinc mode (64/32) for capture → 45 kHz.
+- Haptics anti-alias filter is now 4th-order (two cascaded biquads); the old
+  single 2nd-order stage let bright content alias into the tactile band.
+- 1-LSB TPDF dither on the 8-bit haptic quantization
+  (`DitherQuantizeU8`; exact digital zero passes through untouched so
+  silence detection still works).
+- **HF texture (experimental, default OFF)**: `BTHapticsHFTexture` option
+  (UI checkbox under the low-pass slider) transposes the >cutoff band's
+  envelope onto a 180 Hz carrier so sharp transients (shots, hits) stay
+  feelable instead of being filtered out.
+
+Protocol-adjacent change needing a listen test:
+
+- **Controller-side dejitter depth (report bytes 5–9) now follows the
+  latency profile** (LowLatency 32 / Balanced 64 / Smooth 120). The
+  `LatencyProfile.ControllerBuffer` field existed before but was never
+  plumbed — every mode silently sent 0x20. All live validation to date used
+  0x20 (= LowLatency's value). Smooth is the default persisted mode, so
+  **the first stream start on this build must get a quick listen test**; if
+  the pad rejects deeper values (silence/garbled audio), revert bytes 5–9
+  to 0x20 in `WriteConfigAndState` (one line) and keep everything else.
+
+Validation state: 134/137 tests pass (13 new streamer tests; the 3 failures
+are the pre-existing profile-XML snapshots), Release x64 builds with the
+baseline 20 warnings, usbip selftest passes. NOT yet live-validated on the
+physical pad — the servo, gate resume, and ControllerBuffer values each
+want a short music + rumble listen test.
 
 ## Native-Game Haptics Validation (2026-07-19) — MILESTONE MET
 

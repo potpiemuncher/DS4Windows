@@ -1,3 +1,4 @@
+using DS4Windows;
 using DS4Windows.InputDevices;
 
 namespace DS4WindowsTests;
@@ -89,5 +90,102 @@ public class DualSenseHapticsStreamerTests
         Assert.IsTrue(right < 0.0f);
         Assert.IsTrue(Math.Abs(left) < 1.0f);
         Assert.IsTrue(Math.Abs(right) < 1.0f);
+    }
+
+    [TestMethod]
+    public void DitherQuantizeU8_ExactSilencePassesThrough()
+    {
+        // Dithered silence would defeat HasHapticSignal idle detection and the
+        // silence gate, so exact digital zero must always map to exactly 0x80.
+        uint state = 0x12345678;
+        for (int i = 0; i < 100; i++)
+        {
+            Assert.AreEqual((byte)0x80, DualSenseHapticsStreamer.DitherQuantizeU8(0.0, ref state));
+        }
+    }
+
+    [TestMethod]
+    public void DitherQuantizeU8_StaysWithinOneLsbOfUndithered()
+    {
+        const double x = 0.25;
+        double softClipped = x / (1.0 + Math.Abs(x));
+        int reference = (int)Math.Round(128.0 + softClipped * 127.0);
+
+        uint state = 0x9E3779B9;
+        for (int i = 0; i < 1000; i++)
+        {
+            byte q = DualSenseHapticsStreamer.DitherQuantizeU8(x, ref state);
+            Assert.IsTrue(Math.Abs(q - reference) <= 2,
+                $"dithered value {q} strayed more than 2 LSB from {reference}");
+        }
+    }
+
+    [DataTestMethod]
+    [DataRow(1.0, DualSenseHapticsStreamer.AUDIO_RATE_TRIM_LIMIT)]
+    [DataRow(-1.0, -DualSenseHapticsStreamer.AUDIO_RATE_TRIM_LIMIT)]
+    [DataRow(0.001, 0.001)]
+    public void ClampRateTrim_LimitsServoAuthority(double input, double expected)
+    {
+        Assert.AreEqual(expected, DualSenseHapticsStreamer.ClampRateTrim(input), 1e-12);
+    }
+
+    [TestMethod]
+    public void BuildFillerFrame_DecaysToSilenceWithoutStep()
+    {
+        short[] pcm = new short[960];
+        double lastL = 16000.0, lastR = -12000.0;
+
+        DualSenseHapticsStreamer.BuildFillerFrame(pcm, ref lastL, ref lastR);
+
+        // First sample continues from the previous output (no step discontinuity)
+        Assert.IsTrue(Math.Abs(pcm[0] - 16000.0 * 0.985) < 2.0);
+        Assert.IsTrue(Math.Abs(pcm[1] + 12000.0 * 0.985) < 2.0);
+
+        // A second filler frame is effectively silent
+        DualSenseHapticsStreamer.BuildFillerFrame(pcm, ref lastL, ref lastR);
+        Assert.IsTrue(Math.Abs(lastL) < 1.0);
+        Assert.IsTrue(Math.Abs(lastR) < 1.0);
+    }
+
+    [TestMethod]
+    public void ApplyResumeFade_RampsInFromZero()
+    {
+        short[] pcm = new short[960];
+        Array.Fill(pcm, (short)10000);
+
+        DualSenseHapticsStreamer.ApplyResumeFade(pcm);
+
+        Assert.AreEqual(0, pcm[0]);
+        Assert.AreEqual(0, pcm[1]);
+        Assert.IsTrue(pcm[2] < 100); // early ramp stays near zero
+        // Beyond the fade window the content is untouched
+        Assert.AreEqual(10000, pcm[DualSenseHapticsStreamer.RESUME_FADE_FRAMES * 2]);
+    }
+
+    [DataTestMethod]
+    [DataRow(DualSenseControllerOptions.AudioLatencyMode.LowLatency, (byte)32)]
+    [DataRow(DualSenseControllerOptions.AudioLatencyMode.Balanced, (byte)64)]
+    [DataRow(DualSenseControllerOptions.AudioLatencyMode.Smooth, (byte)120)]
+    public void GetLatencyProfile_CarriesControllerDejitterDepth(
+        DualSenseControllerOptions.AudioLatencyMode mode, byte expectedBuffer)
+    {
+        Assert.AreEqual(expectedBuffer,
+            DualSenseHapticsStreamer.GetLatencyProfile(mode).ControllerBuffer);
+    }
+
+    [DataTestMethod]
+    [DataRow(DualSenseControllerOptions.AudioLatencyMode.LowLatency)]
+    [DataRow(DualSenseControllerOptions.AudioLatencyMode.Balanced)]
+    [DataRow(DualSenseControllerOptions.AudioLatencyMode.Smooth)]
+    public void GetLatencyProfile_LeavesAdaptiveRingHeadroom(
+        DualSenseControllerOptions.AudioLatencyMode mode)
+    {
+        var profile = DualSenseHapticsStreamer.GetLatencyProfile(mode);
+        int ringFrames = profile.AudioRingSamples / 960;
+
+        // The adaptive prebuffer escalates up to ringFrames - 4; the base
+        // target must leave at least that headroom to escalate into.
+        Assert.IsTrue(profile.PrebufferFrames + 4 <= ringFrames,
+            $"{mode}: prebuffer {profile.PrebufferFrames}f has no headroom in {ringFrames}f ring");
     }
 }

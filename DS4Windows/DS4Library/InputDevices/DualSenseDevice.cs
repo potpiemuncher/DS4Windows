@@ -510,6 +510,7 @@ namespace DS4Windows.InputDevices
             streamer.Configure(nativeOptionsStore.BTHapticsMode,
                 nativeOptionsStore.BTHapticsGain,
                 nativeOptionsStore.BTHapticsLowPassHz,
+                nativeOptionsStore.BTHapticsHFTexture,
                 nativeOptionsStore.BTHapticsAudioDeviceId,
                 nativeOptionsStore.BTAudioEnabled,
                 nativeOptionsStore.BTAudioRoute,

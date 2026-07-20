@@ -104,6 +104,11 @@
                         <TextBlock Text="{Binding Options.BTHapticsLowPassHz}" Margin="8,4,0,0" VerticalAlignment="Center" MinWidth="32" />
                     </StackPanel>
 
+                    <CheckBox Content="High-frequency texture (experimental)"
+                              IsChecked="{Binding Options.BTHapticsHFTexture}"
+                              ToolTip="Sharp high-frequency sounds (shots, impacts) become a feelable pulse instead of being filtered out entirely."
+                              Margin="0,8,0,0" />
+
                     <Separator Margin="0,12,0,4" />
                     <TextBlock Text="Standard mode — Bluetooth Audio (headphones / speaker)" FontWeight="Bold" Margin="0,4,0,0" />
                     <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,2,0,0"

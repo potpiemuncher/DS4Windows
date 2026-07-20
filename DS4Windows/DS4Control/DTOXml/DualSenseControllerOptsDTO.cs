@@ -58,6 +58,12 @@ namespace DS4WinWPF.DS4Control.DTOXml
             get; set;
         } = 350;
 
+        [XmlElement("BTHapticsHFTexture")]
+        public bool BTHapticsHFTexture
+        {
+            get; set;
+        } = false;
+
         [XmlElement("BTHapticsAudioDeviceId")]
         public string BTHapticsAudioDeviceId
         {
@@ -113,6 +119,7 @@ namespace DS4WinWPF.DS4Control.DTOXml
             BTHapticsMode = source.BTHapticsMode;
             BTHapticsGain = source.BTHapticsGain;
             BTHapticsLowPassHz = source.BTHapticsLowPassHz;
+            BTHapticsHFTexture = source.BTHapticsHFTexture;
             BTHapticsAudioDeviceId = source.BTHapticsAudioDeviceId;
             BTAudioEnabled = source.BTAudioEnabled;
             BTAudioRoute = source.BTAudioRoute;
@@ -130,6 +137,7 @@ namespace DS4WinWPF.DS4Control.DTOXml
             destination.BTHapticsMode = BTHapticsMode;
             destination.BTHapticsGain = BTHapticsGain;
             destination.BTHapticsLowPassHz = BTHapticsLowPassHz;
+            destination.BTHapticsHFTexture = BTHapticsHFTexture;
             destination.BTHapticsAudioDeviceId = BTHapticsAudioDeviceId;
             destination.BTAudioEnabled = BTAudioEnabled;
             destination.BTAudioRoute = BTAudioRoute;

@@ -18,6 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 using System;
 using System.Diagnostics;
+using System.Runtime;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Concentus;
@@ -37,6 +38,14 @@ namespace DS4Windows.InputDevices
     /// Opus-encoded 48 kHz stereo frame (10 ms, 160 kbps CBR) routed to the
     /// controller's headphone jack or internal speaker.
     ///
+    /// Delivery reliability mirrors the design proven live in the usbip speaker
+    /// relay (BluetoothDualSenseInputSource): an integral rate servo trims the
+    /// capture resampler onto the pad's real consumption clock, stalls skip
+    /// slots instead of burst-catching-up, and the stream is silence-gated so
+    /// an idle source stops costing ~37 kB/s of 2.4 GHz airtime. Filler frames
+    /// are encoded through the live Opus encoder so decoder state stays
+    /// coherent across underruns (a spliced stale silence frame warbles).
+    ///
     /// Protocol research credit: egormanga/SAxense (haptics stream) and
     /// awalol/DS5Dongle (audio container, Opus parameters, routing).
     /// </summary>
@@ -45,7 +54,6 @@ namespace DS4Windows.InputDevices
         // 0x36 self-contained haptics report (state + signed 3 kHz PCM)
         private const int HAPTICS_REPORT_SIZE = 398;
         private const byte HAPTICS_REPORT_ID = 0x36;
-        private const byte HAPTICS_CONTROLLER_BUFFER = 0x20;
 
         // Packetized SetStateData command used to initialize the listening-audio amp.
         private const int STATE_SETUP_REPORT_SIZE = 142;
@@ -56,6 +64,7 @@ namespace DS4Windows.InputDevices
         private const byte AUDIO_REPORT_ID = 0x36;
         private const int OPUS_FRAME_BYTES = 200;      // CBR: 160 kbps * 10 ms / 8
         private const int OPUS_SAMPLES_PER_FRAME = 480; // one frame per report, per channel
+        private const int FRAME_SHORTS = OPUS_SAMPLES_PER_FRAME * 2; // interleaved stereo
         private const int AUDIO_SAMPLE_RATE = 48000;   // Opus codec rate
 
         // The controller consumes one 480-sample Opus frame per ~10.667 ms haptic
@@ -64,27 +73,54 @@ namespace DS4Windows.InputDevices
         // and drops frames audibly. Same reason DS5Dongle resamples 512->480.
         private const int AUDIO_DELIVERY_RATE = 45000;
 
+        // The PC capture clock and this loop's Stopwatch cadence are different
+        // crystals; without correction their drift slowly walks the frame
+        // backlog into an underrun or an overflow drop no matter how deep the
+        // buffers are. An integral servo trims the capture resampler's output
+        // rate using the backlog level as the error signal, exactly as the
+        // usbip speaker relay does (validated live: queue parks on target with
+        // zero dry-outs). Gain is per frame of error per tick; authority 2.5 %.
+        internal const double AUDIO_RATE_TRIM_GAIN = 0.00003;
+        internal const double AUDIO_RATE_TRIM_LIMIT = 0.025;
+
+        // Source-energy gate: the stream only runs while the capture source
+        // carried real energy recently (or haptics are active). Windows keeps
+        // idle render pins primed with silence indefinitely; streaming that
+        // costs airtime and pad battery for nothing. ~0.005 is about -46 dBFS.
+        private const double AUDIO_ENERGY_THRESHOLD = 0.005;
+        private const double SILENCE_GATE_MS = 2000.0;
+        private const int SILENCE_TAIL_REPORTS = 6;
+
+        // ~5 ms ramp applied to the first content frame after a rebuffer or a
+        // backlog drop so the resume edge is inaudible.
+        internal const int RESUME_FADE_FRAMES = 240;
+
+        // After an underrun the local prebuffer target escalates one frame
+        // (bounded by ring headroom); after this many clean ticks (~3 min) it
+        // decays one frame back toward the profile's base. Users get the
+        // latency they asked for on clean links and stability on bad ones.
+        private const long ADAPTIVE_DECAY_TICKS = 16875;
+
         /// <summary>
         /// One coherent set of buffer sizes for the whole pipeline. Bigger
         /// buffers survive congested links (2.4 GHz Wi-Fi, wireless headset
         /// dongles); smaller buffers cut end-to-end delay for game audio.
         /// </summary>
-        private readonly struct LatencyProfile
+        internal readonly struct LatencyProfile
         {
             public readonly byte ControllerBuffer;   // controller-side dejitter buffer [16,127]
-            public readonly int OpusQueueDepth;      // local frame backlog (frames of ~21.3 ms/2)
-            public readonly int OpusPrebufferFrames; // frames banked before playback starts
-            public readonly double MaxCatchupMs;     // burst catch-up window before resync
+            public readonly int PrebufferFrames;     // frames banked before playback starts
+            public readonly double MaxCatchupMs;     // haptics-only burst catch-up window
             public readonly int AudioRingSamples;    // capture ring feeding the encoder
             public readonly int HapticsRingBytes;    // capture ring feeding the actuators
             public readonly int HapticsPrebufferBytes;
 
-            public LatencyProfile(byte controllerBuffer, int queueDepth, int prebufferFrames,
-                double maxCatchupMs, int audioRingSamples, int hapticsRingBytes, int hapticsPrebufferBytes)
+            public LatencyProfile(byte controllerBuffer, int prebufferFrames,
+                double maxCatchupMs, int audioRingSamples, int hapticsRingBytes,
+                int hapticsPrebufferBytes)
             {
                 ControllerBuffer = controllerBuffer;
-                OpusQueueDepth = queueDepth;
-                OpusPrebufferFrames = prebufferFrames;
+                PrebufferFrames = prebufferFrames;
                 MaxCatchupMs = maxCatchupMs;
                 AudioRingSamples = audioRingSamples;
                 HapticsRingBytes = hapticsRingBytes;
@@ -92,20 +128,20 @@ namespace DS4Windows.InputDevices
             }
         }
 
-        private static LatencyProfile GetLatencyProfile(DualSenseControllerOptions.AudioLatencyMode latencyMode)
+        internal static LatencyProfile GetLatencyProfile(DualSenseControllerOptions.AudioLatencyMode latencyMode)
         {
             switch (latencyMode)
             {
                 case DualSenseControllerOptions.AudioLatencyMode.LowLatency:
                     // ~80-120 ms end to end; needs a clean link
-                    return new LatencyProfile(32, 4, 2, 100.0, AUDIO_DELIVERY_RATE * 2 / 10, 960, 192);
+                    return new LatencyProfile(32, 2, 100.0, FRAME_SHORTS * 12, 960, 192);
                 case DualSenseControllerOptions.AudioLatencyMode.Balanced:
                     // ~150-250 ms
-                    return new LatencyProfile(64, 6, 3, 150.0, AUDIO_DELIVERY_RATE * 2 * 3 / 20, 1440, 384);
+                    return new LatencyProfile(64, 3, 150.0, FRAME_SHORTS * 16, 1440, 384);
                 case DualSenseControllerOptions.AudioLatencyMode.Smooth:
                 default:
                     // ~300-400 ms; proven on congested 2.4 GHz environments
-                    return new LatencyProfile(120, 10, 4, 250.0, AUDIO_DELIVERY_RATE * 2 / 5, 1920, 576);
+                    return new LatencyProfile(120, 4, 250.0, FRAME_SHORTS * 20, 1920, 576);
             }
         }
 
@@ -133,6 +169,17 @@ namespace DS4Windows.InputDevices
         private const double ENVELOPE_ATTACK = 0.35;
         private const double ENVELOPE_RELEASE = 0.015;
 
+        // High-frequency texture synthesis: content above the haptic low-pass
+        // is normally discarded, so sharp transients (shots, hits, snares)
+        // contribute nothing to feel. When enabled, the 350 Hz..~4 kHz band's
+        // envelope amplitude-modulates a tactile carrier that is mixed under
+        // the direct low band — the same band-transposition idea Sony's own
+        // audio-to-vibration uses.
+        private const double HF_TEXTURE_CARRIER_HZ = 180.0;
+        private const double HF_TEXTURE_GAIN = 0.6;
+        private const double HF_TEXTURE_ATTACK_SECONDS = 0.005;
+        private const double HF_TEXTURE_RELEASE_SECONDS = 0.060;
+
         // Voice-coil haptics can reproduce rumble values that are too weak to
         // move a conventional eccentric motor. Some games continuously emit
         // those tiny values during stick movement, turning them into an
@@ -153,6 +200,7 @@ namespace DS4Windows.InputDevices
             DualSenseControllerOptions.HapticsMode.Off;
         private double gain = 3.0;
         private int lowPassHz = 350;
+        private bool hfTexture = false;
         private string endpointId = string.Empty;
         private bool audioEnabled = false;
         private DualSenseControllerOptions.AudioOutputRoute audioRoute =
@@ -164,6 +212,14 @@ namespace DS4Windows.InputDevices
 
         // Rumble-to-haptics synth state
         private double heavyEnv, lightEnv, heavyPhase, lightPhase;
+
+        // Rate-servo output applied by the capture callback; written by the
+        // stream thread, read by the WASAPI callback thread.
+        private double audioRateTrim;
+
+        // Stopwatch timestamp of the last capture buffer that carried real
+        // energy; drives the silence gate.
+        private long lastEnergyTimestamp;
 
         private byte seq;
         private byte packetCounter;
@@ -177,7 +233,7 @@ namespace DS4Windows.InputDevices
         }
 
         public void Configure(DualSenseControllerOptions.HapticsMode newMode,
-            double newGain, int newLowPassHz, string newEndpointId,
+            double newGain, int newLowPassHz, bool newHFTexture, string newEndpointId,
             bool newAudioEnabled, DualSenseControllerOptions.AudioOutputRoute newAudioRoute,
             int newAudioVolume, DualSenseControllerOptions.AudioLatencyMode newLatencyMode)
         {
@@ -188,8 +244,8 @@ namespace DS4Windows.InputDevices
                 newEndpointId ??= string.Empty;
                 newAudioVolume = Math.Clamp(newAudioVolume, 0, 100);
 
-                // Gain, volume, and routing apply live; anything that changes the
-                // pipeline shape needs a restart.
+                // Gain, volume, routing, and HF texture apply live; anything
+                // that changes the pipeline shape needs a restart.
                 if (running && newMode == mode && newLowPassHz == lowPassHz &&
                     newEndpointId == endpointId && newAudioEnabled == audioEnabled &&
                     newLatencyMode == latencyMode)
@@ -197,6 +253,7 @@ namespace DS4Windows.InputDevices
                     gain = newGain;
                     audioVolume = newAudioVolume;
                     audioRoute = newAudioRoute;
+                    hfTexture = newHFTexture;
                     return;
                 }
 
@@ -206,6 +263,7 @@ namespace DS4Windows.InputDevices
                 mode = newMode;
                 gain = newGain;
                 lowPassHz = newLowPassHz;
+                hfTexture = newHFTexture;
                 endpointId = newEndpointId;
                 audioEnabled = newAudioEnabled;
                 audioRoute = newAudioRoute;
@@ -284,18 +342,32 @@ namespace DS4Windows.InputDevices
             ShortRing audioRing = audioEnabled ? new ShortRing(profile.AudioRingSamples) : null;
             WasapiLoopbackCapture capture = null;
             IOpusEncoder opusEncoder = null;
+            IntPtr mmcssHandle = IntPtr.Zero;
+            IntPtr highResTimer = IntPtr.Zero;
 
+            EnterLatencySensitiveGC();
             try
             {
+                // MMCSS puts this thread in the same scheduling class WASAPI
+                // clients use; base priority alone still loses to scheduler
+                // jitter under load.
+                uint mmcssTaskIndex = 0;
+                try
+                {
+                    mmcssHandle = AvSetMmThreadCharacteristicsW("Pro Audio", ref mmcssTaskIndex);
+                }
+                catch (Exception) { mmcssHandle = IntPtr.Zero; }
+
+                highResTimer = CreateHighResTimer();
+
                 if (needCapture)
                 {
                     capture = CreateCapture(hapticsRing, audioRing);
                     capture?.StartRecording();
                 }
 
-                byte[] silenceOpus = null;
-                OpusFrameQueue opusQueue = null;
                 short[] pcmFrame = null;
+                byte[] opusA = null;
                 if (audioEnabled)
                 {
                     // The controller's audio amp defaults to muted volume; it only
@@ -310,21 +382,34 @@ namespace DS4Windows.InputDevices
                         OpusApplication.OPUS_APPLICATION_AUDIO);
                     opusEncoder.Bitrate = OPUS_FRAME_BYTES * 8 * 100;
                     opusEncoder.UseVBR = false;
-                    opusEncoder.Complexity = 5;
+                    // Complexity is a pure quality dial at fixed CBR bitrate;
+                    // one 10 ms encode per tick fits the slot with margin.
+                    opusEncoder.Complexity = 10;
 
-                    pcmFrame = new short[OPUS_SAMPLES_PER_FRAME * 2];
-                    silenceOpus = new byte[OPUS_FRAME_BYTES];
-                    EncodeOpusFrame(opusEncoder, new short[OPUS_SAMPLES_PER_FRAME * 2], silenceOpus);
-                    opusQueue = new OpusFrameQueue(profile.OpusQueueDepth, OPUS_FRAME_BYTES);
+                    pcmFrame = new short[FRAME_SHORTS];
+                    opusA = new byte[OPUS_FRAME_BYTES];
                 }
 
                 byte[] report = new byte[audioEnabled ? AUDIO_REPORT_SIZE : HAPTICS_REPORT_SIZE];
                 byte[] chunk = new byte[HAPTIC_CHUNK_BYTES];
-                byte[] opusA = new byte[OPUS_FRAME_BYTES];
                 bool primed = false;
                 bool audioPrimed = false;
+                bool needFadeIn = false;
+                double fillerL = 0.0, fillerR = 0.0;
+                int targetFrames = profile.PrebufferFrames;
+                int targetFramesCap = Math.Max(profile.PrebufferFrames,
+                    profile.AudioRingSamples / FRAME_SHORTS - 4);
+                int silenceTail = 0;
+                double rateTrim = 0.0;
+                long lastUnderrunTick = 0;
+
+                // Interval health telemetry (logged ~every 30 s when nonzero)
                 long audioUnderruns = 0;
-                long lastUnderrunLogTick = 0;
+                long stallSkips = 0;
+                long slowWrites = 0;
+                double maxWriteMs = 0.0;
+                long lastHealthLogTick = 0;
+
                 int consecutiveFailures = 0;
                 int firstWriteError = 0;
                 int lastWriteError = 0;
@@ -340,7 +425,7 @@ namespace DS4Windows.InputDevices
                     double wait = nextDeadlineMs - clock.Elapsed.TotalMilliseconds;
                     if (wait > 2.0)
                     {
-                        Thread.Sleep((int)(wait - 1.5));
+                        WaitPrecise(highResTimer, wait - 1.0);
                     }
 
                     while (!cancellationToken.IsCancellationRequested &&
@@ -354,67 +439,148 @@ namespace DS4Windows.InputDevices
                         break;
                     }
 
-                    // If we fall behind (a stalled BT write, a scheduler hiccup),
-                    // send back-to-back to catch up: the controller's dejitter
-                    // buffer absorbs the burst. Only resync (accepting an audio
-                    // gap) after a stall too large to catch up from.
-                    if (clock.Elapsed.TotalMilliseconds - nextDeadlineMs > profile.MaxCatchupMs)
+                    double behindMs = clock.Elapsed.TotalMilliseconds - nextDeadlineMs;
+                    if (audioEnabled)
                     {
+                        // A catch-up burst dequeues one audio frame per report and
+                        // instantly drains the prebuffer (a GC-pause burst was an
+                        // observed live artifact source in the usbip relay). Skip
+                        // the missed slots instead; the pad's dejitter buffer
+                        // already covered the stall on its side.
+                        if (behindMs > TICK_MS * 2.0)
+                        {
+                            int skip = (int)(behindMs / TICK_MS);
+                            nextDeadlineMs += skip * TICK_MS;
+                            stallSkips += skip;
+                        }
+                    }
+                    else if (behindMs > profile.MaxCatchupMs)
+                    {
+                        // Haptics-only: back-to-back catch-up preserves rumble
+                        // timing; only resync after a stall too large to absorb.
                         nextDeadlineMs = clock.Elapsed.TotalMilliseconds;
                     }
 
                     bool hapticsActive = FillHapticsChunk(chunk, hapticsRing,
                         useRumbleSynth, ref primed);
 
-                    // A continuous stream of nominally silent haptic packets can
-                    // leave the voice-coil actuators faintly energized. In the
-                    // pure rumble-synth pipeline there is no audio clock to
-                    // maintain, so send one final centered chunk after an effect
-                    // and stop writing until a real rumble signal arrives.
-                    bool idleRumbleSynth = !audioEnabled && !captureForHaptics &&
-                        useRumbleSynth && !hapticsActive;
-                    if (idleRumbleSynth && !synthStreamWasActive)
-                    {
-                        tick++;
-                        continue;
-                    }
+                    bool energyRecent = needCapture &&
+                        (Stopwatch.GetTimestamp() - Volatile.Read(ref lastEnergyTimestamp)) *
+                        1000.0 / Stopwatch.Frequency < SILENCE_GATE_MS;
 
-                    synthStreamWasActive = hapticsActive;
+                    if (needCapture)
+                    {
+                        // Silence gate: when neither the capture source nor the
+                        // haptic channel has anything to say, stop transmitting
+                        // after a short drain tail. An idle stream costs ~37 kB/s
+                        // of shared 2.4 GHz airtime and pad battery. Proven live
+                        // by the usbip speaker relay's energy gate.
+                        if (!hapticsActive && !energyRecent)
+                        {
+                            if (++silenceTail > SILENCE_TAIL_REPORTS)
+                            {
+                                if (audioEnabled)
+                                {
+                                    audioPrimed = false;
+                                    audioRing.TrimToNewest(targetFrames * FRAME_SHORTS);
+                                }
+
+                                tick++;
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            silenceTail = 0;
+                        }
+                    }
+                    else if (useRumbleSynth)
+                    {
+                        // A continuous stream of nominally silent haptic packets can
+                        // leave the voice-coil actuators faintly energized. In the
+                        // pure rumble-synth pipeline there is no audio clock to
+                        // maintain, so send one final centered chunk after an effect
+                        // and stop writing until a real rumble signal arrives.
+                        bool idleRumbleSynth = !hapticsActive;
+                        if (idleRumbleSynth && !synthStreamWasActive)
+                        {
+                            tick++;
+                            continue;
+                        }
+
+                        synthStreamWasActive = hapticsActive;
+                    }
 
                     if (audioEnabled)
                     {
-                        // Encode any pending captured audio into Opus frames.
-                        while (audioRing.ReadExact(pcmFrame))
-                        {
-                            byte[] frame = opusQueue.RentSlot();
-                            EncodeOpusFrame(opusEncoder, pcmFrame, frame);
-                            opusQueue.CommitSlot();
-                        }
-
-                        // One self-contained 0x36 report per haptic clock slot.
-                        // Each carries one 64-byte haptic chunk and one Opus frame.
-                        if (!audioPrimed && opusQueue.Count >= profile.OpusPrebufferFrames)
+                        int framesAvailable = audioRing.Count / FRAME_SHORTS;
+                        if (!audioPrimed && framesAvailable >= targetFrames)
                         {
                             audioPrimed = true;
+                            needFadeIn = true;
                         }
 
-                        bool gotAudio = audioPrimed && opusQueue.TryDequeue(opusA);
-                        if (!gotAudio)
-                        {
-                            Buffer.BlockCopy(silenceOpus, 0, opusA, 0, OPUS_FRAME_BYTES);
-                        }
-
+                        bool gotAudio = audioPrimed && audioRing.ReadExact(pcmFrame);
                         if (audioPrimed && !gotAudio)
                         {
                             audioPrimed = false; // ran dry: rebuffer before resuming
-                            audioUnderruns++;
+                            if (energyRecent)
+                            {
+                                audioUnderruns++;
+                                lastUnderrunTick = tick;
+                                targetFrames = Math.Min(targetFrames + 1, targetFramesCap);
+                            }
                         }
 
-                        if (audioUnderruns > 0 && tick - lastUnderrunLogTick > 2800) // ~30 s
+                        if (gotAudio)
                         {
-                            AppLogger.LogToGui($"{device.MacAddress}: BT audio underruns in last interval: {audioUnderruns}", false);
-                            audioUnderruns = 0;
-                            lastUnderrunLogTick = tick;
+                            if (audioRing.TakeDropFlag())
+                            {
+                                needFadeIn = true; // backlog drop: mask the splice
+                            }
+
+                            if (needFadeIn)
+                            {
+                                ApplyResumeFade(pcmFrame);
+                                needFadeIn = false;
+                            }
+
+                            fillerL = pcmFrame[FRAME_SHORTS - 2];
+                            fillerR = pcmFrame[FRAME_SHORTS - 1];
+                        }
+                        else
+                        {
+                            // No content: encode a decay-to-silence filler through
+                            // the LIVE encoder. Opus delta-codes state across
+                            // frames, so replaying a pre-encoded silence frame
+                            // desynchronizes the pad's decoder and clicks at every
+                            // underrun boundary; a live encode stays coherent.
+                            BuildFillerFrame(pcmFrame, ref fillerL, ref fillerR);
+                        }
+
+                        EncodeOpusFrame(opusEncoder, pcmFrame, opusA);
+
+                        if (audioPrimed)
+                        {
+                            // Integral servo: backlog below target => positive
+                            // error => raise the resampler's output rate so each
+                            // capture buffer yields more delivery-rate samples,
+                            // and vice versa. Converges on the true clock offset
+                            // within seconds and holds. Frozen while unprimed so
+                            // rebuffer transients cannot wind up the integral.
+                            double levelError = (targetFrames + 1) -
+                                audioRing.Count / (double)FRAME_SHORTS;
+                            rateTrim = ClampRateTrim(rateTrim + levelError * AUDIO_RATE_TRIM_GAIN);
+                            Volatile.Write(ref audioRateTrim, rateTrim);
+                        }
+
+                        // With a long clean run, decay the escalated prebuffer
+                        // back toward the profile's base latency.
+                        if (targetFrames > profile.PrebufferFrames &&
+                            tick - lastUnderrunTick > ADAPTIVE_DECAY_TICKS)
+                        {
+                            targetFrames--;
+                            lastUnderrunTick = tick;
                         }
 
                         BuildAudioReport(report, chunk, opusA);
@@ -424,7 +590,20 @@ namespace DS4Windows.InputDevices
                         BuildHapticsReport(report, chunk);
                     }
 
-                    if (hidDevice.WriteOutputReportViaInterrupt(report, 100, out int writeError))
+                    long writeStart = Stopwatch.GetTimestamp();
+                    bool wrote = hidDevice.WriteOutputReportViaInterrupt(report, 100, out int writeError);
+                    double writeMs = (Stopwatch.GetTimestamp() - writeStart) * 1000.0 / Stopwatch.Frequency;
+                    if (writeMs > maxWriteMs)
+                    {
+                        maxWriteMs = writeMs;
+                    }
+
+                    if (writeMs > 20.0)
+                    {
+                        slowWrites++;
+                    }
+
+                    if (wrote)
                     {
                         consecutiveFailures = 0;
                         firstWriteError = 0;
@@ -448,6 +627,24 @@ namespace DS4Windows.InputDevices
                         }
                     }
 
+                    if (tick - lastHealthLogTick > 2800) // ~30 s
+                    {
+                        long ringDrops = audioRing?.TakeDropCount() ?? 0;
+                        if (audioUnderruns > 0 || stallSkips > 0 || slowWrites > 0 || ringDrops > 0)
+                        {
+                            AppLogger.LogToGui($"{device.MacAddress}: BT stream health: " +
+                                $"underruns={audioUnderruns} drops={ringDrops} stallSkips={stallSkips} " +
+                                $"slowWrites={slowWrites} maxWrite={maxWriteMs:F1}ms " +
+                                $"trim={rateTrim * 1e6:F0}ppm prebuffer={targetFrames}f", false);
+                        }
+
+                        audioUnderruns = 0;
+                        stallSkips = 0;
+                        slowWrites = 0;
+                        maxWriteMs = 0.0;
+                        lastHealthLogTick = tick;
+                    }
+
                     tick++;
                 }
             }
@@ -468,6 +665,19 @@ namespace DS4Windows.InputDevices
                 }
 
                 (opusEncoder as IDisposable)?.Dispose();
+
+                if (highResTimer != IntPtr.Zero)
+                {
+                    CloseHandle(highResTimer);
+                }
+
+                if (mmcssHandle != IntPtr.Zero)
+                {
+                    try { AvRevertMmThreadCharacteristics(mmcssHandle); }
+                    catch (Exception) { }
+                }
+
+                ExitLatencySensitiveGC();
 
                 lock (stateLock)
                 {
@@ -590,6 +800,73 @@ namespace DS4Windows.InputDevices
             return (byte)Math.Clamp(128.0 + Math.Tanh(sample) * 127.0, 1.0, 255.0);
         }
 
+        internal static double ClampRateTrim(double trim)
+        {
+            return Math.Clamp(trim, -AUDIO_RATE_TRIM_LIMIT, AUDIO_RATE_TRIM_LIMIT);
+        }
+
+        /// <summary>
+        /// Soft-clips and quantizes one unit-range haptic sample to u8
+        /// offset-binary with 1-LSB TPDF dither. 8-bit quantization makes
+        /// quiet haptic tails feel granular; dither trades that for a far
+        /// less perceptible noise floor. Exact digital silence passes through
+        /// untouched so silence detection and idle gating still work.
+        /// </summary>
+        internal static byte DitherQuantizeU8(double x, ref uint rngState)
+        {
+            if (x == 0.0)
+            {
+                return 0x80;
+            }
+
+            double y = x / (1.0 + Math.Abs(x));
+            double dither = NextUnit(ref rngState) + NextUnit(ref rngState) - 1.0;
+            return (byte)Math.Clamp(Math.Round(128.0 + y * 127.0 + dither), 0.0, 255.0);
+        }
+
+        private static double NextUnit(ref uint state)
+        {
+            // xorshift32; cheap enough for one call per haptic sample.
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            return (state & 0xFFFFFF) / 16777216.0;
+        }
+
+        /// <summary>
+        /// Fills one PCM frame with an exponential decay from the last sent
+        /// sample pair toward digital silence, so an underrun ends in a fade
+        /// instead of a step discontinuity. Subsequent filler frames are
+        /// effectively silent.
+        /// </summary>
+        internal static void BuildFillerFrame(short[] pcm, ref double lastL, ref double lastR)
+        {
+            const double decay = 0.985; // reaches ~-45 dB across one 480-sample frame
+            double l = lastL;
+            double r = lastR;
+            for (int i = 0; i < pcm.Length / 2; i++)
+            {
+                l *= decay;
+                r *= decay;
+                pcm[i * 2] = (short)l;
+                pcm[i * 2 + 1] = (short)r;
+            }
+
+            lastL = l;
+            lastR = r;
+        }
+
+        /// <summary>Linear ~5 ms fade-in masking the resume edge after a rebuffer.</summary>
+        internal static void ApplyResumeFade(short[] pcm)
+        {
+            for (int i = 0; i < RESUME_FADE_FRAMES && i < pcm.Length / 2; i++)
+            {
+                double scale = i / (double)RESUME_FADE_FRAMES;
+                pcm[i * 2] = (short)(pcm[i * 2] * scale);
+                pcm[i * 2 + 1] = (short)(pcm[i * 2 + 1] * scale);
+            }
+        }
+
         private void EncodeOpusFrame(IOpusEncoder encoder, short[] pcm, byte[] dest)
         {
             int written = encoder.Encode(pcm, OPUS_SAMPLES_PER_FRAME, dest, dest.Length);
@@ -612,19 +889,7 @@ namespace DS4Windows.InputDevices
             report[1] = (byte)((seq & 0x0F) << 4);
             seq = (byte)((seq + 1) & 0x0F);
 
-            report[2] = 0x91; // config packet: PID 0x11 | sized
-            report[3] = 0x07;
-            report[4] = 0xFE;
-            report[5] = HAPTICS_CONTROLLER_BUFFER;
-            report[6] = HAPTICS_CONTROLLER_BUFFER;
-            report[7] = HAPTICS_CONTROLLER_BUFFER;
-            report[8] = HAPTICS_CONTROLLER_BUFFER;
-            report[9] = HAPTICS_CONTROLLER_BUFFER;
-            report[10] = ++packetCounter;
-
-            report[11] = 0x90; // SetStateData packet: PID 0x10 | sized
-            report[12] = (byte)HAPTICS_STATE.Length;
-            Buffer.BlockCopy(HAPTICS_STATE, 0, report, 13, HAPTICS_STATE.Length);
+            WriteConfigAndState(report);
 
             report[76] = 0x92; // haptic audio packet: PID 0x12 | sized
             report[77] = HAPTIC_CHUNK_BYTES;
@@ -649,19 +914,7 @@ namespace DS4Windows.InputDevices
             report[1] = (byte)((seq & 0x0F) << 4);
             seq = (byte)((seq + 1) & 0x0F);
 
-            report[2] = 0x91; // config packet: PID 0x11 | sized
-            report[3] = 0x07;
-            report[4] = 0xFE;
-            report[5] = HAPTICS_CONTROLLER_BUFFER;
-            report[6] = HAPTICS_CONTROLLER_BUFFER;
-            report[7] = HAPTICS_CONTROLLER_BUFFER;
-            report[8] = HAPTICS_CONTROLLER_BUFFER;
-            report[9] = HAPTICS_CONTROLLER_BUFFER;
-            report[10] = ++packetCounter;
-
-            report[11] = 0x90; // SetStateData packet: PID 0x10 | sized
-            report[12] = (byte)HAPTICS_STATE.Length;
-            Buffer.BlockCopy(HAPTICS_STATE, 0, report, 13, HAPTICS_STATE.Length);
+            WriteConfigAndState(report);
 
             report[76] = 0x92; // haptic packet: PID 0x12 | sized
             report[77] = HAPTIC_CHUNK_BYTES;
@@ -690,6 +943,27 @@ namespace DS4Windows.InputDevices
             Buffer.BlockCopy(opus, 0, report, 144, OPUS_FRAME_BYTES);
 
             ApplyCrc(report, AUDIO_REPORT_SIZE);
+        }
+
+        private void WriteConfigAndState(byte[] report)
+        {
+            report[2] = 0x91; // config packet: PID 0x11 | sized
+            report[3] = 0x07;
+            report[4] = 0xFE;
+            // Controller-side dejitter depth. All live validation to date used
+            // 0x20; deeper Balanced/Smooth values are within the documented
+            // [16,127] range but each needs one listen test on real hardware.
+            byte controllerBuffer = profile.ControllerBuffer;
+            report[5] = controllerBuffer;
+            report[6] = controllerBuffer;
+            report[7] = controllerBuffer;
+            report[8] = controllerBuffer;
+            report[9] = controllerBuffer;
+            report[10] = ++packetCounter;
+
+            report[11] = 0x90; // SetStateData packet: PID 0x10 | sized
+            report[12] = (byte)HAPTICS_STATE.Length;
+            Buffer.BlockCopy(HAPTICS_STATE, 0, report, 13, HAPTICS_STATE.Length);
         }
 
         /// <summary>
@@ -773,16 +1047,32 @@ namespace DS4Windows.InputDevices
 
                 int inRate = capture.WaveFormat.SampleRate;
                 int inChannels = capture.WaveFormat.Channels;
+
+                // Two cascaded biquads (4th-order, ~70 dB at the fold) before
+                // decimating to 3 kHz. The old single 2nd-order stage let bright
+                // content alias back into the tactile band as non-harmonic mud.
                 BiquadLowPass lpfL = hapticsRing != null ? new BiquadLowPass(lowPassHz, inRate) : null;
                 BiquadLowPass lpfR = hapticsRing != null ? new BiquadLowPass(lowPassHz, inRate) : null;
+                BiquadLowPass lpfL2 = hapticsRing != null ? new BiquadLowPass(lowPassHz, inRate) : null;
+                BiquadLowPass lpfR2 = hapticsRing != null ? new BiquadLowPass(lowPassHz, inRate) : null;
                 int decimPhase = 0;
+                uint ditherState = 0x9E3779B9;
+
+                // HF texture synthesis state
+                double hfEnvL = 0.0, hfEnvR = 0.0, hfPhase = 0.0;
+                double hfPhaseInc = 2.0 * Math.PI * HF_TEXTURE_CARRIER_HZ / inRate;
+                double hfAttack = 1.0 - Math.Exp(-1.0 / (HF_TEXTURE_ATTACK_SECONDS * inRate));
+                double hfRelease = 1.0 - Math.Exp(-1.0 / (HF_TEXTURE_RELEASE_SECONDS * inRate));
 
                 WdlResampler resampler = null;
                 float[] resampleOut = null;
                 if (audioRing != null)
                 {
                     resampler = new WdlResampler();
-                    resampler.SetMode(true, 2, false);
+                    // Sinc mode: materially better anti-aliasing than the
+                    // default linear-interpolation mode for 96k -> 45k, at a
+                    // still-trivial CPU cost.
+                    resampler.SetMode(true, 0, true, 64, 32);
                     resampler.SetFilterParms();
                     resampler.SetFeedMode(true);
                     resampler.SetRates(inRate, AUDIO_DELIVERY_RATE);
@@ -793,6 +1083,7 @@ namespace DS4Windows.InputDevices
                 {
                     double captureGain = gain;
                     double volumeScale = audioVolume / 100.0;
+                    bool textureEnabled = hfTexture;
                     ReadOnlySpan<float> samples = MemoryMarshal.Cast<byte, float>(
                         e.Buffer.AsSpan(0, e.BytesRecorded));
                     int frames = samples.Length / inChannels;
@@ -801,8 +1092,16 @@ namespace DS4Windows.InputDevices
                         return;
                     }
 
+                    bool energyFound = false;
+
                     if (audioRing != null)
                     {
+                        // Apply the stream thread's servo correction before
+                        // resampling this buffer; all resampler access stays on
+                        // the capture callback thread.
+                        double trim = Volatile.Read(ref audioRateTrim);
+                        resampler.SetRates(inRate, AUDIO_DELIVERY_RATE * (1.0 + trim));
+
                         float[] inBuffer;
                         int inOffset;
                         resampler.ResamplePrepare(frames, 2, out inBuffer, out inOffset);
@@ -810,6 +1109,13 @@ namespace DS4Windows.InputDevices
                         {
                             DownmixToStereo(samples, i * inChannels, inChannels,
                                 out float left, out float right);
+                            if (!energyFound &&
+                                (Math.Abs(left) > AUDIO_ENERGY_THRESHOLD ||
+                                 Math.Abs(right) > AUDIO_ENERGY_THRESHOLD))
+                            {
+                                energyFound = true;
+                            }
+
                             inBuffer[inOffset + i * 2] = left;
                             inBuffer[inOffset + i * 2 + 1] = right;
                         }
@@ -824,8 +1130,34 @@ namespace DS4Windows.InputDevices
                         {
                             DownmixToStereo(samples, i * inChannels, inChannels,
                                 out float left, out float right);
-                            double l = lpfL.Process(left);
-                            double r = lpfR.Process(right);
+                            if (audioRing == null && !energyFound &&
+                                (Math.Abs(left) > AUDIO_ENERGY_THRESHOLD ||
+                                 Math.Abs(right) > AUDIO_ENERGY_THRESHOLD))
+                            {
+                                energyFound = true;
+                            }
+
+                            double l = lpfL2.Process(lpfL.Process(left));
+                            double r = lpfR2.Process(lpfR.Process(right));
+
+                            if (textureEnabled)
+                            {
+                                double hfL = left - l;
+                                double hfR = right - r;
+                                double absL = Math.Abs(hfL);
+                                double absR = Math.Abs(hfR);
+                                hfEnvL += (absL - hfEnvL) * (absL > hfEnvL ? hfAttack : hfRelease);
+                                hfEnvR += (absR - hfEnvR) * (absR > hfEnvR ? hfAttack : hfRelease);
+                                double carrier = Math.Sin(hfPhase);
+                                l += hfEnvL * carrier * HF_TEXTURE_GAIN;
+                                r += hfEnvR * carrier * HF_TEXTURE_GAIN;
+                            }
+
+                            hfPhase += hfPhaseInc;
+                            if (hfPhase > 2.0 * Math.PI)
+                            {
+                                hfPhase -= 2.0 * Math.PI;
+                            }
 
                             decimPhase += SAMPLE_RATE;
                             if (decimPhase < inRate)
@@ -834,8 +1166,15 @@ namespace DS4Windows.InputDevices
                             }
 
                             decimPhase -= inRate;
-                            hapticsRing.Write(SoftClipToU8(l * captureGain), SoftClipToU8(r * captureGain));
+                            hapticsRing.Write(
+                                DitherQuantizeU8(l * captureGain, ref ditherState),
+                                DitherQuantizeU8(r * captureGain, ref ditherState));
                         }
+                    }
+
+                    if (energyFound)
+                    {
+                        Volatile.Write(ref lastEnergyTimestamp, Stopwatch.GetTimestamp());
                     }
                 };
 
@@ -923,10 +1262,100 @@ namespace DS4Windows.InputDevices
             right = MathF.Tanh(mixedRight);
         }
 
-        private static byte SoftClipToU8(double x)
+        // --- Scheduling support -------------------------------------------------
+
+        // GC pauses were an observed live artifact source (usbip relay stall
+        // logs). SustainedLowLatency while any streamer is active makes the
+        // runtime avoid blocking full collections. Refcounted across pads.
+        private static readonly object gcModeGate = new object();
+        private static int gcModeUsers;
+        private static GCLatencyMode gcPreviousMode;
+
+        private static void EnterLatencySensitiveGC()
         {
-            double y = x / (1.0 + Math.Abs(x));
-            return (byte)Math.Clamp(128.0 + y * 127.0, 0, 255);
+            lock (gcModeGate)
+            {
+                if (++gcModeUsers == 1)
+                {
+                    gcPreviousMode = GCSettings.LatencyMode;
+                    try { GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency; }
+                    catch (Exception) { }
+                }
+            }
+        }
+
+        private static void ExitLatencySensitiveGC()
+        {
+            lock (gcModeGate)
+            {
+                if (gcModeUsers > 0 && --gcModeUsers == 0)
+                {
+                    try { GCSettings.LatencyMode = gcPreviousMode; }
+                    catch (Exception) { }
+                }
+            }
+        }
+
+        private const uint CREATE_WAITABLE_TIMER_HIGH_RESOLUTION = 0x00000002;
+        private const uint TIMER_ALL_ACCESS = 0x1F0003;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateWaitableTimerExW(IntPtr attributes, IntPtr name,
+            uint flags, uint desiredAccess);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetWaitableTimer(IntPtr timer, ref long dueTime,
+            int period, IntPtr completionRoutine, IntPtr argToCompletionRoutine, bool resume);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("avrt.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr AvSetMmThreadCharacteristicsW(string taskName, ref uint taskIndex);
+
+        [DllImport("avrt.dll")]
+        private static extern bool AvRevertMmThreadCharacteristics(IntPtr handle);
+
+        /// <summary>
+        /// High-resolution waitable timer (Windows 10 1803+); IntPtr.Zero on
+        /// older systems, in which case the loop falls back to Thread.Sleep.
+        /// Sub-millisecond wakeups without depending on the global timer
+        /// resolution and without long spin waits.
+        /// </summary>
+        private static IntPtr CreateHighResTimer()
+        {
+            try
+            {
+                return CreateWaitableTimerExW(IntPtr.Zero, IntPtr.Zero,
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            }
+            catch (Exception)
+            {
+                return IntPtr.Zero;
+            }
+        }
+
+        private static void WaitPrecise(IntPtr timer, double milliseconds)
+        {
+            if (milliseconds <= 0.0)
+            {
+                return;
+            }
+
+            if (timer != IntPtr.Zero)
+            {
+                long dueTime = -(long)(milliseconds * 10000.0); // relative, 100 ns units
+                if (SetWaitableTimer(timer, ref dueTime, 0, IntPtr.Zero, IntPtr.Zero, false))
+                {
+                    WaitForSingleObject(timer, (uint)milliseconds + 16);
+                    return;
+                }
+            }
+
+            Thread.Sleep((int)milliseconds);
         }
 
         /// <summary>Byte ring for interleaved L/R u8 haptic samples with bounded latency.</summary>
@@ -979,8 +1408,9 @@ namespace DS4Windows.InputDevices
         }
 
         /// <summary>
-        /// Ring of 16-bit interleaved stereo samples at 48 kHz feeding the Opus
-        /// encoder. Drops oldest data when full to bound latency.
+        /// Ring of 16-bit interleaved stereo samples at the delivery rate
+        /// feeding the Opus encoder. Drops oldest data when full to bound
+        /// latency and records the drop so the reader can mask the splice.
         /// </summary>
         private sealed class ShortRing
         {
@@ -988,6 +1418,10 @@ namespace DS4Windows.InputDevices
             private readonly object gate = new object();
             private int head;
             private int count;
+            private bool droppedSinceRead;
+            private long droppedTotal;
+
+            public int Count { get { lock (gate) return count; } }
 
             public ShortRing(int capacitySamples)
             {
@@ -1004,6 +1438,8 @@ namespace DS4Windows.InputDevices
                         {
                             head = (head + 2) % buffer.Length;
                             count -= 2;
+                            droppedSinceRead = true;
+                            droppedTotal++;
                         }
 
                         double v = samples[i] * volumeScale * 32767.0;
@@ -1034,66 +1470,41 @@ namespace DS4Windows.InputDevices
                     return true;
                 }
             }
-        }
 
-        /// <summary>Small fixed-size queue of Opus frames with drop-oldest overflow.</summary>
-        private sealed class OpusFrameQueue
-        {
-            private readonly byte[][] slots;
-            private readonly object gate = new object();
-            private int head;
-            private int count;
-
-            public int Count { get { lock (gate) return count; } }
-
-            public OpusFrameQueue(int depth, int frameBytes)
-            {
-                slots = new byte[depth][];
-                for (int i = 0; i < depth; i++)
-                {
-                    slots[i] = new byte[frameBytes];
-                }
-            }
-
-            /// <summary>Returns the buffer to encode into; call CommitSlot afterwards.</summary>
-            public byte[] RentSlot()
+            /// <summary>Drops oldest samples so at most maxSamples remain (keeps sample pairs aligned).</summary>
+            public void TrimToNewest(int maxSamples)
             {
                 lock (gate)
                 {
-                    if (count >= slots.Length)
+                    if (count > maxSamples)
                     {
-                        head = (head + 1) % slots.Length; // drop oldest
-                        count--;
-                    }
-
-                    return slots[(head + count) % slots.Length];
-                }
-            }
-
-            public void CommitSlot()
-            {
-                lock (gate)
-                {
-                    if (count < slots.Length)
-                    {
-                        count++;
+                        int drop = count - maxSamples;
+                        drop -= drop % 2;
+                        head = (head + drop) % buffer.Length;
+                        count -= drop;
                     }
                 }
             }
 
-            public bool TryDequeue(byte[] dest)
+            /// <summary>True once if an overflow drop occurred since the last call.</summary>
+            public bool TakeDropFlag()
             {
                 lock (gate)
                 {
-                    if (count == 0)
-                    {
-                        return false;
-                    }
+                    bool value = droppedSinceRead;
+                    droppedSinceRead = false;
+                    return value;
+                }
+            }
 
-                    Buffer.BlockCopy(slots[head], 0, dest, 0, dest.Length);
-                    head = (head + 1) % slots.Length;
-                    count--;
-                    return true;
+            /// <summary>Total dropped samples since the last call (telemetry).</summary>
+            public long TakeDropCount()
+            {
+                lock (gate)
+                {
+                    long value = droppedTotal;
+                    droppedTotal = 0;
+                    return value;
                 }
             }
         }
