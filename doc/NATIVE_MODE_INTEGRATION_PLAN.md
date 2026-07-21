@@ -6,10 +6,13 @@ the reviewed BSOD mitigations through code commit
 `6cc5ae731ef3592ab34a5be2251a6779ab2f674f`. The unapproved Bluetooth-streamer
 overhaul `9e9872b` is excluded. The fresh package is
 `C:\Users\patri\PS5Haptics\native-mode-bsod-guarded-build-20260720`.
-Live validation has not been performed and still requires Patrick's explicit
-approval.
+One controlled basic lifecycle validation passed on 2026-07-20: exact virtual
+attach, render-pin keepalive, unchanged Sonar defaults, ordered Stop/removal,
+keepalive release, and Bluetooth-pad reclaim all completed without a fatal log
+or crash event. Game audio, speaker effects, native haptics, and alt-tab/pin
+cycling were not exercised and still require separate explicit approval.
 
-Controlled live-validation checklist:
+Controlled game-validation checklist:
 1. Confirm explicit approval, the package hashes in `BUILD-INFO.txt`, trace
    readiness, the bounded scenario, and the stop procedure.
 2. Confirm the existing elevation task. Re-run setup only if it is missing or
