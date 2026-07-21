@@ -18,14 +18,17 @@ roles stayed unchanged, and no fatal log or system crash event occurred. Stop
 then deferred until the endpoint and parent disappeared, reclaimed the normal
 X360 mapping, and the UI correctly returned to Start Native Mode.
 
-The third phase used the final r3 package at the persisted 50% volume. The user
-repeatedly alt-tabbed between Black Flag and other applications while the game
-remained open, then confirmed controls, haptics, and sounds still worked. A
-live snapshot after more than six minutes showed the r3 app/server and exact
-virtual parent healthy, all six Sonar default roles unchanged, seven recovered
-speaker rebuffers, and no fatal native marker or Windows critical/bugcheck
-event. This validates the active Alt+Tab scenario that previously crashed.
-No forced rapid pin-cycle/stress sequence was performed.
+The third phase used the final r3 package at the persisted 50% volume for about
+19 minutes. The user repeatedly alt-tabbed between Black Flag and other
+applications while the game remained open, then confirmed controls, haptics,
+and sounds still worked. The r3 app/server and exact virtual parent remained
+healthy, all six Sonar default roles stayed unchanged, and 16 speaker
+rebuffers recovered without a fatal native marker or Windows
+critical/bugcheck event. Stop then deferred for about three seconds until the
+endpoint and parent disappeared, released the keepalive, and restored the
+Bluetooth pad and normal X360 mapping. This validates both the active Alt+Tab
+scenario that previously crashed and its guarded teardown. No forced rapid
+pin-cycle/stress sequence was performed.
 
 Controlled game-validation checklist:
 1. Confirm explicit approval, the package hashes in `BUILD-INFO.txt`, trace
