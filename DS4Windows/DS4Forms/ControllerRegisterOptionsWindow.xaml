@@ -74,57 +74,59 @@
                     </StackPanel>
 
                     <Separator Margin="0,12,0,4" />
-                    <TextBlock Text="Bluetooth Haptic Feedback (audio-based)" FontWeight="Bold" Margin="0,4,0,0" />
+                    <TextBlock Text="{lex:Loc ControllerRegOptWin.HapticsHeading}" FontWeight="Bold" Margin="0,4,0,0" />
                     <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,2,0,0"
-                               Text="Streams haptic audio to the controller's actuators over Bluetooth. System Audio converts what you hear into haptics; Rumble To Haptics re-voices game rumble through the haptic actuators." />
+                               Text="{lex:Loc ControllerRegOptWin.HapticsDescription}" />
 
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                        <Label Content="Haptics mode:" />
+                        <Label Content="{lex:Loc ControllerRegOptWin.HapticsMode}" ContentStringFormat="{}{0}:" />
                         <ComboBox ItemsSource="{Binding Path=DsHapticsModes}" DisplayMemberPath="DisplayName" SelectedValuePath="ChoiceValue" SelectedValue="{Binding Options.BTHapticsMode}" Margin="8,0,0,0" MinWidth="180" />
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                        <Label Content="Audio source:" />
+                        <Label Content="{lex:Loc ControllerRegOptWin.AudioSource}" ContentStringFormat="{}{0}:" />
                         <ComboBox ItemsSource="{Binding Path=HapticsAudioDevices}" DisplayMemberPath="DisplayName" SelectedValuePath="Id" SelectedValue="{Binding Options.BTHapticsAudioDeviceId}" Margin="8,0,0,0" MinWidth="260" />
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                        <Label Content="Intensity:" />
+                        <Label Content="{lex:Loc ControllerRegOptWin.Intensity}" ContentStringFormat="{}{0}:" />
                         <Slider Value="{Binding Options.BTHapticsGain}" Minimum="0.5" Maximum="8" TickFrequency="0.5" IsSnapToTickEnabled="True" Width="180" Margin="8,4,0,0" VerticalAlignment="Center" />
                         <TextBlock Text="{Binding Options.BTHapticsGain}" Margin="8,4,0,0" VerticalAlignment="Center" MinWidth="32" />
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                        <Label Content="Low-pass filter (Hz):" ToolTip="Lower values = only deep bass becomes haptics; higher values = more texture from the audio." />
+                        <Label Content="{lex:Loc ControllerRegOptWin.LowPassFilter}" ContentStringFormat="{}{0}:"
+                               ToolTip="{lex:Loc ControllerRegOptWin.LowPassFilterTip}" />
                         <Slider Value="{Binding Options.BTHapticsLowPassHz}" Minimum="80" Maximum="800" TickFrequency="10" IsSnapToTickEnabled="True" Width="180" Margin="8,4,0,0" VerticalAlignment="Center" />
                         <TextBlock Text="{Binding Options.BTHapticsLowPassHz}" Margin="8,4,0,0" VerticalAlignment="Center" MinWidth="32" />
                     </StackPanel>
 
                     <Separator Margin="0,12,0,4" />
-                    <TextBlock Text="Bluetooth Audio (headphones / speaker)" FontWeight="Bold" Margin="0,4,0,0" />
+                    <TextBlock Text="{lex:Loc ControllerRegOptWin.BTAudioHeading}" FontWeight="Bold" Margin="0,4,0,0" />
                     <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,2,0,0"
-                               Text="Streams the selected audio source to the controller's headphone jack or built-in speaker over Bluetooth — no USB cable needed." />
+                               Text="{lex:Loc ControllerRegOptWin.BTAudioDescription}" />
 
-                    <CheckBox Content="Send audio to controller" IsChecked="{Binding Options.BTAudioEnabled}" Margin="0,8,0,0" />
+                    <CheckBox Content="{lex:Loc ControllerRegOptWin.SendAudioToController}" IsChecked="{Binding Options.BTAudioEnabled}" Margin="0,8,0,0" />
 
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                        <Label Content="Output:" />
+                        <Label Content="{lex:Loc ControllerRegOptWin.AudioOutput}" ContentStringFormat="{}{0}:" />
                         <ComboBox ItemsSource="{Binding Path=DsAudioRoutes}" DisplayMemberPath="DisplayName" SelectedValuePath="ChoiceValue" SelectedValue="{Binding Options.BTAudioRoute}" Margin="8,0,0,0" MinWidth="220" />
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                        <Label Content="Volume:" />
+                        <Label Content="{lex:Loc ControllerRegOptWin.Volume}" ContentStringFormat="{}{0}:" />
                         <Slider Value="{Binding Options.BTAudioVolume}" Minimum="0" Maximum="100" TickFrequency="5" IsSnapToTickEnabled="True" Width="180" Margin="8,4,0,0" VerticalAlignment="Center" />
                         <TextBlock Text="{Binding Options.BTAudioVolume}" Margin="8,4,0,0" VerticalAlignment="Center" MinWidth="32" />
                     </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
-                        <Label Content="Buffering:" ToolTip="Smooth = most stable, ~0.3-0.4 s behind. Low latency = ~0.1 s behind, but needs a clean Bluetooth link (interference causes dropouts). Applies to both audio and audio-based haptics." />
+                        <Label Content="{lex:Loc ControllerRegOptWin.Buffering}" ContentStringFormat="{}{0}:"
+                               ToolTip="{lex:Loc ControllerRegOptWin.BufferingTip}" />
                         <ComboBox ItemsSource="{Binding Path=DsAudioLatencies}" DisplayMemberPath="DisplayName" SelectedValuePath="ChoiceValue" SelectedValue="{Binding Options.BTAudioLatency}" Margin="8,0,0,0" MinWidth="220" />
                     </StackPanel>
 
                     <TextBlock TextWrapping="Wrap" Foreground="Gray" Margin="0,6,0,0"
-                               Text="Bluetooth connections only. Applies immediately. While streaming is active, standard rumble emulation is disabled (the controller cannot do both at once) — use a haptics mode that includes Rumble to keep feeling game rumble. Pick the audio source your game actually plays through. Protocol research credit: egormanga/SAxense and awalol/DS5Dongle." />
+                               Text="{lex:Loc ControllerRegOptWin.BTStreamingNote}" />
                 </StackPanel>
             </TabItem>
 

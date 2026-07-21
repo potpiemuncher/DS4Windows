@@ -278,7 +278,8 @@ namespace DS4Windows
         public event EventHandler MuteLedModeChanged;
 
         // Bluetooth audio-haptics streaming settings. Fires a single combined
-        // change event; the device restarts its haptics streamer on any change.
+        // change event; the device applies live-safe fields or restarts the
+        // capture pipeline as needed.
         private HapticsMode btHapticsMode = HapticsMode.Off;
         public HapticsMode BTHapticsMode
         {

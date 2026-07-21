@@ -288,10 +288,18 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         private List<EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>> dsHapticsModes =
             new List<EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>>()
         {
-            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>("Off", DualSenseControllerOptions.HapticsMode.Off),
-            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>("System Audio", DualSenseControllerOptions.HapticsMode.SystemAudio),
-            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>("Rumble To Haptics", DualSenseControllerOptions.HapticsMode.RumbleToHaptics),
-            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>("System Audio + Rumble", DualSenseControllerOptions.HapticsMode.Mix),
+            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>(
+                Translations.Strings.ControllerRegOptWin_HapticsModeOff,
+                DualSenseControllerOptions.HapticsMode.Off),
+            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>(
+                Translations.Strings.ControllerRegOptWin_HapticsModeSystemAudio,
+                DualSenseControllerOptions.HapticsMode.SystemAudio),
+            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>(
+                Translations.Strings.ControllerRegOptWin_HapticsModeRumble,
+                DualSenseControllerOptions.HapticsMode.RumbleToHaptics),
+            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>(
+                Translations.Strings.ControllerRegOptWin_HapticsModeMix,
+                DualSenseControllerOptions.HapticsMode.Mix),
         };
         public List<EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>> DsHapticsModes { get => dsHapticsModes; }
 
@@ -301,18 +309,30 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         private List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>> dsAudioRoutes =
             new List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>>()
         {
-            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>("Auto (headphones when plugged in)", DualSenseControllerOptions.AudioOutputRoute.Auto),
-            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>("Headphone jack", DualSenseControllerOptions.AudioOutputRoute.Headphone),
-            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>("Built-in speaker", DualSenseControllerOptions.AudioOutputRoute.Speaker),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>(
+                Translations.Strings.ControllerRegOptWin_AudioRouteAuto,
+                DualSenseControllerOptions.AudioOutputRoute.Auto),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>(
+                Translations.Strings.ControllerRegOptWin_AudioRouteHeadphones,
+                DualSenseControllerOptions.AudioOutputRoute.Headphone),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>(
+                Translations.Strings.ControllerRegOptWin_AudioRouteSpeaker,
+                DualSenseControllerOptions.AudioOutputRoute.Speaker),
         };
         public List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>> DsAudioRoutes { get => dsAudioRoutes; }
 
         private List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>> dsAudioLatencies =
             new List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>>()
         {
-            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>("Smooth (most buffering)", DualSenseControllerOptions.AudioLatencyMode.Smooth),
-            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>("Balanced", DualSenseControllerOptions.AudioLatencyMode.Balanced),
-            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>("Low latency (clean link needed)", DualSenseControllerOptions.AudioLatencyMode.LowLatency),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>(
+                Translations.Strings.ControllerRegOptWin_LatencySmooth,
+                DualSenseControllerOptions.AudioLatencyMode.Smooth),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>(
+                Translations.Strings.ControllerRegOptWin_LatencyBalanced,
+                DualSenseControllerOptions.AudioLatencyMode.Balanced),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>(
+                Translations.Strings.ControllerRegOptWin_LatencyLow,
+                DualSenseControllerOptions.AudioLatencyMode.LowLatency),
         };
         public List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>> DsAudioLatencies { get => dsAudioLatencies; }
 
@@ -328,7 +348,8 @@ namespace DS4WinWPF.DS4Forms.ViewModels
 
         private void PopulateHapticsAudioDevices()
         {
-            hapticsAudioDevices.Add(new HapticsAudioDeviceChoice("Default output device", string.Empty));
+            hapticsAudioDevices.Add(new HapticsAudioDeviceChoice(
+                Translations.Strings.ControllerRegOptWin_AudioDeviceDefault, string.Empty));
             try
             {
                 using NAudio.CoreAudioApi.MMDeviceEnumerator enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
@@ -348,7 +369,8 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             if (!string.IsNullOrEmpty(options.BTHapticsAudioDeviceId) &&
                 !hapticsAudioDevices.Exists(item => item.Id == options.BTHapticsAudioDeviceId))
             {
-                hapticsAudioDevices.Add(new HapticsAudioDeviceChoice("(saved device, currently unavailable)",
+                hapticsAudioDevices.Add(new HapticsAudioDeviceChoice(
+                    Translations.Strings.ControllerRegOptWin_AudioDeviceUnavailable,
                     options.BTHapticsAudioDeviceId));
             }
         }

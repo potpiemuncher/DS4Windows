@@ -74,6 +74,15 @@
 	</ItemGroup>
 
 	<ItemGroup>
+		<None Include="..\THIRD-PARTY-NOTICES.txt">
+			<Link>THIRD-PARTY-NOTICES.txt</Link>
+			<TargetPath>THIRD-PARTY-NOTICES.txt</TargetPath>
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+		</None>
+	</ItemGroup>
+
+	<ItemGroup>
 		<PackageReference Include="bloomtom.HttpProgress" Version="2.3.2" />
 		<PackageReference Include="DotNetProjects.Extended.Wpf.Toolkit" Version="5.0.106" />
 		<PackageReference Include="H.NotifyIcon.Wpf" Version="2.0.74" />
