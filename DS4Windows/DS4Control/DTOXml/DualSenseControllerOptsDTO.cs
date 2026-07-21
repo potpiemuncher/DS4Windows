@@ -98,7 +98,7 @@ namespace DS4WinWPF.DS4Control.DTOXml
         public int NativeModeSpeakerVolume
         {
             get; set;
-        } = 35;
+        } = DualSenseControllerOptions.DEFAULT_NATIVE_MODE_SPEAKER_VOLUME;
 
         [XmlElement("NativeModeRoute")]
         public AudioOutputRoute NativeModeRoute

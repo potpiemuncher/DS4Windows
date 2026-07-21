@@ -17,9 +17,17 @@ public class NativeModeSettingsTests
         var options = new DualSenseControllerOptions(InputDeviceType.DualSense);
 
         Assert.IsTrue(options.NativeModeSpeakerAudio);
-        Assert.AreEqual(35, options.NativeModeSpeakerVolume);
+        Assert.AreEqual(50, options.NativeModeSpeakerVolume);
         Assert.AreEqual(DualSenseControllerOptions.AudioOutputRoute.Auto,
             options.NativeModeRoute);
+    }
+
+    [TestMethod]
+    public void DualSenseOptionsDto_DefaultsNativeSpeakerVolumeToFiftyPercent()
+    {
+        var options = new DualSenseControllerOptsDTO();
+
+        Assert.AreEqual(50, options.NativeModeSpeakerVolume);
     }
 
     [TestMethod]

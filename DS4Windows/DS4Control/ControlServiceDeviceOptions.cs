@@ -212,6 +212,8 @@ namespace DS4Windows
 
     public class DualSenseControllerOptions : ControllerOptionsStore
     {
+        public const int DEFAULT_NATIVE_MODE_SPEAKER_VOLUME = 50;
+
         public const string XML_ELEMENT_NAME = "DualSenseSupportSettings";
 
         public enum LEDBarMode : ushort
@@ -394,7 +396,8 @@ namespace DS4Windows
             }
         }
 
-        private int nativeModeSpeakerVolume = 35;
+        private int nativeModeSpeakerVolume =
+            DEFAULT_NATIVE_MODE_SPEAKER_VOLUME;
         public int NativeModeSpeakerVolume
         {
             get => nativeModeSpeakerVolume;
