@@ -130,6 +130,7 @@ namespace DS4Windows
         public event EventHandler PreServiceStop;
         public event EventHandler ServiceStopped;
         public event EventHandler RunningChanged;
+        public event EventHandler NativeModeSessionActivityChanged;
         //public event EventHandler HotplugFinished;
         public delegate void HotplugControllerHandler(ControlService sender, DS4Device device, int index);
         public event HotplugControllerHandler HotplugController;
@@ -2536,9 +2537,16 @@ namespace DS4Windows
             finally
             {
                 DS4Devices.EndNativeModeSuppression();
-                if (rescanAfterStop && running &&
-                    !nativeModeShutdownRequested)
-                    HotPlug();
+                try
+                {
+                    if (rescanAfterStop && running &&
+                        !nativeModeShutdownRequested)
+                        HotPlug();
+                }
+                finally
+                {
+                    NotifyNativeModeSessionActivityChanged();
+                }
             }
 
             if (deferredCleanup)
@@ -2547,6 +2555,23 @@ namespace DS4Windows
                     "[native] Deferred native-mode cleanup completed after " +
                     "confirmed server, virtual child, and audio endpoint removal.",
                     false);
+            }
+        }
+
+        private void NotifyNativeModeSessionActivityChanged()
+        {
+            if (IsNativeModeSessionActive)
+                return;
+
+            try
+            {
+                NativeModeSessionActivityChanged?.Invoke(this, EventArgs.Empty);
+            }
+            catch (Exception ex)
+            {
+                AppLogger.LogToGui(
+                    $"[native] Could not refresh Native Mode controls: {ex.Message}",
+                    true);
             }
         }
 

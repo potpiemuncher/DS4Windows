@@ -1,5 +1,6 @@
 using System.Xml;
 using System.Xml.Serialization;
+using System.Threading;
 using DS4Windows;
 using DS4Windows.InputDevices;
 using DS4WinWPF.DS4Control.DTOXml;
@@ -129,6 +130,49 @@ public class NativeModeSettingsTests
     }
 
     [TestMethod]
+    public void NativeModeControls_ConfirmedDeferredCleanupRestoresStoppedUi()
+    {
+        var retained =
+            DualSenseControllerOptionsWrapper.ProjectNativeModeControls(
+                operationInProgress: false,
+                sessionActive: true,
+                NativeModeState.Stopped);
+
+        Assert.AreEqual("Stop Native Mode", retained.ButtonText);
+        Assert.IsTrue(retained.CanToggle);
+        Assert.IsFalse(retained.SettingsEnabled);
+        Assert.IsFalse(retained.SetupCanRun);
+
+        var released =
+            DualSenseControllerOptionsWrapper.ProjectNativeModeControls(
+                operationInProgress: false,
+                sessionActive: false,
+                NativeModeState.Stopped);
+
+        Assert.AreEqual("Start Native Mode", released.ButtonText);
+        Assert.IsTrue(released.CanToggle);
+        Assert.IsTrue(released.SettingsEnabled);
+        Assert.IsTrue(released.SetupCanRun);
+    }
+
+    [TestMethod]
+    public void NativeModeActivityRefresh_PostsToCapturedUiContext()
+    {
+        var context = new RecordingSynchronizationContext();
+        int refreshCount = 0;
+
+        DualSenseControllerOptionsWrapper.DispatchNativeModePropertyRefresh(
+            context, () => refreshCount++);
+
+        Assert.AreEqual(1, context.PostCount);
+        Assert.AreEqual(0, refreshCount);
+
+        context.RunPostedCallback();
+
+        Assert.AreEqual(1, refreshCount);
+    }
+
+    [TestMethod]
     public void AppendFixturesArgument_AddsPackagedFixturesBesideServer()
     {
         string[] baseArguments = { "serve", "--configuration", "composite" };
@@ -159,5 +203,29 @@ public class NativeModeSettingsTests
             _ => false);
 
         Assert.AreSame(baseArguments, untouched);
+    }
+
+    private sealed class RecordingSynchronizationContext :
+        SynchronizationContext
+    {
+        private SendOrPostCallback postedCallback;
+        private object postedState;
+
+        public int PostCount { get; private set; }
+
+        public override void Post(SendOrPostCallback callback, object state)
+        {
+            postedCallback = callback;
+            postedState = state;
+            PostCount++;
+        }
+
+        public void RunPostedCallback()
+        {
+            Assert.IsNotNull(postedCallback);
+            SendOrPostCallback callback = postedCallback;
+            postedCallback = null;
+            callback(postedState);
+        }
     }
 }

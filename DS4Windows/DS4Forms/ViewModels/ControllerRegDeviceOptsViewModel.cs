@@ -343,21 +343,21 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         };
         public List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>> DsAudioLatencies { get => dsAudioLatencies; }
 
-        public string NativeModeButtonText => IsNativeModeSessionActive
-            ? "Stop Native Mode"
-            : "Start Native Mode";
+        private (string ButtonText, bool CanToggle, bool SettingsEnabled,
+            bool SetupCanRun) NativeModeControls =>
+            ProjectNativeModeControls(nativeModeOperationInProgress,
+                IsNativeModeSessionActive, service.NativeModeManager.State);
+
+        public string NativeModeButtonText => NativeModeControls.ButtonText;
         public event EventHandler NativeModeButtonTextChanged;
 
-        public bool NativeModeCanToggle => !nativeModeOperationInProgress &&
-            service.NativeModeManager.State != NativeModeState.Starting;
+        public bool NativeModeCanToggle => NativeModeControls.CanToggle;
         public event EventHandler NativeModeCanToggleChanged;
 
-        public bool NativeModeSettingsEnabled => !nativeModeOperationInProgress &&
-            !IsNativeModeSessionActive;
+        public bool NativeModeSettingsEnabled => NativeModeControls.SettingsEnabled;
         public event EventHandler NativeModeSettingsEnabledChanged;
 
-        public bool NativeModeSetupCanRun => !nativeModeOperationInProgress &&
-            !IsNativeModeSessionActive;
+        public bool NativeModeSetupCanRun => NativeModeControls.SetupCanRun;
         public event EventHandler NativeModeSetupCanRunChanged;
 
         public string NativeModeStatus => nativeModeStatus;
@@ -374,6 +374,7 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             parentOptions.EnabledChanged += (sender, e) => { VisibleChanged?.Invoke(this, EventArgs.Empty); };
             service.NativeModeManager.StateChanged += NativeModeManager_StateChanged;
             service.NativeModeManager.StatsChanged += NativeModeManager_StatsChanged;
+            service.NativeModeSessionActivityChanged += ControlService_NativeModeSessionActivityChanged;
             nativeModeStatus = StatusForState(service.NativeModeManager.State, null);
 
             PopulateHapticsAudioDevices();
@@ -446,6 +447,7 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         {
             service.NativeModeManager.StateChanged -= NativeModeManager_StateChanged;
             service.NativeModeManager.StatsChanged -= NativeModeManager_StatsChanged;
+            service.NativeModeSessionActivityChanged -= ControlService_NativeModeSessionActivityChanged;
         }
 
         private bool IsNativeModeSessionActive => service.IsNativeModeSessionActive;
@@ -486,6 +488,34 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             {
                 ApplyNativeModeStats();
             }
+        }
+
+        private void ControlService_NativeModeSessionActivityChanged(object sender, EventArgs e)
+        {
+            DispatchNativeModePropertyRefresh(uiContext,
+                NotifyNativeModeProperties);
+        }
+
+        internal static (string ButtonText, bool CanToggle,
+            bool SettingsEnabled, bool SetupCanRun) ProjectNativeModeControls(
+            bool operationInProgress, bool sessionActive,
+            NativeModeState managerState)
+        {
+            bool inactive = !operationInProgress && !sessionActive;
+            return (
+                sessionActive ? "Stop Native Mode" : "Start Native Mode",
+                !operationInProgress && managerState != NativeModeState.Starting,
+                inactive,
+                inactive);
+        }
+
+        internal static void DispatchNativeModePropertyRefresh(
+            SynchronizationContext context, Action refresh)
+        {
+            if (context != null && SynchronizationContext.Current != context)
+                context.Post(_ => refresh(), null);
+            else
+                refresh();
         }
 
         private void ApplyNativeModeState(NativeModeStateChangedEventArgs e)
