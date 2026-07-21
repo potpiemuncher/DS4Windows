@@ -1,16 +1,23 @@
 # One-Click Native DualSense Mode — Integration Plan
 
-Status: OFFLINE CANDIDATE BUILT AND VALIDATED 2026-07-20. The isolated branch
+Status: GUARDED CANDIDATE VALIDATED 2026-07-20. The isolated branch
 `feature/native-mode-bsod-mitigation` contains the authorized checkpoint plus
-the reviewed BSOD mitigations through code commit
-`6cc5ae731ef3592ab34a5be2251a6779ab2f674f`. The unapproved Bluetooth-streamer
-overhaul `9e9872b` is excluded. The fresh package is
-`C:\Users\patri\PS5Haptics\native-mode-bsod-guarded-build-20260720`.
-One controlled basic lifecycle validation passed on 2026-07-20: exact virtual
-attach, render-pin keepalive, unchanged Sonar defaults, ordered Stop/removal,
-keepalive release, and Bluetooth-pad reclaim all completed without a fatal log
-or crash event. Game audio, speaker effects, native haptics, and alt-tab/pin
-cycling were not exercised and still require separate explicit approval.
+the reviewed BSOD mitigations, the deferred-cleanup UI refresh, and the 50%
+native speaker default through app commit
+`90e965e7df092b68c7d4c137960c5ceafb304787`. The unapproved Bluetooth-streamer
+overhaul `9e9872b` is excluded. The final fresh package is
+`C:\Users\patri\PS5Haptics\native-mode-bsod-guarded-build-20260720-r3`.
+
+Two controlled live validations passed on 2026-07-20. The first proved exact
+virtual attach, render-pin keepalive, unchanged Sonar defaults, ordered
+Stop/removal, keepalive release, and Bluetooth-pad reclaim. The second ran
+Black Flag Resynced for about four minutes without alt-tab; the user confirmed
+controls, triggers, native haptics, and controller-speaker audio were all good.
+The server and exact virtual parent remained stable, all six Sonar default
+roles stayed unchanged, and no fatal log or system crash event occurred. Stop
+then deferred until the endpoint and parent disappeared, reclaimed the normal
+X360 mapping, and the UI correctly returned to Start Native Mode. The separate
+alt-tab/pin-cycle drill remains untested and requires explicit approval.
 
 Controlled game-validation checklist:
 1. Confirm explicit approval, the package hashes in `BUILD-INFO.txt`, trace
