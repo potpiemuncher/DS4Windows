@@ -285,12 +285,84 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         };
         public List<EnumChoiceSelection<MuteLEDMode>> DsMuteLEDModes { get => dsMuteLEDModes; }
 
+        private List<EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>> dsHapticsModes =
+            new List<EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>>()
+        {
+            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>("Off", DualSenseControllerOptions.HapticsMode.Off),
+            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>("System Audio", DualSenseControllerOptions.HapticsMode.SystemAudio),
+            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>("Rumble To Haptics", DualSenseControllerOptions.HapticsMode.RumbleToHaptics),
+            new EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>("System Audio + Rumble", DualSenseControllerOptions.HapticsMode.Mix),
+        };
+        public List<EnumChoiceSelection<DualSenseControllerOptions.HapticsMode>> DsHapticsModes { get => dsHapticsModes; }
+
+        private List<HapticsAudioDeviceChoice> hapticsAudioDevices = new List<HapticsAudioDeviceChoice>();
+        public List<HapticsAudioDeviceChoice> HapticsAudioDevices { get => hapticsAudioDevices; }
+
+        private List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>> dsAudioRoutes =
+            new List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>>()
+        {
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>("Auto (headphones when plugged in)", DualSenseControllerOptions.AudioOutputRoute.Auto),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>("Headphone jack", DualSenseControllerOptions.AudioOutputRoute.Headphone),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>("Built-in speaker", DualSenseControllerOptions.AudioOutputRoute.Speaker),
+        };
+        public List<EnumChoiceSelection<DualSenseControllerOptions.AudioOutputRoute>> DsAudioRoutes { get => dsAudioRoutes; }
+
+        private List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>> dsAudioLatencies =
+            new List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>>()
+        {
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>("Smooth (most buffering)", DualSenseControllerOptions.AudioLatencyMode.Smooth),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>("Balanced", DualSenseControllerOptions.AudioLatencyMode.Balanced),
+            new EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>("Low latency (clean link needed)", DualSenseControllerOptions.AudioLatencyMode.LowLatency),
+        };
+        public List<EnumChoiceSelection<DualSenseControllerOptions.AudioLatencyMode>> DsAudioLatencies { get => dsAudioLatencies; }
+
         public DualSenseControllerOptionsWrapper(DualSenseControllerOptions options,
             DualSenseDeviceOptions parentOpts)
         {
             this.options = options;
             this.parentOptions = parentOpts;
             parentOptions.EnabledChanged += (sender, e) => { VisibleChanged?.Invoke(this, EventArgs.Empty); };
+
+            PopulateHapticsAudioDevices();
+        }
+
+        private void PopulateHapticsAudioDevices()
+        {
+            hapticsAudioDevices.Add(new HapticsAudioDeviceChoice("Default output device", string.Empty));
+            try
+            {
+                using NAudio.CoreAudioApi.MMDeviceEnumerator enumerator = new NAudio.CoreAudioApi.MMDeviceEnumerator();
+                foreach (NAudio.CoreAudioApi.MMDevice dev in enumerator.EnumerateAudioEndPoints(
+                    NAudio.CoreAudioApi.DataFlow.Render, NAudio.CoreAudioApi.DeviceState.Active))
+                {
+                    hapticsAudioDevices.Add(new HapticsAudioDeviceChoice(dev.FriendlyName, dev.ID));
+                    dev.Dispose();
+                }
+            }
+            catch (Exception)
+            {
+                // Endpoint enumeration is best-effort; the default entry always works.
+            }
+
+            // Keep the ComboBox binding valid if the saved endpoint disappeared.
+            if (!string.IsNullOrEmpty(options.BTHapticsAudioDeviceId) &&
+                !hapticsAudioDevices.Exists(item => item.Id == options.BTHapticsAudioDeviceId))
+            {
+                hapticsAudioDevices.Add(new HapticsAudioDeviceChoice("(saved device, currently unavailable)",
+                    options.BTHapticsAudioDeviceId));
+            }
+        }
+    }
+
+    public class HapticsAudioDeviceChoice
+    {
+        public string DisplayName { get; }
+        public string Id { get; }
+
+        public HapticsAudioDeviceChoice(string displayName, string id)
+        {
+            DisplayName = displayName;
+            Id = id;
         }
     }
 
