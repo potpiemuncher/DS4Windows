@@ -210,7 +210,6 @@ namespace DS4Windows.InputDevices
         public DualSenseControllerOptions NativeOptionsStore { get => nativeOptionsStore; }
 
         private DualSenseHapticsStreamer hapticsStreamer;
-        public DualSenseHapticsStreamer HapticsStreamer { get => hapticsStreamer; }
         private volatile bool hapticsStreamerReady;
 
         internal readonly struct BtOutputControl
@@ -257,7 +256,7 @@ namespace DS4Windows.InputDevices
         internal byte CurrentRumbleHeavy => currentHap.rumbleState.RumbleMotorStrengthLeftHeavySlow;
         internal byte CurrentRumbleLight => currentHap.rumbleState.RumbleMotorStrengthRightLightFast;
 
-        private bool headsetPlugged = false;
+        private volatile bool headsetPlugged = false;
         public bool HeadsetPlugged => headsetPlugged;
 
         public override event ReportHandler<EventArgs> Report = null;

@@ -198,7 +198,7 @@ namespace DS4Windows
             }
         }
 
-        public unsafe bool WriteOutputReportViaInterruptWithTimeout(byte[] outputBuffer, int timeout,
+        internal unsafe bool WriteOutputReportViaInterruptWithTimeout(byte[] outputBuffer, int timeout,
             out int win32Error)
         {
             lock (outputReportWriteLock)
@@ -219,42 +219,53 @@ namespace DS4Windows
             SafeReadHandle ??= OpenHandle(_devicePath, true, false);
             using AutoResetEvent wait = new(false);
             var ov = new NativeOverlapped { EventHandle = wait.SafeWaitHandle.DangerousGetHandle() };
+            GCHandle outputPin = GCHandle.Alloc(outputBuffer, GCHandleType.Pinned);
 
-            if (PInvoke.WriteFile(SafeReadHandle, outputBuffer, null, &ov))
-                return true;
-
-            int error = Marshal.GetLastWin32Error();
-            if (error != (int)WIN32_ERROR.ERROR_IO_PENDING)
+            try
             {
-                win32Error = error;
-                return false;
-            }
-
-            if (!timeout.HasValue)
-            {
-                if (PInvoke.GetOverlappedResult(SafeReadHandle, ov, out _, true))
+                // Overlapped I/O retains the caller's buffer until completion.
+                // Keep the managed array pinned through the wait/cancel/drain
+                // sequence, not only for the initial WriteFile call.
+                if (PInvoke.WriteFile(SafeReadHandle, outputBuffer, null, &ov))
                     return true;
 
-                win32Error = Marshal.GetLastWin32Error();
+                int error = Marshal.GetLastWin32Error();
+                if (error != (int)WIN32_ERROR.ERROR_IO_PENDING)
+                {
+                    win32Error = error;
+                    return false;
+                }
+
+                if (!timeout.HasValue)
+                {
+                    if (PInvoke.GetOverlappedResult(SafeReadHandle, ov, out _, true))
+                        return true;
+
+                    win32Error = Marshal.GetLastWin32Error();
+                    return false;
+                }
+
+                uint waitTimeout = timeout.Value < 0 ? uint.MaxValue : (uint)timeout.Value;
+                if (PInvoke.GetOverlappedResultEx(SafeReadHandle, ov, out _, waitTimeout, false))
+                    return true;
+
+                int resultError = Marshal.GetLastWin32Error();
+                if (resultError == NativeMethods.WAIT_TIMEOUT)
+                {
+                    // The NativeOverlapped and its event are stack-scoped, so cancel
+                    // this exact request and drain its completion before releasing
+                    // either. Never cancel the input read sharing this HID handle.
+                    NativeMethods.CancelIoEx(SafeReadHandle.DangerousGetHandle(), (IntPtr)(&ov));
+                    PInvoke.GetOverlappedResult(SafeReadHandle, ov, out _, true);
+                }
+
+                win32Error = resultError;
                 return false;
             }
-
-            uint waitTimeout = timeout.Value < 0 ? uint.MaxValue : (uint)timeout.Value;
-            if (PInvoke.GetOverlappedResultEx(SafeReadHandle, ov, out _, waitTimeout, false))
-                return true;
-
-            int resultError = Marshal.GetLastWin32Error();
-            if (resultError == NativeMethods.WAIT_TIMEOUT)
+            finally
             {
-                // The NativeOverlapped and its event are stack-scoped, so cancel
-                // this exact request and drain its completion before releasing
-                // either. Never cancel the input read sharing this HID handle.
-                NativeMethods.CancelIoEx(SafeReadHandle.DangerousGetHandle(), (IntPtr)(&ov));
-                PInvoke.GetOverlappedResult(SafeReadHandle, ov, out _, true);
+                outputPin.Free();
             }
-
-            win32Error = resultError;
-            return false;
         }
 
         private SafeFileHandle OpenHandle(string devicePathName, bool isExclusive, bool enumerate)
