@@ -8,7 +8,7 @@ native speaker default through app commit
 overhaul `9e9872b` is excluded. The final fresh package is
 `C:\Users\patri\PS5Haptics\native-mode-bsod-guarded-build-20260720-r3`.
 
-Two controlled live validations passed on 2026-07-20. The first proved exact
+Three live validation phases passed on 2026-07-20. The first proved exact
 virtual attach, render-pin keepalive, unchanged Sonar defaults, ordered
 Stop/removal, keepalive release, and Bluetooth-pad reclaim. The second ran
 Black Flag Resynced for about four minutes without alt-tab; the user confirmed
@@ -16,8 +16,16 @@ controls, triggers, native haptics, and controller-speaker audio were all good.
 The server and exact virtual parent remained stable, all six Sonar default
 roles stayed unchanged, and no fatal log or system crash event occurred. Stop
 then deferred until the endpoint and parent disappeared, reclaimed the normal
-X360 mapping, and the UI correctly returned to Start Native Mode. The separate
-alt-tab/pin-cycle drill remains untested and requires explicit approval.
+X360 mapping, and the UI correctly returned to Start Native Mode.
+
+The third phase used the final r3 package at the persisted 50% volume. The user
+repeatedly alt-tabbed between Black Flag and other applications while the game
+remained open, then confirmed controls, haptics, and sounds still worked. A
+live snapshot after more than six minutes showed the r3 app/server and exact
+virtual parent healthy, all six Sonar default roles unchanged, seven recovered
+speaker rebuffers, and no fatal native marker or Windows critical/bugcheck
+event. This validates the active Alt+Tab scenario that previously crashed.
+No forced rapid pin-cycle/stress sequence was performed.
 
 Controlled game-validation checklist:
 1. Confirm explicit approval, the package hashes in `BUILD-INFO.txt`, trace
