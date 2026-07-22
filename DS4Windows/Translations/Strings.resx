@@ -986,7 +986,7 @@ Disabled:
     <value>Native passthrough (virtual wired DualSense)</value>
   </data>
   <data name="ControllerRegOptWin.NativeModeDescription" xml:space="preserve">
-    <value>Lets games use their native wired DualSense support while this controller remains connected over Bluetooth. While active, both standard-mode sections above are inactive.</value>
+    <value>Lets games use their native wired DualSense support while this controller remains connected over Bluetooth. Start Native Mode before launching or restarting the game so its audio system discovers the virtual controller. While active, both standard-mode sections above are inactive.</value>
   </data>
   <data name="ControllerRegOptWin.NativeModeSafetyWarning" xml:space="preserve">
     <value>Experimental — known kernel risk: Native Mode depends on the external usbip-win2 driver. Version 0.9.7.8 has a confirmed BSOD race. The included teardown mitigations reduce the reproduced trigger but do not make that driver safe.</value>
@@ -1031,10 +1031,10 @@ Disabled:
     <value>Native Mode requirements check failed: {0}</value>
   </data>
   <data name="ControllerRegOptWin.NativeModeAttachedDetectedFormat" xml:space="preserve">
-    <value>Native Mode attached — native haptics detected (L {0:0.00}%, R {1:0.00}%; BT errors {2}).</value>
+    <value>Native Mode attached — native haptics detected (L {0:0.00}%, R {1:0.00}%; BT errors {2}). If controller speaker audio is missing, restart the game after attachment.</value>
   </data>
   <data name="ControllerRegOptWin.NativeModeAttachedWaitingFormat" xml:space="preserve">
-    <value>Native Mode attached — waiting for native haptics (channels 3/4 silent; BT errors {0}).</value>
+    <value>Native Mode attached — start or restart the game now; waiting for native haptics (channels 3/4 silent; BT errors {0}).</value>
   </data>
   <data name="ControllerRegOptWin.NativeModeStartingStatus" xml:space="preserve">
     <value>Starting Native Mode server...</value>
@@ -1043,7 +1043,7 @@ Disabled:
     <value>Server running — attaching virtual DualSense...</value>
   </data>
   <data name="ControllerRegOptWin.NativeModeAttachedStatus" xml:space="preserve">
-    <value>Native Mode attached.</value>
+    <value>Native Mode attached — start or restart the game now.</value>
   </data>
   <data name="ControllerRegOptWin.NativeModePadLostStatus" xml:space="preserve">
     <value>Pad lost — press PS, then Start Native Mode again.</value>

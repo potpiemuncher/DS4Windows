@@ -87,16 +87,17 @@ namespace DS4Windows
     }
 
     /// <summary>
-    /// Keeps high-rate telemetry out of the WPF log while retaining it in the
-    /// manager's snapshots. State markers, rebuffers, and stderr remain visible.
+    /// Keeps redundant audio summaries out of the WPF log while retaining
+    /// them in the manager snapshot. The periodic ISO snapshot is forwarded
+    /// because its four-channel levels distinguish speaker-routing failures
+    /// from haptic-relay failures without exposing device identifiers.
     /// </summary>
     public static class NativeModeLogPolicy
     {
         public static bool ShouldForwardToGui(NativeModeLogKind kind,
             bool fromStandardError)
         {
-            if (kind == NativeModeLogKind.IsochronousOutStats ||
-                kind == NativeModeLogKind.AudioStats)
+            if (kind == NativeModeLogKind.AudioStats)
             {
                 return false;
             }
@@ -107,6 +108,7 @@ namespace DS4Windows
                 kind == NativeModeLogKind.PadOpenFailure ||
                 kind == NativeModeLogKind.PadLost ||
                 kind == NativeModeLogKind.FatalUsbIpSession ||
+                kind == NativeModeLogKind.IsochronousOutStats ||
                 kind == NativeModeLogKind.SpeakerRebuffer;
         }
     }

@@ -102,6 +102,16 @@ production blocker rather than being approximated by a path check.
 
 ## Validation
 
+Start Native Mode and wait for Attached before launching or restarting the
+game. Games may accept the hot-plugged HID controller while retaining the audio
+topology they enumerated at process start. In that state native controls and
+haptics can work while the controller-speaker channels remain silent. Restarting
+the game after attachment lets it discover the current virtual controller and
+audio endpoint. A controlled validation reproduced this distinction and then
+confirmed speaker audio with the configured Auto route; the relay reported
+nonzero speaker-channel levels and Bluetooth audio writes with zero write
+errors.
+
 Offline checks include USB/IP codec vectors, descriptor and EP0 behavior,
 loopback HID/ISO/UNLINK behavior, transfer-quiescing races, controller identity
 matching, Native Mode lifecycle policy, default-audio restoration, keepalive

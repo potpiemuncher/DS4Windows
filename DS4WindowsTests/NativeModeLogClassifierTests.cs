@@ -40,8 +40,8 @@ public class NativeModeLogClassifierTests
     }
 
     [DataTestMethod]
-    [DataRow(NativeModeLogKind.IsochronousOutStats, false, false)]
-    [DataRow(NativeModeLogKind.IsochronousOutStats, true, false)]
+    [DataRow(NativeModeLogKind.IsochronousOutStats, false, true)]
+    [DataRow(NativeModeLogKind.IsochronousOutStats, true, true)]
     [DataRow(NativeModeLogKind.AudioStats, false, false)]
     [DataRow(NativeModeLogKind.ServerListening, false, true)]
     [DataRow(NativeModeLogKind.RenderKeepaliveReady, false, true)]
@@ -59,7 +59,7 @@ public class NativeModeLogClassifierTests
     }
 
     [TestMethod]
-    public void ProcessLogLine_SuppressesIsoStatsButUpdatesTelemetry()
+    public void ProcessLogLine_ForwardsPeriodicIsoStatsAndUpdatesTelemetry()
     {
         const string line =
             "14:10:22.419 ISO OUT total=500 seq=28610 ep=1 urbs/s=98.7 KiB/s=370.1 packets=5000 current=10x384..384 gap-ms=9.1..17.0 rms%=0.00/0.00/15.90/15.90 peak%=0.0/0.0/35.0/35.0 start=5000 interval=1 bt36=461 btq=0 bt-underrun=90 bt-errors=0 bt-audio=420 spkq=5 spk-underrun=0";
@@ -67,7 +67,7 @@ public class NativeModeLogClassifierTests
 
         bool forward = manager.ProcessLogLine(line, warning: false);
 
-        Assert.IsFalse(forward);
+        Assert.IsTrue(forward);
         Assert.AreEqual(line, manager.LatestStats.IsochronousOut);
     }
 
