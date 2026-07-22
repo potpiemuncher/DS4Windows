@@ -43,7 +43,31 @@ internal static class NativeModeContainmentSelfTest
                 new StringReader("detach\n"));
         Assert(invalid.Signal == NativeModeControlSignal.ProtocolViolation,
             "An unsupported command was not rejected.");
-        return 3;
+
+        using var blockingInput = new SynchronouslyBlockingTextReader();
+        Task<Task<NativeModeControlLeaseResult>> startCall =
+            Task.Factory.StartNew(
+                () => NativeModeControlLease.Start(blockingInput),
+                CancellationToken.None,
+                TaskCreationOptions.DenyChildAttach,
+                TaskScheduler.Default);
+        Task startWinner = await Task.WhenAny(
+            startCall, Task.Delay(TestTimeout));
+        if (!ReferenceEquals(startWinner, startCall))
+            blockingInput.Complete("stop");
+        Assert(ReferenceEquals(startWinner, startCall),
+            "Starting the control lease blocked helper initialization.");
+        Task<NativeModeControlLeaseResult> backgroundLease = await startCall;
+        Assert(blockingInput.WaitForReadStart(TestTimeout),
+            "The dedicated control-lease reader did not start.");
+        Assert(!backgroundLease.IsCompleted,
+            "The blocking control lease completed before input arrived.");
+        blockingInput.Complete("stop");
+        NativeModeControlLeaseResult backgroundResult =
+            await backgroundLease.WaitAsync(TestTimeout);
+        Assert(backgroundResult.Signal == NativeModeControlSignal.StopRequested,
+            "The dedicated control-lease reader lost the stop signal.");
+        return 7;
     }
 
     private static int BrokenPipeWriterChecks()
@@ -392,6 +416,41 @@ internal static class NativeModeContainmentSelfTest
                 throw new InvalidOperationException("Synthetic endpoint failure.");
             lock (gate)
                 return endpoints.ToArray();
+        }
+    }
+
+    private sealed class SynchronouslyBlockingTextReader : TextReader
+    {
+        private readonly ManualResetEventSlim readStarted = new(false);
+        private readonly ManualResetEventSlim release = new(false);
+        private string? completedLine;
+
+        public bool WaitForReadStart(TimeSpan timeout) =>
+            readStarted.Wait(timeout);
+
+        public void Complete(string? line)
+        {
+            completedLine = line;
+            release.Set();
+        }
+
+        public override ValueTask<string?> ReadLineAsync(
+            CancellationToken cancellationToken = default)
+        {
+            readStarted.Set();
+            release.Wait(cancellationToken);
+            return ValueTask.FromResult(completedLine);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                release.Set();
+                readStarted.Dispose();
+                release.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 

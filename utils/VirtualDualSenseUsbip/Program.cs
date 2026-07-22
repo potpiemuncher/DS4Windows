@@ -65,7 +65,7 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
             "for a DS4Windows-managed server.");
     }
     Task<NativeModeControlLeaseResult> controlLease =
-        NativeModeControlLease.WaitAsync(Console.In);
+        NativeModeControlLease.Start(Console.In);
 
     string fixtures = DefaultFixturesPath();
     string busId = GetOption(args, "--busid") ?? "1-1";
@@ -324,10 +324,22 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
 
     try
     {
+        if (controlLease.IsCompleted)
+        {
+            ReportControlLeaseEnd(await controlLease);
+            return;
+        }
+
         // Capture the endpoint baseline before the USB/IP listener is visible.
         // This child-owned pin is redundant with the parent pin by design.
         renderSessionBegun = true;
         renderKeepalive.BeginSession();
+        if (controlLease.IsCompleted)
+        {
+            ReportControlLeaseEnd(await controlLease);
+            return;
+        }
+
         server.Start();
         Console.WriteLine($"Virtual DualSense ({configurationMode} configuration) is ready for usbip-win2.");
         if (speakerAudio)
@@ -353,19 +365,7 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
         else if (ReferenceEquals(completed, controlLease))
         {
             NativeModeControlLeaseResult result = await controlLease;
-            Console.WriteLine(result.Signal switch
-            {
-                NativeModeControlSignal.StopRequested =>
-                    "NativeControlLeaseEnded: stop requested.",
-                NativeModeControlSignal.ParentPipeClosed =>
-                    "NativeControlLeaseEnded: parent pipe closed.",
-                _ => "NativeControlLeaseEnded: protocol violation.",
-            });
-            if (result.Signal == NativeModeControlSignal.ProtocolViolation)
-            {
-                terminalFailure = new InvalidOperationException(
-                    result.Detail ?? "The Native Mode control lease failed.");
-            }
+            ReportControlLeaseEnd(result);
         }
         else if (ReferenceEquals(completed, renderFailure))
         {
@@ -499,6 +499,23 @@ static BluetoothDualSenseIdentity ParseBluetoothDeviceIdentity(
     return new BluetoothDualSenseIdentity(devicePath.Trim(),
         ParseUsbIdentifier(GetOption(arguments, "--device-vid"), "--device-vid"),
         ParseUsbIdentifier(GetOption(arguments, "--device-pid"), "--device-pid"));
+}
+
+static void ReportControlLeaseEnd(NativeModeControlLeaseResult result)
+{
+    Console.WriteLine(result.Signal switch
+    {
+        NativeModeControlSignal.StopRequested =>
+            "NativeControlLeaseEnded: stop requested.",
+        NativeModeControlSignal.ParentPipeClosed =>
+            "NativeControlLeaseEnded: parent pipe closed.",
+        _ => "NativeControlLeaseEnded: protocol violation.",
+    });
+    if (result.Signal == NativeModeControlSignal.ProtocolViolation)
+    {
+        throw new InvalidOperationException(
+            result.Detail ?? "The Native Mode control lease failed.");
+    }
 }
 
 static int ParseUsbIdentifier(string? value, string optionName)

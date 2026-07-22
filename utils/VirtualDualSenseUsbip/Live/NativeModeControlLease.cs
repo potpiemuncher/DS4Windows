@@ -24,6 +24,23 @@ internal static class NativeModeControlLease
 {
     internal const string StopCommand = "stop";
 
+    /// <summary>
+    /// Starts the redirected-stdin lease on a dedicated worker. Console.In is
+    /// a synchronized TextReader whose async read can block synchronously
+    /// before returning a task, which must never stall helper startup.
+    /// </summary>
+    public static Task<NativeModeControlLeaseResult> Start(TextReader input)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+        return Task.Factory.StartNew(
+                () => WaitAsync(input),
+                CancellationToken.None,
+                TaskCreationOptions.LongRunning |
+                    TaskCreationOptions.DenyChildAttach,
+                TaskScheduler.Default)
+            .Unwrap();
+    }
+
     public static async Task<NativeModeControlLeaseResult> WaitAsync(
         TextReader input,
         CancellationToken cancellationToken = default)
