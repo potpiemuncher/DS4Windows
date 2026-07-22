@@ -748,6 +748,9 @@ namespace DS4WinWPF
             {
                 if (rootHub != null)
                 {
+                    // Application exit must synchronously tear down the child;
+                    // otherwise usbip-win2 keeps the virtual pad attached.
+                    rootHub.StopNativeModeForShutdown();
                     Task.Run(() =>
                     {
                         if (rootHub.running)

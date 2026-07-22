@@ -415,4 +415,37 @@
 	<ItemGroup>
 		<Folder Remove="extras\" />
 	</ItemGroup>
+
+	<PropertyGroup>
+		<NativeDualSenseRuntimeIdentifier Condition="'$(Platform)' == 'x64'">win-x64</NativeDualSenseRuntimeIdentifier>
+		<NativeDualSenseRuntimeIdentifier Condition="'$(Platform)' == 'x86'">win-x86</NativeDualSenseRuntimeIdentifier>
+		<NativeDualSensePublishDir Condition="'$(NativeDualSensePublishDir)' == ''">$(MSBuildProjectDirectory)\obj\native-dualsense\$(Configuration)\$(Platform)\</NativeDualSensePublishDir>
+	</PropertyGroup>
+
+	<Target Name="PublishNativeDualSenseServer" BeforeTargets="Build"
+			Condition="'$(Configuration)' == 'Release'">
+		<Error Condition="'$(NativeDualSenseRuntimeIdentifier)' == ''"
+			Text="Native DualSense server does not support platform '$(Platform)'." />
+		<RemoveDir Directories="$(NativeDualSensePublishDir)" />
+		<MakeDir Directories="$(NativeDualSensePublishDir)" />
+		<MSBuild Projects="$(MSBuildProjectDirectory)\..\utils\VirtualDualSenseUsbip\VirtualDualSenseUsbip.csproj"
+			Targets="Publish"
+			BuildInParallel="false"
+			Properties="Configuration=Release;Platform=AnyCPU;RuntimeIdentifier=$(NativeDualSenseRuntimeIdentifier);SelfContained=false;PublishSingleFile=false;DebugSymbols=false;DebugType=None;PublishDir=$(NativeDualSensePublishDir)" />
+		<Error Condition="!Exists('$(NativeDualSensePublishDir)VirtualDualSenseUsbip.exe')"
+			Text="Native DualSense server publish did not produce '$(NativeDualSensePublishDir)VirtualDualSenseUsbip.exe'." />
+	</Target>
+
+	<Target Name="CopyNativeDualSenseServer" AfterTargets="Build"
+			DependsOnTargets="PublishNativeDualSenseServer"
+			Condition="'$(Configuration)' == 'Release'">
+		<RemoveDir Directories="$(TargetDir)native" />
+		<MakeDir Directories="$(TargetDir)native" />
+		<ItemGroup>
+			<NativeDualSensePublishFiles Include="$(NativeDualSensePublishDir)**\*"
+				Exclude="$(NativeDualSensePublishDir)**\*.pdb;$(NativeDualSensePublishDir)**\*.xml" />
+		</ItemGroup>
+		<Copy SourceFiles="@(NativeDualSensePublishFiles)"
+			DestinationFiles="@(NativeDualSensePublishFiles->'$(TargetDir)native\%(RecursiveDir)%(Filename)%(Extension)')" />
+	</Target>
 </Project>

@@ -88,6 +88,24 @@ namespace DS4WinWPF.DS4Control.DTOXml
             get; set;
         } = AudioLatencyMode.Smooth;
 
+        [XmlElement("NativeModeSpeakerAudio")]
+        public bool NativeModeSpeakerAudio
+        {
+            get; set;
+        } = true;
+
+        [XmlElement("NativeModeSpeakerVolume")]
+        public int NativeModeSpeakerVolume
+        {
+            get; set;
+        } = DualSenseControllerOptions.DEFAULT_NATIVE_MODE_SPEAKER_VOLUME;
+
+        [XmlElement("NativeModeRoute")]
+        public AudioOutputRoute NativeModeRoute
+        {
+            get; set;
+        } = AudioOutputRoute.Auto;
+
         public void MapFrom(DualSenseControllerOptions source)
         {
             LEDMode = source.LedMode;
@@ -100,6 +118,9 @@ namespace DS4WinWPF.DS4Control.DTOXml
             BTAudioRoute = source.BTAudioRoute;
             BTAudioVolume = source.BTAudioVolume;
             BTAudioLatency = source.BTAudioLatency;
+            NativeModeSpeakerAudio = source.NativeModeSpeakerAudio;
+            NativeModeSpeakerVolume = source.NativeModeSpeakerVolume;
+            NativeModeRoute = source.NativeModeRoute;
         }
 
         public void MapTo(DualSenseControllerOptions destination)
@@ -114,6 +135,9 @@ namespace DS4WinWPF.DS4Control.DTOXml
             destination.BTAudioRoute = BTAudioRoute;
             destination.BTAudioVolume = BTAudioVolume;
             destination.BTAudioLatency = BTAudioLatency;
+            destination.NativeModeSpeakerAudio = NativeModeSpeakerAudio;
+            destination.NativeModeSpeakerVolume = NativeModeSpeakerVolume;
+            destination.NativeModeRoute = NativeModeRoute;
         }
     }
 }

@@ -212,6 +212,8 @@ namespace DS4Windows
 
     public class DualSenseControllerOptions : ControllerOptionsStore
     {
+        public const int DEFAULT_NATIVE_MODE_SPEAKER_VOLUME = 50;
+
         public const string XML_ELEMENT_NAME = "DualSenseSupportSettings";
 
         public enum LEDBarMode : ushort
@@ -382,6 +384,41 @@ namespace DS4Windows
         }
 
         public event EventHandler BTHapticsOptionChanged;
+
+        private bool nativeModeSpeakerAudio = true;
+        public bool NativeModeSpeakerAudio
+        {
+            get => nativeModeSpeakerAudio;
+            set
+            {
+                if (nativeModeSpeakerAudio == value) return;
+                nativeModeSpeakerAudio = value;
+            }
+        }
+
+        private int nativeModeSpeakerVolume =
+            DEFAULT_NATIVE_MODE_SPEAKER_VOLUME;
+        public int NativeModeSpeakerVolume
+        {
+            get => nativeModeSpeakerVolume;
+            set
+            {
+                value = Math.Clamp(value, 0, 100);
+                if (nativeModeSpeakerVolume == value) return;
+                nativeModeSpeakerVolume = value;
+            }
+        }
+
+        private AudioOutputRoute nativeModeRoute = AudioOutputRoute.Auto;
+        public AudioOutputRoute NativeModeRoute
+        {
+            get => nativeModeRoute;
+            set
+            {
+                if (nativeModeRoute == value) return;
+                nativeModeRoute = value;
+            }
+        }
 
         public DualSenseControllerOptions(InputDeviceType deviceType) :
             base(deviceType)

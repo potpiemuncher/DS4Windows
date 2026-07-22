@@ -979,6 +979,87 @@ Disabled:
   <data name="ControllerRegOptWin.BTStreamingNote" xml:space="preserve">
     <value>Bluetooth connections only. Applies immediately. While streaming is active, standard rumble emulation is disabled (the controller cannot do both at once) — use a haptics mode that includes Rumble to keep feeling game rumble. Pick the audio source your game actually plays through. Protocol research credit: egormanga/SAxense, awalol/DS5Dongle, and loteran/DS5Dongle AutoHaptics.</value>
   </data>
+  <data name="ControllerRegOptWin.StandardNativeModeNote" xml:space="preserve">
+    <value>The next two sections apply only in standard mode while DS4Windows directly manages the controller; they are inactive during Native Mode.</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeHeading" xml:space="preserve">
+    <value>Native passthrough (virtual wired DualSense)</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeDescription" xml:space="preserve">
+    <value>Lets games use their native wired DualSense support while this controller remains connected over Bluetooth. While active, both standard-mode sections above are inactive.</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeSafetyWarning" xml:space="preserve">
+    <value>Experimental — known kernel risk: Native Mode depends on the external usbip-win2 driver. Version 0.9.7.8 has a confirmed BSOD race. The included teardown mitigations reduce the reproduced trigger but do not make that driver safe.</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeSafetyConfirmationTitle" xml:space="preserve">
+    <value>Experimental Native Mode warning</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeSafetyConfirmation" xml:space="preserve">
+    <value>Native Mode uses the external usbip-win2 kernel driver. Its signed 0.9.7.8 release has a confirmed request-lifetime race that can cause a Windows blue screen. DS4Windows mitigates the reproduced teardown path, but cannot repair the driver. Continue with this controlled test?</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeRelaySpeakerAudio" xml:space="preserve">
+    <value>Relay native game speaker audio</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeSpeakerVolume" xml:space="preserve">
+    <value>Speaker/headphone volume</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeAudioOutput" xml:space="preserve">
+    <value>Controller audio output</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeCheckRequirements" xml:space="preserve">
+    <value>Check Native Mode requirements</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeRequirementsNote" xml:space="preserve">
+    <value>usbip.exe must be installed under Windows Program Files. If an older build left an elevated attach task, Check or Start requests one-time approval to delete it. Each Native Mode start then requests approval for only the fixed attach action.</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeStart" xml:space="preserve">
+    <value>Start Native Mode</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeStop" xml:space="preserve">
+    <value>Stop Native Mode</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeErrorFormat" xml:space="preserve">
+    <value>Native Mode error: {0}</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeCheckingRequirements" xml:space="preserve">
+    <value>Checking Native Mode requirements and removing any legacy elevated attach task...</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeRequirementsReady" xml:space="preserve">
+    <value>Native Mode requirements are ready. Windows will request administrator approval when Native Mode starts.</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeRequirementsFailedFormat" xml:space="preserve">
+    <value>Native Mode requirements check failed: {0}</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeAttachedDetectedFormat" xml:space="preserve">
+    <value>Native Mode attached — native haptics detected (L {0:0.00}%, R {1:0.00}%; BT errors {2}).</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeAttachedWaitingFormat" xml:space="preserve">
+    <value>Native Mode attached — waiting for native haptics (channels 3/4 silent; BT errors {0}).</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeStartingStatus" xml:space="preserve">
+    <value>Starting Native Mode server...</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeServingStatus" xml:space="preserve">
+    <value>Server running — attaching virtual DualSense...</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeAttachedStatus" xml:space="preserve">
+    <value>Native Mode attached.</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModePadLostStatus" xml:space="preserve">
+    <value>Pad lost — press PS, then Start Native Mode again.</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeRequirementsRequiredStatus" xml:space="preserve">
+    <value>Native Mode requirements need attention — select Check Native Mode requirements.</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeFaultedStatus" xml:space="preserve">
+    <value>Native Mode faulted.</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeFaultedFormat" xml:space="preserve">
+    <value>Native Mode faulted: {0}</value>
+  </data>
+  <data name="ControllerRegOptWin.NativeModeStoppedStatus" xml:space="preserve">
+    <value>Native Mode stopped.</value>
+  </data>
   <data name="ControllerRegOptWin.Buffering" xml:space="preserve">
     <value>Buffering</value>
   </data>
