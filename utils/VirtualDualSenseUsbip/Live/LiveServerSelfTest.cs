@@ -47,6 +47,8 @@ public static class LiveServerSelfTest
                 composite.Endpoints.Contains(new UsbEndpointDescriptorInfo(3, 0, 0x03, 0x03, 64, 6)),
             "composite endpoint topology mismatch");
         await TestCompositeDeviceListAsync(composite);
+        Console.WriteLine("servertest: shutdown import gate");
+        await TestShutdownImportGateAsync(descriptors);
 
         using var server = new VirtualDualSenseServer(descriptors,
             new VirtualDualSenseServerOptions(Port: 0,
@@ -80,6 +82,101 @@ public static class LiveServerSelfTest
 
         Console.WriteLine("PASS: live USB/IP management, HID-only EP0, interrupt IN/OUT, " +
             "packet-preserving ISO OUT, and UNLINK.");
+    }
+
+    private static async Task TestShutdownImportGateAsync(
+        DescriptorSet descriptors)
+    {
+        using (var server = new VirtualDualSenseServer(descriptors,
+            new VirtualDualSenseServerOptions(Port: 0)))
+        {
+            server.Start();
+            Task serverTask = server.RunAsync();
+            using var client = new TcpClient { NoDelay = true };
+            await client.ConnectAsync("127.0.0.1", server.Port);
+            await WaitUntilAsync(
+                () => server.AcceptedClientCount == 1,
+                "the pre-import client was not accepted");
+
+            server.StopAccepting();
+            NetworkStream stream = client.GetStream();
+            await stream.WriteAsync(
+                EncodeOperation(UsbIpConstants.OpReqImport, "1-1"));
+            byte[] rejected = await UsbIpCodec.ReadExactlyAsync(
+                stream, 8);
+            Require(U16(rejected, 2) == UsbIpConstants.OpRepImport &&
+                    U32(rejected, 4) != 0,
+                "an import reserved after StopAccepting was not rejected");
+            Require(!server.RequiresHealthyRenderLeaseForShutdown,
+                "a rejected pre-commit import required a render lease");
+
+            client.Dispose();
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+
+        using (var server = new VirtualDualSenseServer(descriptors,
+            new VirtualDualSenseServerOptions(Port: 0)))
+        {
+            server.Start();
+            Task serverTask = server.RunAsync();
+            using var client = new TcpClient { NoDelay = true };
+            await client.ConnectAsync("127.0.0.1", server.Port);
+            NetworkStream stream = client.GetStream();
+            await stream.WriteAsync(
+                EncodeOperation(UsbIpConstants.OpReqImport, "1-1"));
+            byte[] reply = await UsbIpCodec.ReadExactlyAsync(
+                stream, 8 + 312);
+            Require(U16(reply, 2) == UsbIpConstants.OpRepImport &&
+                    U32(reply, 4) == 0,
+                "the shutdown-gate import did not commit");
+            Require(server.RequiresHealthyRenderLeaseForShutdown,
+                "a committed import did not require a render lease");
+
+            server.StopAccepting();
+            using (var secondClient = new TcpClient())
+            using (var connectTimeout = new CancellationTokenSource(
+                TimeSpan.FromMilliseconds(500)))
+            {
+                bool connected = false;
+                try
+                {
+                    await secondClient.ConnectAsync(
+                        "127.0.0.1", server.Port, connectTimeout.Token);
+                    connected = true;
+                }
+                catch (Exception ex) when (
+                    ex is SocketException or OperationCanceledException)
+                {
+                }
+                Require(!connected,
+                    "a second attach connected after StopAccepting");
+            }
+
+            client.Dispose();
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(2));
+            Require(server.RequiresHealthyRenderLeaseForShutdown,
+                "a committed import lost its sticky safety state after EOF");
+        }
+
+        using (var server = new VirtualDualSenseServer(descriptors,
+            new VirtualDualSenseServerOptions(Port: 0)))
+        {
+            server.Start();
+            Task serverTask = server.RunAsync();
+            server.StopAccepting();
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+    }
+
+    private static async Task WaitUntilAsync(
+        Func<bool> predicate,
+        string failureMessage)
+    {
+        DateTimeOffset deadline = DateTimeOffset.UtcNow +
+            TimeSpan.FromSeconds(2);
+        while (!predicate() && DateTimeOffset.UtcNow < deadline)
+            await Task.Delay(5);
+        Require(predicate(), failureMessage);
     }
 
     private static void TestBluetoothControllerIdentity()

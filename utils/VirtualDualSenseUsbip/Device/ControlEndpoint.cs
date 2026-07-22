@@ -15,6 +15,9 @@ public sealed class ControlEndpoint
     private readonly DescriptorSet descriptors;
     private readonly FeatureReportSet featureReports;
     private readonly Dictionary<byte, byte> interfaceAltSettings = new();
+    private readonly HashSet<byte> advertisedInterfaces = new();
+    private readonly HashSet<(byte InterfaceNumber, byte AlternateSetting)> advertisedAltSettings = new();
+    private readonly HashSet<byte> audioControlInterfaces = new();
     private readonly Dictionary<byte, byte> idleRates = new();
     private readonly Dictionary<byte, byte> audioMuteStates = new();
     private readonly Dictionary<byte, short> audioVolumeStates = new();
@@ -36,6 +39,26 @@ public sealed class ControlEndpoint
     {
         this.descriptors = descriptors;
         this.featureReports = featureReports ?? FeatureReportSet.CreateVirtualDefaults();
+
+        foreach (UsbInterfaceDescriptorInfo descriptor in descriptors.Interfaces)
+        {
+            advertisedInterfaces.Add(descriptor.Number);
+            advertisedAltSettings.Add((descriptor.Number, 0));
+            interfaceAltSettings[descriptor.Number] = 0;
+
+            if (descriptor.Class == 0x01 && descriptor.SubClass == 0x01)
+            {
+                audioControlInterfaces.Add(descriptor.Number);
+            }
+        }
+
+        // DescriptorSet exposes one class record per interface. In the shipped
+        // descriptors every non-zero alternate setting owns at least one
+        // endpoint, so endpoint topology supplies the remaining valid alts.
+        foreach (UsbEndpointDescriptorInfo endpoint in descriptors.Endpoints)
+        {
+            advertisedAltSettings.Add((endpoint.InterfaceNumber, endpoint.AlternateSetting));
+        }
     }
 
     public byte GetAltSetting(byte interfaceNumber) =>
@@ -92,6 +115,15 @@ public sealed class ControlEndpoint
 
             case UsbStandardRequest.SetInterface:
             {
+                if (setup.DeviceToHost ||
+                    setup.Recipient != UsbSetupPacket.RecipientInterface ||
+                    setup.Index > byte.MaxValue || setup.Value > byte.MaxValue ||
+                    setup.Length != 0 ||
+                    !advertisedAltSettings.Contains(((byte)setup.Index, (byte)setup.Value)))
+                {
+                    return ControlResult.Stalled();
+                }
+
                 byte interfaceNumber = (byte)setup.Index;
                 byte alt = (byte)setup.Value;
                 interfaceAltSettings[interfaceNumber] = alt;
@@ -100,6 +132,15 @@ public sealed class ControlEndpoint
             }
 
             case UsbStandardRequest.GetInterface:
+                if (!setup.DeviceToHost ||
+                    setup.Recipient != UsbSetupPacket.RecipientInterface ||
+                    setup.Value != 0 || setup.Index > byte.MaxValue ||
+                    setup.Length != 1 ||
+                    !advertisedInterfaces.Contains((byte)setup.Index))
+                {
+                    return ControlResult.Stalled();
+                }
+
                 return ControlResult.Ok(new[] { GetAltSetting((byte)setup.Index) });
 
             case UsbStandardRequest.GetStatus:
@@ -134,13 +175,24 @@ public sealed class ControlEndpoint
 
     private ControlResult HandleClass(UsbSetupPacket setup, ReadOnlySpan<byte> outData)
     {
-        if (setup.Recipient == UsbSetupPacket.RecipientInterface &&
-            (byte)setup.Index != descriptors.HidInterfaceNumber)
+        if (setup.Recipient != UsbSetupPacket.RecipientInterface)
+        {
+            return ControlResult.Stalled();
+        }
+
+        // HID wIndex is exactly the interface number. UAC1 uses the low byte
+        // for the interface and the high byte for the entity ID.
+        if (setup.Index == descriptors.HidInterfaceNumber)
+        {
+            return HandleHidClass(setup);
+        }
+
+        if (audioControlInterfaces.Contains((byte)setup.Index))
         {
             return HandleAudioClass(setup, outData);
         }
 
-        return HandleHidClass(setup);
+        return ControlResult.Stalled();
     }
 
     private ControlResult HandleHidClass(UsbSetupPacket setup)

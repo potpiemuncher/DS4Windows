@@ -230,9 +230,9 @@ namespace DS4Windows
         }
 
         /// <summary>
-        /// Arms deferred release before the server process is killed. This does
-        /// not stop or dispose the render client while the endpoint/device is
-        /// still present.
+        /// Arms deferred release before ordered helper shutdown is requested.
+        /// This does not stop or dispose the render client while the
+        /// endpoint/device is still present.
         /// </summary>
         public void BeginTeardown()
         {

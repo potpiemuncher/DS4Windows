@@ -16,8 +16,44 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
+using System;
+
 namespace DS4Windows
 {
+    internal static class NativeModeStartupSafety
+    {
+        public static void EnsureNoExistingVirtualDevice(
+            Func<bool> isExactVirtualDevicePresent)
+        {
+            if (isExactVirtualDevicePresent == null)
+            {
+                throw new ArgumentNullException(
+                    nameof(isExactVirtualDevicePresent));
+            }
+
+            bool present;
+            try
+            {
+                present = isExactVirtualDevicePresent();
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException(
+                    "Native Mode could not verify that an earlier virtual " +
+                    "DualSense session is absent. Startup is blocked so a " +
+                    "second device cannot be attached.", ex);
+            }
+
+            if (present)
+            {
+                throw new InvalidOperationException(
+                    "A virtual DualSense from an earlier Native Mode session " +
+                    "is still present. Native Mode will not attach another " +
+                    "device until the earlier session is removed.");
+            }
+        }
+    }
+
     public static class NativeModeLifecyclePolicy
     {
         public static bool IsSessionActive(NativeModeState state,
@@ -36,5 +72,14 @@ namespace DS4Windows
                 (state == NativeModeState.PadLost ||
                  state == NativeModeState.Faulted);
         }
+
+        /// <summary>
+        /// Must be evaluated while holding the lifecycle gate, not only when a
+        /// cleanup request is queued. A UAC launch can become pending while a
+        /// previously queued cleanup waits for that gate.
+        /// </summary>
+        public static bool CanBeginTeardown(
+            bool pendingCommandBarrierActive) =>
+            !pendingCommandBarrierActive;
     }
 }

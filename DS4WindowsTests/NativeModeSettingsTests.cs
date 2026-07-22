@@ -68,7 +68,8 @@ public class NativeModeSettingsTests
         CollectionAssert.AreEqual(new[]
         {
             "serve",
-            "--protocol-version", "1",
+            "--protocol-version", "2",
+            "--control-stdin", "required",
             "--configuration", "composite",
             "--input", "bluetooth",
             "--device-path", devicePath,
@@ -82,9 +83,9 @@ public class NativeModeSettingsTests
     }
 
     [DataTestMethod]
-    [DataRow("DS4WINDOWS_NATIVE_USBIP_PROTOCOL=1", true)]
-    [DataRow("DS4WINDOWS_NATIVE_USBIP_PROTOCOL=1\r\n", true)]
-    [DataRow("DS4WINDOWS_NATIVE_USBIP_PROTOCOL=0", false)]
+    [DataRow("DS4WINDOWS_NATIVE_USBIP_PROTOCOL=2", true)]
+    [DataRow("DS4WINDOWS_NATIVE_USBIP_PROTOCOL=2\r\n", true)]
+    [DataRow("DS4WINDOWS_NATIVE_USBIP_PROTOCOL=1", false)]
     [DataRow("", false)]
     public void NativeServerCapability_MustMatchExpectedProtocol(
         string output, bool expected)
@@ -190,6 +191,20 @@ public class NativeModeSettingsTests
         Assert.IsTrue(released.CanToggle);
         Assert.IsTrue(released.SettingsEnabled);
         Assert.IsTrue(released.SetupCanRun);
+    }
+
+    [TestMethod]
+    public void NativeModeStoppedStatus_MatchesCleanupAndButtonState()
+    {
+        Assert.AreEqual(
+            "Native Mode cleanup is pending; protections remain active. " +
+            "Use Stop Native Mode to retry.",
+            DualSenseControllerOptionsWrapper.StatusForState(
+                NativeModeState.Stopped, null, sessionActive: true));
+        Assert.AreEqual(
+            "Native Mode stopped.",
+            DualSenseControllerOptionsWrapper.StatusForState(
+                NativeModeState.Stopped, null, sessionActive: false));
     }
 
     [TestMethod]

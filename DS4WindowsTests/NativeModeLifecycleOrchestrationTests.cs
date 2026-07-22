@@ -118,6 +118,47 @@ public class NativeModeLifecycleOrchestrationTests
     }
 
     [TestMethod]
+    public async Task PendingCommand_BlocksRecoveryUntilItIsTerminal()
+    {
+        var pending = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        bool recovered = false;
+
+        Task barrier = NativeModeStartupOrchestration
+            .RunAfterCommandTerminationAsync(pending.Task, () =>
+            {
+                recovered = true;
+                return Task.CompletedTask;
+            });
+
+        Assert.IsFalse(barrier.IsCompleted);
+        Assert.IsFalse(recovered);
+
+        pending.SetResult();
+        await barrier;
+
+        Assert.IsTrue(recovered);
+    }
+
+    [TestMethod]
+    public async Task FailedPendingCommand_StillRunsOrderedRecovery()
+    {
+        bool recovered = false;
+
+        await NativeModeStartupOrchestration
+            .RunAfterCommandTerminationAsync(
+                Task.FromException(new InvalidOperationException(
+                    "elevated client failed")),
+                () =>
+                {
+                    recovered = true;
+                    return Task.CompletedTask;
+                });
+
+        Assert.IsTrue(recovered);
+    }
+
+    [TestMethod]
     public async Task StopFailure_RetainsEveryProtectionAndReportsFailure()
     {
         var failure = new InvalidOperationException("kill failed");

@@ -49,10 +49,26 @@ public sealed class VirtualDualSenseServer : IDisposable
     private readonly UsbIpDeviceInfo deviceInfo;
     private readonly IInputReportSource inputReports;
     private readonly FeatureReportSet featureReports;
+    private readonly object importStateGate = new();
     private WindowsTimerResolution? timerResolution;
     private bool started;
+    private int acceptingStopped;
+    private int acceptedClientCount;
+    private int importReservations;
+    private bool importReplyCommittedSinceStart;
 
     public int Port { get; private set; }
+    internal int AcceptedClientCount =>
+        Volatile.Read(ref acceptedClientCount);
+    internal bool RequiresHealthyRenderLeaseForShutdown
+    {
+        get
+        {
+            lock (importStateGate)
+                return importReservations != 0 ||
+                    importReplyCommittedSinceStart;
+        }
+    }
     public event Action<string>? Log;
     public event Action<HidOutputCapture>? HidOutputReceived;
     public event Action<IsochronousOutCapture>? IsochronousOutReceived;
@@ -118,23 +134,36 @@ public sealed class VirtualDualSenseServer : IDisposable
             throw new InvalidOperationException("Call Start before RunAsync.");
         }
 
-        using CancellationTokenRegistration registration = cancellationToken.Register(listener.Stop);
-        while (!cancellationToken.IsCancellationRequested)
+        using CancellationTokenRegistration registration =
+            cancellationToken.Register(StopAccepting);
+        while (!cancellationToken.IsCancellationRequested &&
+            Volatile.Read(ref acceptingStopped) == 0)
         {
             TcpClient client;
             try
             {
                 client = await listener.AcceptTcpClientAsync(cancellationToken);
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException) when (
+                cancellationToken.IsCancellationRequested ||
+                Volatile.Read(ref acceptingStopped) != 0)
             {
                 break;
             }
-            catch (SocketException) when (cancellationToken.IsCancellationRequested)
+            catch (SocketException) when (
+                cancellationToken.IsCancellationRequested ||
+                Volatile.Read(ref acceptingStopped) != 0)
+            {
+                break;
+            }
+            catch (ObjectDisposedException) when (
+                cancellationToken.IsCancellationRequested ||
+                Volatile.Read(ref acceptingStopped) != 0)
             {
                 break;
             }
 
+            Interlocked.Increment(ref acceptedClientCount);
             using (client)
             {
                 client.NoDelay = true;
@@ -155,6 +184,30 @@ public sealed class VirtualDualSenseServer : IDisposable
                     EmitLog($"USB/IP socket ended: {ex.Message}");
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Stops new attach/re-attach connections without disturbing the active
+    /// USB/IP socket. Ordered containment calls this before canceling the
+    /// current session.
+    /// </summary>
+    public void StopAccepting()
+    {
+        lock (importStateGate)
+        {
+            if (acceptingStopped != 0)
+                return;
+            Volatile.Write(ref acceptingStopped, 1);
+        }
+
+        try
+        {
+            listener.Stop();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Dispose and cancellation may converge on the same listener.
         }
     }
 
@@ -186,17 +239,39 @@ public sealed class VirtualDualSenseServer : IDisposable
                 return;
 
             case UsbIpConstants.OpReqImport when operation.BusId == options.BusId:
-                await writer.WriteAsync(
-                    UsbIpCodec.EncodeOperationReply(UsbIpConstants.OpRepImport, 0, deviceInfo),
-                    cancellationToken);
-                EmitLog($"Imported busid {options.BusId}; beginning live URB session.");
-                var session = new UsbIpDeviceSession(
-                    stream, writer, descriptors, featureReports, inputReports,
-                    options.EffectiveInputInterval,
-                    options.EffectiveIsochronousOutQuiesceTimeout,
-                    capture => HidOutputReceived?.Invoke(capture),
-                    capture => IsochronousOutReceived?.Invoke(capture), EmitLog);
-                await session.RunAsync(cancellationToken);
+                if (!TryReserveImport())
+                {
+                    await writer.WriteAsync(
+                        UsbIpCodec.EncodeOperationReply(
+                            UsbIpConstants.OpRepImport, status: 1),
+                        cancellationToken);
+                    EmitLog($"Rejected import for busid {options.BusId} " +
+                        "because shutdown has begun.");
+                    return;
+                }
+                bool importReplyCommitted = false;
+                try
+                {
+                    await writer.WriteAsync(
+                        UsbIpCodec.EncodeOperationReply(
+                            UsbIpConstants.OpRepImport, 0, deviceInfo),
+                        cancellationToken);
+                    CommitImportReply();
+                    importReplyCommitted = true;
+                    EmitLog($"Imported busid {options.BusId}; beginning live URB session.");
+                    var session = new UsbIpDeviceSession(
+                        stream, writer, descriptors, featureReports, inputReports,
+                        options.EffectiveInputInterval,
+                        options.EffectiveIsochronousOutQuiesceTimeout,
+                        capture => HidOutputReceived?.Invoke(capture),
+                        capture => IsochronousOutReceived?.Invoke(capture), EmitLog);
+                    await session.RunAsync(cancellationToken);
+                }
+                finally
+                {
+                    if (!importReplyCommitted)
+                        AbandonImportReservation();
+                }
                 return;
 
             case UsbIpConstants.OpReqImport:
@@ -217,9 +292,43 @@ public sealed class VirtualDualSenseServer : IDisposable
 
     private void EmitLog(string message) => Log?.Invoke(message);
 
+    private bool TryReserveImport()
+    {
+        lock (importStateGate)
+        {
+            if (acceptingStopped != 0)
+                return false;
+            importReservations++;
+            return true;
+        }
+    }
+
+    private void CommitImportReply()
+    {
+        lock (importStateGate)
+        {
+            if (importReservations <= 0)
+                throw new InvalidOperationException(
+                    "The USB/IP import reservation was lost.");
+            importReservations--;
+            importReplyCommittedSinceStart = true;
+        }
+    }
+
+    private void AbandonImportReservation()
+    {
+        lock (importStateGate)
+        {
+            if (importReservations <= 0)
+                throw new InvalidOperationException(
+                    "The USB/IP import reservation was lost.");
+            importReservations--;
+        }
+    }
+
     public void Dispose()
     {
-        listener.Stop();
+        StopAccepting();
         timerResolution?.Dispose();
         timerResolution = null;
         GC.SuppressFinalize(this);
@@ -1254,6 +1363,7 @@ internal sealed class UsbIpDeviceSession
                 await FailSessionIfQuiescedIsochronousInRemainsAsync(quiesced,
                     cancellationToken);
             }
+
         }
     }
 

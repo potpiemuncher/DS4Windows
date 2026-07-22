@@ -227,6 +227,67 @@ public class NativeModeElevationBrokerTests
     }
 
     [TestMethod]
+    public async Task RunAttach_CallerCancellationInterruptsPendingElevation()
+    {
+        CancellationToken observedToken = default;
+        var runner = new FakeCommandRunner
+        {
+            AsynchronousImplementation = async cancellationToken =>
+            {
+                observedToken = cancellationToken;
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+                return new NativeModeCommandResult(0, string.Empty, string.Empty);
+            },
+        };
+        var broker = CreateBroker(runner, administrator: false,
+            devicePresent: () => false);
+        using var cancellation = new CancellationTokenSource();
+
+        Task<NativeModeAttachResult> attach = broker.RunAttachAsync(
+            @"C:\Program Files\USBip\usbip.exe", cancellation.Token);
+        cancellation.Cancel();
+
+        NativeModeAttachResult result = await attach;
+
+        Assert.IsFalse(result.Success);
+        Assert.AreEqual(NativeModeAttachFailureKind.CommandFailed,
+            result.FailureKind);
+        StringAssert.Contains(result.Reason, "canceled");
+        Assert.IsNotNull(result.PendingCommandCompletion);
+        Assert.IsTrue(observedToken.IsCancellationRequested);
+    }
+
+    [TestMethod]
+    public async Task RunAttach_IgnoredCancellationStillHasBoundedTimeout()
+    {
+        var pending = new TaskCompletionSource<NativeModeCommandResult>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var runner = new FakeCommandRunner
+        {
+            AsynchronousImplementation = _ => pending.Task,
+        };
+        var broker = CreateBroker(runner, administrator: false,
+            devicePresent: () => false,
+            commandTimeout: TimeSpan.FromMilliseconds(20));
+
+        NativeModeAttachResult result = await broker.RunAttachAsync(
+            @"C:\Program Files\USBip\usbip.exe").WaitAsync(
+                TimeSpan.FromSeconds(1));
+
+        Assert.IsFalse(result.Success);
+        Assert.AreEqual(NativeModeAttachFailureKind.CommandFailed,
+            result.FailureKind);
+        StringAssert.Contains(result.Reason, "did not finish within");
+        Assert.AreSame(pending.Task, result.PendingCommandCompletion);
+        Assert.IsTrue(runner.AsyncCalls[0].CancellationToken
+            .IsCancellationRequested);
+
+        pending.SetResult(new NativeModeCommandResult(
+            0, string.Empty, string.Empty));
+        await result.PendingCommandCompletion;
+    }
+
+    [TestMethod]
     public async Task RunAttach_PresenceQueryFailureReturnsSafeAttachFailure()
     {
         var runner = new FakeCommandRunner();
@@ -328,7 +389,8 @@ public class NativeModeElevationBrokerTests
         FakeCommandRunner runner, bool administrator,
         Func<bool> devicePresent, Func<string, bool> fileExists = null,
         Func<IReadOnlyList<string>> trustedRoots = null,
-        Func<bool> legacyTaskPresent = null)
+        Func<bool> legacyTaskPresent = null,
+        TimeSpan? commandTimeout = null)
     {
         return new NativeModeElevationBroker(fileExists ?? (_ => true),
             trustedRoots ?? (() => new[]
@@ -338,24 +400,28 @@ public class NativeModeElevationBrokerTests
             }), legacyTaskPresent ?? (() => false),
             () => administrator, runner, devicePresent,
             (_, _) => Task.CompletedTask,
-            @"C:\Windows\System32\schtasks.exe");
+            @"C:\Windows\System32\schtasks.exe", commandTimeout);
     }
 
     private sealed class FakeCommandRunner : INativeModeCommandRunner
     {
         public NativeModeCommandResult AsynchronousResult { get; set; } =
             new NativeModeCommandResult(0, string.Empty, string.Empty);
+        public Func<CancellationToken, Task<NativeModeCommandResult>>
+            AsynchronousImplementation { get; set; }
         public List<CommandCall> AsyncCalls { get; } = new List<CommandCall>();
 
         public Task<NativeModeCommandResult> RunAsync(string executable,
             IReadOnlyList<string> arguments, bool elevate,
             CancellationToken cancellationToken)
         {
-            AsyncCalls.Add(new CommandCall(executable, arguments.ToArray(), elevate));
-            return Task.FromResult(AsynchronousResult);
+            AsyncCalls.Add(new CommandCall(executable, arguments.ToArray(),
+                elevate, cancellationToken));
+            return AsynchronousImplementation?.Invoke(cancellationToken) ??
+                Task.FromResult(AsynchronousResult);
         }
     }
 
     private sealed record CommandCall(string Executable, string[] Arguments,
-        bool Elevate);
+        bool Elevate, CancellationToken CancellationToken);
 }

@@ -10,6 +10,10 @@ public class NativeModeLogClassifierTests
         NativeModeLogKind.ServerListening)]
     [DataRow("No physical Bluetooth DualSense with streaming reports was found.",
         NativeModeLogKind.PadOpenFailure)]
+    [DataRow("NativeRenderKeepaliveReady: active.",
+        NativeModeLogKind.RenderKeepaliveReady)]
+    [DataRow("NativeRenderKeepaliveFailed: helper render pin could not be maintained.",
+        NativeModeLogKind.RenderKeepaliveFailure)]
     [DataRow("Bluetooth input stopped after 750 valid reports (Win32 error 1167). The physical pad is gone; restart serve after it reconnects.",
         NativeModeLogKind.PadLost)]
     [DataRow("FatalUsbIpSession: ISO OUT quiesce watchdog found 2 unlinked transfers.",
@@ -40,6 +44,8 @@ public class NativeModeLogClassifierTests
     [DataRow(NativeModeLogKind.IsochronousOutStats, true, false)]
     [DataRow(NativeModeLogKind.AudioStats, false, false)]
     [DataRow(NativeModeLogKind.ServerListening, false, true)]
+    [DataRow(NativeModeLogKind.RenderKeepaliveReady, false, true)]
+    [DataRow(NativeModeLogKind.RenderKeepaliveFailure, false, true)]
     [DataRow(NativeModeLogKind.PadLost, false, true)]
     [DataRow(NativeModeLogKind.FatalUsbIpSession, false, true)]
     [DataRow(NativeModeLogKind.SpeakerRebuffer, false, true)]
@@ -84,5 +90,98 @@ public class NativeModeLogClassifierTests
         Assert.IsNotNull(lastState);
         Assert.AreEqual(NativeModeState.Faulted, lastState.State);
         Assert.AreEqual(fatal, lastState.Detail);
+    }
+
+    [TestMethod]
+    public async Task ProcessLogLine_RenderKeepaliveMarkerCompletesReadiness()
+    {
+        var manager = new NativeModeManager();
+        Task wait = manager.WaitForRenderKeepaliveAsync(TimeSpan.FromSeconds(1));
+
+        bool forward = manager.ProcessLogLine(
+            "NativeRenderKeepaliveReady: active.", warning: false);
+
+        await wait;
+        Assert.IsTrue(forward);
+    }
+
+    [TestMethod]
+    public async Task ProcessLogLine_RenderKeepaliveFailureFaultsReadiness()
+    {
+        var manager = new NativeModeManager();
+        Task wait = manager.WaitForRenderKeepaliveAsync(TimeSpan.FromSeconds(1));
+
+        manager.ProcessLogLine(
+            "NativeRenderKeepaliveFailed: helper render pin could not be maintained.",
+            warning: false);
+
+        await Assert.ThrowsExceptionAsync<InvalidOperationException>(
+            async () => await wait);
+        Assert.AreEqual(NativeModeState.Faulted, manager.State);
+    }
+
+    [DataTestMethod]
+    [DataRow(NativeModeState.PadLost)]
+    [DataRow(NativeModeState.SetupRequired)]
+    [DataRow(NativeModeState.Faulted)]
+    public async Task RenderKeepaliveWait_FailsOnEveryFaultTerminalState(
+        NativeModeState terminalState)
+    {
+        var manager = new NativeModeManager();
+        Task wait = manager.WaitForRenderKeepaliveAsync(
+            TimeSpan.FromSeconds(5));
+
+        switch (terminalState)
+        {
+            case NativeModeState.PadLost:
+                manager.MarkPadLost("pad lost");
+                break;
+            case NativeModeState.SetupRequired:
+                manager.MarkSetupRequired("setup required");
+                break;
+            default:
+                manager.MarkFaulted("session faulted");
+                break;
+        }
+
+        await Assert.ThrowsExceptionAsync<InvalidOperationException>(
+            async () => await wait);
+    }
+
+    [TestMethod]
+    public async Task RenderKeepaliveWait_CancelsOnSuccessfulStop()
+    {
+        var manager = new NativeModeManager();
+        Task wait = manager.WaitForRenderKeepaliveAsync(
+            TimeSpan.FromSeconds(5));
+
+        await manager.StopAsync();
+
+        await Assert.ThrowsExceptionAsync<TaskCanceledException>(
+            async () => await wait);
+    }
+
+    [TestMethod]
+    public async Task RenderReadiness_RejectsMarkersFromEarlierGeneration()
+    {
+        var readiness = new NativeModeRenderReadiness();
+        long firstGeneration = readiness.BeginSession();
+        Task firstWait = readiness.GetCurrentTask();
+        long secondGeneration = readiness.BeginSession();
+        Task secondWait = readiness.GetCurrentTask();
+
+        await Assert.ThrowsExceptionAsync<TaskCanceledException>(
+            async () => await firstWait);
+        bool staleActionRan = false;
+        Assert.IsFalse(readiness.TryRunForCurrent(firstGeneration,
+            () => staleActionRan = true));
+        Assert.IsFalse(staleActionRan);
+        Assert.IsFalse(readiness.TrySetReady(firstGeneration));
+        Assert.IsFalse(readiness.TrySetFailure(firstGeneration,
+            new InvalidOperationException("stale helper failure")));
+        Assert.IsFalse(secondWait.IsCompleted);
+
+        Assert.IsTrue(readiness.TrySetReady(secondGeneration));
+        await secondWait;
     }
 }

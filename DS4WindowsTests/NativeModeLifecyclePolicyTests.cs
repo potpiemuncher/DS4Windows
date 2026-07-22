@@ -5,6 +5,34 @@ namespace DS4WindowsTests;
 [TestClass]
 public class NativeModeLifecyclePolicyTests
 {
+    [TestMethod]
+    public void StartupSafety_AllowsConfirmedAbsence()
+    {
+        NativeModeStartupSafety.EnsureNoExistingVirtualDevice(() => false);
+    }
+
+    [TestMethod]
+    public void StartupSafety_BlocksPresentEarlierSession()
+    {
+        InvalidOperationException failure =
+            Assert.ThrowsException<InvalidOperationException>(() =>
+                NativeModeStartupSafety.EnsureNoExistingVirtualDevice(() => true));
+
+        StringAssert.Contains(failure.Message, "will not attach another");
+    }
+
+    [TestMethod]
+    public void StartupSafety_BlocksProbeFailure()
+    {
+        InvalidOperationException failure =
+            Assert.ThrowsException<InvalidOperationException>(() =>
+                NativeModeStartupSafety.EnsureNoExistingVirtualDevice(
+                    () => throw new IOException("SetupAPI failed")));
+
+        Assert.IsInstanceOfType<IOException>(failure.InnerException);
+        StringAssert.Contains(failure.Message, "Startup is blocked");
+    }
+
     [DataTestMethod]
     [DataRow(NativeModeState.Starting, false, false, true)]
     [DataRow(NativeModeState.Serving, false, false, true)]
@@ -38,5 +66,19 @@ public class NativeModeLifecyclePolicyTests
         Assert.AreEqual(expected,
             NativeModeLifecyclePolicy.RequiresAutomaticCleanup(
                 state, suppressionActive));
+    }
+
+    [TestMethod]
+    public void QueuedAutomaticCleanup_RechecksLateCommandBarrierAtExecution()
+    {
+        bool cleanupWasQueued =
+            NativeModeLifecyclePolicy.RequiresAutomaticCleanup(
+                NativeModeState.Faulted, suppressionActive: true);
+
+        Assert.IsTrue(cleanupWasQueued);
+        Assert.IsFalse(NativeModeLifecyclePolicy.CanBeginTeardown(
+            pendingCommandBarrierActive: true));
+        Assert.IsTrue(NativeModeLifecyclePolicy.CanBeginTeardown(
+            pendingCommandBarrierActive: false));
     }
 }

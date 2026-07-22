@@ -24,6 +24,8 @@ namespace DS4Windows
     {
         Other,
         ServerListening,
+        RenderKeepaliveReady,
+        RenderKeepaliveFailure,
         PadOpenFailure,
         PadLost,
         FatalUsbIpSession,
@@ -49,6 +51,18 @@ namespace DS4Windows
 
             if (line.Contains("No physical Bluetooth DualSense", StringComparison.Ordinal))
                 return NativeModeLogKind.PadOpenFailure;
+
+            if (line.Contains("NativeRenderKeepaliveReady:",
+                StringComparison.Ordinal))
+            {
+                return NativeModeLogKind.RenderKeepaliveReady;
+            }
+
+            if (line.Contains("NativeRenderKeepaliveFailed:",
+                StringComparison.Ordinal))
+            {
+                return NativeModeLogKind.RenderKeepaliveFailure;
+            }
 
             if (line.Contains(nameof(NativeModeLogKind.FatalUsbIpSession),
                 StringComparison.Ordinal))
@@ -88,6 +102,8 @@ namespace DS4Windows
             }
 
             return fromStandardError || kind == NativeModeLogKind.ServerListening ||
+                kind == NativeModeLogKind.RenderKeepaliveReady ||
+                kind == NativeModeLogKind.RenderKeepaliveFailure ||
                 kind == NativeModeLogKind.PadOpenFailure ||
                 kind == NativeModeLogKind.PadLost ||
                 kind == NativeModeLogKind.FatalUsbIpSession ||

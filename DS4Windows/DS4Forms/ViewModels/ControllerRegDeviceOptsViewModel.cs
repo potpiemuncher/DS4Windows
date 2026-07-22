@@ -396,7 +396,8 @@ namespace DS4WinWPF.DS4Forms.ViewModels
             service.NativeModeManager.StateChanged += NativeModeManager_StateChanged;
             service.NativeModeManager.StatsChanged += NativeModeManager_StatsChanged;
             service.NativeModeSessionActivityChanged += ControlService_NativeModeSessionActivityChanged;
-            nativeModeStatus = StatusForState(service.NativeModeManager.State, null);
+            nativeModeStatus = StatusForState(service.NativeModeManager.State,
+                null, IsNativeModeSessionActive);
 
             PopulateHapticsAudioDevices();
         }
@@ -527,7 +528,11 @@ namespace DS4WinWPF.DS4Forms.ViewModels
         private void ControlService_NativeModeSessionActivityChanged(object sender, EventArgs e)
         {
             DispatchNativeModePropertyRefresh(uiContext,
-                NotifyNativeModeProperties);
+                () =>
+                {
+                    RefreshStoppedNativeModeStatus();
+                    NotifyNativeModeProperties();
+                });
         }
 
         internal static (string ButtonText, bool CanToggle,
@@ -568,9 +573,27 @@ namespace DS4WinWPF.DS4Forms.ViewModels
                 ? StatusForAttachedHaptics(nativeHapticsDetected,
                     nativeHapticsLeftRmsPercent, nativeHapticsRightRmsPercent,
                     nativeHapticsBluetoothErrors)
-                : StatusForState(e.State, e.Detail);
+                : StatusForState(e.State, e.Detail,
+                    IsNativeModeSessionActive);
             NativeModeStatusChanged?.Invoke(this, EventArgs.Empty);
             NotifyNativeModeProperties();
+        }
+
+        private void RefreshStoppedNativeModeStatus()
+        {
+            if (service.NativeModeManager.State != NativeModeState.Stopped)
+                return;
+
+            string projected = StatusForState(NativeModeState.Stopped, null,
+                IsNativeModeSessionActive);
+            if (string.Equals(nativeModeStatus, projected,
+                StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            nativeModeStatus = projected;
+            NativeModeStatusChanged?.Invoke(this, EventArgs.Empty);
         }
 
         private void ApplyNativeModeStats()
@@ -617,8 +640,12 @@ namespace DS4WinWPF.DS4Forms.ViewModels
                     bluetoothErrors);
         }
 
-        internal static string StatusForState(NativeModeState state, string detail)
+        internal static string StatusForState(NativeModeState state,
+            string detail, bool sessionActive = false)
         {
+            if (state == NativeModeState.Stopped && sessionActive)
+                return NativeModeText("NativeModeCleanupPendingStatus");
+
             return state switch
             {
                 NativeModeState.Starting =>

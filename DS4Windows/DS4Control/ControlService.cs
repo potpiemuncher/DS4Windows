@@ -107,11 +107,15 @@ namespace DS4Windows
         private readonly NativeModeRenderKeepalive nativeModeRenderKeepalive =
             new NativeModeRenderKeepalive();
         private readonly SemaphoreSlim nativeModeLifecycleGate = new SemaphoreSlim(1, 1);
+        private readonly NativeModeSessionCancellation nativeModeSessionCancellation =
+            new NativeModeSessionCancellation();
         private readonly object nativeModeDeferredCleanupGate = new object();
         private Task nativeModeDeferredCleanupTask = Task.CompletedTask;
+        private Task nativeModePendingCommandCompletion = Task.CompletedTask;
         private long nativeModeProtectionGeneration;
         private int nativeModeAutomaticCleanupInProgress;
         private volatile bool nativeModeProtectionReleasePending;
+        private volatile bool nativeModePendingCommandBarrierActive;
         private bool nativeModeDeferredRescanRequested;
         private volatile bool nativeModeShutdownRequested;
         public NativeModeManager NativeModeManager => nativeModeManager;
@@ -122,7 +126,8 @@ namespace DS4Windows
                 DS4Devices.NativeModeGuard.IsActive,
                 nativeModeManager.HasOwnedProcess) ||
             nativeModeRenderKeepalive.HasSession ||
-            nativeModeProtectionReleasePending;
+            nativeModeProtectionReleasePending ||
+            nativeModePendingCommandBarrierActive;
 
         private DS4WinWPF.ArgumentParser cmdParser;
 
@@ -1594,6 +1599,7 @@ namespace DS4Windows
 
         public bool Start(bool showlog = true)
         {
+            nativeModeSessionCancellation.ResetForServiceStart();
             nativeModeShutdownRequested = false;
             inServiceTask = true;
             StartViGEm();
@@ -1837,8 +1843,9 @@ namespace DS4Windows
                 runHotPlug = false;
             }
 
-            // This is intentionally synchronous: service shutdown must not
-            // return while its native-mode child can still own the virtual pad.
+            // Cancel in-progress startup first, then synchronously complete the
+            // bounded ordered stop. A fail-closed stop may deliberately leave
+            // the helper and protections active rather than force-killing it.
             StopNativeModeForShutdown();
 
             if (wasRunning)
@@ -2092,9 +2099,17 @@ namespace DS4Windows
         public async Task StartNativeModeAsync(int deviceIndex,
             CancellationToken cancellationToken = default)
         {
-            await nativeModeLifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            CancellationTokenSource sessionCancellation =
+                nativeModeSessionCancellation.Begin(cancellationToken);
+            CancellationToken startupToken = sessionCancellation.Token;
+            bool lifecycleGateHeld = false;
             try
             {
+                await nativeModeLifecycleGate.WaitAsync(startupToken)
+                    .ConfigureAwait(false);
+                lifecycleGateHeld = true;
+                startupToken.ThrowIfCancellationRequested();
+
                 if (IsNativeModeSessionActive)
                 {
                     throw new InvalidOperationException(
@@ -2103,6 +2118,17 @@ namespace DS4Windows
 
                 if (nativeModeShutdownRequested || !running)
                     throw new InvalidOperationException("DS4Windows service is not running.");
+
+                try
+                {
+                    NativeModeStartupSafety.EnsureNoExistingVirtualDevice(
+                        NativeModeDevicePresence.IsVirtualDualSensePresent);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    nativeModeManager.MarkSetupRequired(ex.Message);
+                    throw;
+                }
 
                 if (deviceIndex < 0 || deviceIndex >= DS4Controllers.Length)
                     throw new ArgumentOutOfRangeException(nameof(deviceIndex));
@@ -2133,6 +2159,7 @@ namespace DS4Windows
 
                 try
                 {
+                    startupToken.ThrowIfCancellationRequested();
                     await NativeModeStartupOrchestration
                         .RunWithAudioDefaultProtectionAsync(
                             nativeModeAudioDefaultGuard.Capture,
@@ -2160,6 +2187,7 @@ namespace DS4Windows
                                     ReleaseControllerForNativeMode(device,
                                         deviceIndex)).ConfigureAwait(false);
 
+                                startupToken.ThrowIfCancellationRequested();
                                 if (nativeModeShutdownRequested)
                                 {
                                     throw new InvalidOperationException(
@@ -2167,15 +2195,15 @@ namespace DS4Windows
                                 }
 
                                 await nativeModeManager.StartAsync(serverArguments,
-                                    CancellationToken.None).ConfigureAwait(false);
+                                    startupToken).ConfigureAwait(false);
 
                                 await nativeModeManager.WaitForServingAsync(
-                                    TimeSpan.FromSeconds(10), cancellationToken)
+                                    TimeSpan.FromSeconds(10), startupToken)
                                     .ConfigureAwait(false);
 
                                 NativeModeAttachResult attachResult =
                                     await nativeModeElevationBroker.RunAttachAsync(
-                                        Global.UsbipExePath, cancellationToken)
+                                        Global.UsbipExePath, startupToken)
                                         .ConfigureAwait(false);
                                 if (!attachResult.Success)
                                 {
@@ -2185,7 +2213,10 @@ namespace DS4Windows
                                 }
 
                                 await nativeModeRenderKeepalive.WaitForReadyAsync(
-                                    TimeSpan.FromSeconds(10), cancellationToken)
+                                    TimeSpan.FromSeconds(10), startupToken)
+                                    .ConfigureAwait(false);
+                                await nativeModeManager.WaitForRenderKeepaliveAsync(
+                                    TimeSpan.FromSeconds(10), startupToken)
                                     .ConfigureAwait(false);
                                 nativeModeAudioDefaultGuard.ReconcileNow();
                                 nativeModeManager.MarkAttached();
@@ -2195,7 +2226,17 @@ namespace DS4Windows
                 {
                     nativeModeAudioDefaultGuard.ReconcileNow();
                     NativeModeState failedState = nativeModeManager.State;
-                    await RecoverControllerAfterFailedNativeStartAsync().ConfigureAwait(false);
+                    if (attachFailure?.PendingCommandCompletion != null)
+                    {
+                        SchedulePendingNativeModeCommandRecovery(
+                            attachFailure.PendingCommandCompletion,
+                            nativeModeProtectionGeneration);
+                    }
+                    else
+                    {
+                        await RecoverControllerAfterFailedNativeStartAsync()
+                            .ConfigureAwait(false);
+                    }
                     if (!nativeModeShutdownRequested)
                     {
                         if (attachFailure?.FailureKind ==
@@ -2210,7 +2251,12 @@ namespace DS4Windows
                         else
                         {
                             nativeModeManager.MarkFaulted(
-                                attachFailure?.Reason ?? ex.Message);
+                                attachFailure?.PendingCommandCompletion != null
+                                    ? (attachFailure.Reason +
+                                        " Native Mode is retaining its helper " +
+                                        "and protections until Windows confirms " +
+                                        "that the elevated command has stopped.")
+                                    : (attachFailure?.Reason ?? ex.Message));
                         }
                     }
                     throw;
@@ -2218,7 +2264,14 @@ namespace DS4Windows
             }
             finally
             {
-                nativeModeLifecycleGate.Release();
+                if (lifecycleGateHeld)
+                    nativeModeLifecycleGate.Release();
+
+                if (!nativeModeProtectionReleasePending)
+                {
+                    nativeModeSessionCancellation.CompleteSession(
+                        sessionCancellation);
+                }
             }
         }
 
@@ -2246,7 +2299,8 @@ namespace DS4Windows
             return new[]
             {
                 "serve",
-                "--protocol-version", "1",
+                "--protocol-version", "2",
+                "--control-stdin", "required",
                 "--configuration", "composite",
                 "--input", "bluetooth",
                 "--device-path", devicePath.Trim(),
@@ -2325,6 +2379,9 @@ namespace DS4Windows
             nativeModeShutdownRequested = true;
             try
             {
+                // Make cancellation explicit before the synchronous shutdown
+                // path can wait behind a startup which owns the lifecycle gate.
+                nativeModeSessionCancellation.RequestStop();
                 StopNativeModeAsync(rescanAfterStop: false,
                     CancellationToken.None).GetAwaiter().GetResult();
             }
@@ -2339,13 +2396,31 @@ namespace DS4Windows
         private async Task StopNativeModeAsync(bool rescanAfterStop,
             CancellationToken cancellationToken)
         {
-            await nativeModeLifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            nativeModeSessionCancellation.RequestStop();
+            bool lifecycleGateHeld = false;
             try
             {
+                await nativeModeLifecycleGate.WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                lifecycleGateHeld = true;
+
+                if (nativeModePendingCommandBarrierActive)
+                {
+                    nativeModeDeferredRescanRequested |= rescanAfterStop;
+                    AppLogger.LogToGui(
+                        "[native] Native-mode stop is deferred until Windows " +
+                        "confirms that the already-requested elevated action " +
+                        "has stopped. The helper, render pins, audio-default " +
+                        "guard, and controller suppression remain active.",
+                        true);
+                    return;
+                }
+
                 if (!IsNativeModeSessionActive &&
                     !nativeModeProtectionReleasePending)
                 {
                     nativeModeAudioDefaultGuard.EndSession(restoreDefaultsNow: true);
+                    nativeModeSessionCancellation.CompleteCurrentSession();
                     return;
                 }
 
@@ -2354,7 +2429,10 @@ namespace DS4Windows
             }
             finally
             {
-                nativeModeLifecycleGate.Release();
+                if (lifecycleGateHeld)
+                    nativeModeLifecycleGate.Release();
+                nativeModeSessionCancellation.CompleteStop(
+                    allowFutureStarts: !nativeModeShutdownRequested);
             }
         }
 
@@ -2376,6 +2454,14 @@ namespace DS4Windows
             Task RenderReleaseTask)>
             TryStopNativeModeUnderGateAsync(bool rescanAfterStop)
         {
+            if (!NativeModeLifecyclePolicy.CanBeginTeardown(
+                nativeModePendingCommandBarrierActive))
+            {
+                throw new InvalidOperationException(
+                    "Native Mode cannot begin teardown until Windows confirms " +
+                    "that the pending elevated action has stopped.");
+            }
+
             nativeModeAudioDefaultGuard.ReconcileNow();
             nativeModeDeferredRescanRequested |= rescanAfterStop;
             long generation = nativeModeProtectionGeneration;
@@ -2420,6 +2506,96 @@ namespace DS4Windows
                 AppLogger.LogToGui(
                     $"[native] Native-mode {context} must be retried after the " +
                     $"stop failure: {attempt.Failure.Message}", true);
+            }
+        }
+
+        private void SchedulePendingNativeModeCommandRecovery(
+            Task commandCompletion, long generation)
+        {
+            if (commandCompletion == null)
+                throw new ArgumentNullException(nameof(commandCompletion));
+            if (nativeModePendingCommandBarrierActive)
+            {
+                throw new InvalidOperationException(
+                    "A Native Mode elevated-command barrier is already active.");
+            }
+
+            Volatile.Write(ref nativeModePendingCommandCompletion,
+                commandCompletion);
+            nativeModePendingCommandBarrierActive = true;
+            nativeModeDeferredRescanRequested = true;
+            AppLogger.LogToGui(
+                "[native] Windows still owns an outstanding elevated action. " +
+                "Cleanup is deferred fail-closed; do not end the helper or " +
+                "render keepalives until that action reaches a terminal state.",
+                true);
+            _ = Task.Run(() => RecoverAfterPendingNativeModeCommandAsync(
+                commandCompletion, generation));
+        }
+
+        private async Task RecoverAfterPendingNativeModeCommandAsync(
+            Task commandCompletion, long generation)
+        {
+            try
+            {
+                await NativeModeStartupOrchestration
+                    .RunAfterCommandTerminationAsync(commandCompletion,
+                    async () =>
+                    {
+                        // NativeModeProcessRunner does not make the command
+                        // terminal until any started client is confirmed gone.
+                        await nativeModeLifecycleGate.WaitAsync()
+                            .ConfigureAwait(false);
+                        try
+                        {
+                            if (!ReferenceEquals(
+                                Volatile.Read(
+                                    ref nativeModePendingCommandCompletion),
+                                commandCompletion))
+                            {
+                                return;
+                            }
+
+                            nativeModePendingCommandBarrierActive = false;
+                            Volatile.Write(
+                                ref nativeModePendingCommandCompletion,
+                                Task.CompletedTask);
+
+                            if (generation !=
+                                    nativeModeProtectionGeneration ||
+                                !nativeModeProtectionReleasePending)
+                            {
+                                return;
+                            }
+
+                            await RecoverControllerAfterFailedNativeStartAsync(
+                                rescanAfterStop:
+                                    !nativeModeShutdownRequested)
+                                .ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            AppLogger.LogToGui(
+                                "[native] Cleanup after the elevated action " +
+                                "reached a terminal state failed: " +
+                                $"{ex.Message}. Protections remain active; " +
+                                "retry Stop Native Mode.",
+                                true);
+                        }
+                        finally
+                        {
+                            nativeModeLifecycleGate.Release();
+                        }
+                    }).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // This operation is intentionally detached from the failed
+                // startup call; observe every failure and retain protections.
+                AppLogger.LogToGui(
+                    "[native] Elevated-action cleanup observer failed: " +
+                    $"{ex.Message}. Protections remain active.",
+                    true);
             }
         }
 
@@ -2520,6 +2696,7 @@ namespace DS4Windows
             bool rescanAfterStop = nativeModeDeferredRescanRequested;
             nativeModeProtectionReleasePending = false;
             nativeModeDeferredRescanRequested = false;
+            nativeModeSessionCancellation.CompleteCurrentSession();
             try
             {
                 nativeModeAudioDefaultGuard.EndSession(restoreDefaultsNow: true);
@@ -2586,6 +2763,7 @@ namespace DS4Windows
             NativeModeStateChangedEventArgs e)
         {
             if (!nativeModeShutdownRequested &&
+                !nativeModePendingCommandBarrierActive &&
                 Volatile.Read(ref nativeModeAutomaticCleanupInProgress) == 0 &&
                 NativeModeLifecyclePolicy.RequiresAutomaticCleanup(e.State,
                 DS4Devices.NativeModeGuard.IsActive))
@@ -2607,6 +2785,8 @@ namespace DS4Windows
             try
             {
                 if (nativeModeShutdownRequested ||
+                    !NativeModeLifecyclePolicy.CanBeginTeardown(
+                        nativeModePendingCommandBarrierActive) ||
                     !NativeModeLifecyclePolicy.RequiresAutomaticCleanup(
                     terminalState, DS4Devices.NativeModeGuard.IsActive))
                 {
@@ -2668,11 +2848,12 @@ namespace DS4Windows
             activeControllers = DS4Controllers.Count(controller => controller != null);
         }
 
-        private async Task RecoverControllerAfterFailedNativeStartAsync()
+        private async Task RecoverControllerAfterFailedNativeStartAsync(
+            bool rescanAfterStop = true)
         {
             long generation = nativeModeProtectionGeneration;
             (NativeModeTeardownAttempt attempt, Task renderReleaseTask) =
-                await TryStopNativeModeUnderGateAsync(rescanAfterStop: true)
+                await TryStopNativeModeUnderGateAsync(rescanAfterStop)
                     .ConfigureAwait(false);
             HandleDeferredNativeModeCleanup(attempt, generation,
                 renderReleaseTask, startupRecovery: true);

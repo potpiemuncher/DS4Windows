@@ -125,6 +125,54 @@ public static class DeviceSelfTest
             return 1;
         }
 
+        ControlResult getRenderInterface = ep0.Handle(
+            new UsbSetupPacket(0x81, UsbStandardRequest.GetInterface,
+                0, 1, 1),
+            ReadOnlySpan<byte>.Empty);
+        ControlResult invalidRenderAlt = ep0.Handle(
+            new UsbSetupPacket(0x01, UsbStandardRequest.SetInterface,
+                2, 1, 0),
+            ReadOnlySpan<byte>.Empty);
+        ControlResult invalidInterface = ep0.Handle(
+            new UsbSetupPacket(0x01, UsbStandardRequest.SetInterface,
+                0, 4, 0),
+            ReadOnlySpan<byte>.Empty);
+        if (getRenderInterface.Status != 0 ||
+            !getRenderInterface.Data.AsSpan().SequenceEqual(new byte[] { 1 }) ||
+            invalidRenderAlt.Status == 0 || invalidInterface.Status == 0)
+        {
+            Console.Error.WriteLine("FAIL: interface/alternate-setting descriptor validation is invalid.");
+            return 1;
+        }
+        checks += 3;
+
+        var getHidProtocol = new UsbSetupPacket(
+            RequestType: 0xA1,
+            Request: UsbHidRequest.GetProtocol,
+            Value: 0,
+            Index: descriptors.HidInterfaceNumber,
+            Length: 1);
+        ControlResult hidProtocol = ep0.Handle(getHidProtocol, ReadOnlySpan<byte>.Empty);
+        ControlResult hidWrongInterface = ep0.Handle(
+            getHidProtocol with { Index = 1 }, ReadOnlySpan<byte>.Empty);
+        ControlResult hidMalformedIndex = ep0.Handle(
+            getHidProtocol with
+            {
+                Index = (ushort)(0x0100 | descriptors.HidInterfaceNumber),
+            },
+            ReadOnlySpan<byte>.Empty);
+        ControlResult hidWrongRecipient = ep0.Handle(
+            getHidProtocol with { RequestType = 0xA0 }, ReadOnlySpan<byte>.Empty);
+        if (hidProtocol.Status != 0 ||
+            !hidProtocol.Data.AsSpan().SequenceEqual(new byte[] { 1 }) ||
+            hidWrongInterface.Status == 0 || hidMalformedIndex.Status == 0 ||
+            hidWrongRecipient.Status == 0)
+        {
+            Console.Error.WriteLine("FAIL: HID class recipient/interface validation is invalid.");
+            return 1;
+        }
+        checks += 4;
+
         var getSpeakerMute = new UsbSetupPacket(
             RequestType: 0xA1,
             Request: 0x81,
@@ -179,8 +227,71 @@ public static class DeviceSelfTest
             return 1;
         }
 
+        var hidOnlyDescriptors = DescriptorSet.LoadHidOnlyFromFixtures(fixturesDir);
+        var hidOnlyEp0 = new ControlEndpoint(hidOnlyDescriptors);
+        ControlResult hidOnlyConfiguration = hidOnlyEp0.Handle(
+            new UsbSetupPacket(0x00, UsbStandardRequest.SetConfiguration,
+                1, 0, 0),
+            ReadOnlySpan<byte>.Empty);
+        ControlResult hidOnlyValidAlt = hidOnlyEp0.Handle(
+            new UsbSetupPacket(0x01, UsbStandardRequest.SetInterface,
+                0, 0, 0),
+            ReadOnlySpan<byte>.Empty);
+        ControlResult hidOnlyInvalidAlt = hidOnlyEp0.Handle(
+            new UsbSetupPacket(0x01, UsbStandardRequest.SetInterface,
+                1, 0, 0),
+            ReadOnlySpan<byte>.Empty);
+        ControlResult hidOnlyInvalidInterface = hidOnlyEp0.Handle(
+            new UsbSetupPacket(0x01, UsbStandardRequest.SetInterface,
+                0, 1, 0),
+            ReadOnlySpan<byte>.Empty);
+        ControlResult hidOnlyInvalidGetInterface = hidOnlyEp0.Handle(
+            new UsbSetupPacket(0x81, UsbStandardRequest.GetInterface,
+                0, 1, 1),
+            ReadOnlySpan<byte>.Empty);
+        ControlResult hidOnlyAudioGetRequest = hidOnlyEp0.Handle(
+            getSpeakerMute, ReadOnlySpan<byte>.Empty);
+        // UAC SET_CUR shares bRequest 0x01 with HID GET_REPORT. Before class
+        // routing was descriptor-backed, a request shaped like this could be
+        // misrouted to HID and return virtual feature report 0x09.
+        ControlResult hidOnlyAudioWriteRequest = hidOnlyEp0.Handle(
+            new UsbSetupPacket(
+                RequestType: 0x21,
+                Request: 0x01,
+                Value: 0x0309,
+                Index: 0x0200,
+                Length: 20),
+            new byte[20]);
+        var hidOnlyGetProtocol = getHidProtocol with
+        {
+            Index = hidOnlyDescriptors.HidInterfaceNumber,
+        };
+        ControlResult hidOnlyHidProtocol = hidOnlyEp0.Handle(
+            hidOnlyGetProtocol, ReadOnlySpan<byte>.Empty);
+        ControlResult hidOnlyWrongHidInterface = hidOnlyEp0.Handle(
+            hidOnlyGetProtocol with { Index = 1 }, ReadOnlySpan<byte>.Empty);
+        ControlResult hidOnlyMalformedHidIndex = hidOnlyEp0.Handle(
+            hidOnlyGetProtocol with { Index = 0x0100 }, ReadOnlySpan<byte>.Empty);
+        ControlResult hidOnlyWrongHidRecipient = hidOnlyEp0.Handle(
+            hidOnlyGetProtocol with { RequestType = 0xA0 }, ReadOnlySpan<byte>.Empty);
+
+        if (hidOnlyConfiguration.Status != 0 || hidOnlyValidAlt.Status != 0 ||
+            hidOnlyInvalidAlt.Status == 0 || hidOnlyInvalidInterface.Status == 0 ||
+            hidOnlyInvalidGetInterface.Status == 0 || hidOnlyAudioGetRequest.Status == 0 ||
+            hidOnlyAudioWriteRequest.Status == 0 ||
+            hidOnlyHidProtocol.Status != 0 ||
+            !hidOnlyHidProtocol.Data.AsSpan().SequenceEqual(new byte[] { 1 }) ||
+            hidOnlyWrongHidInterface.Status == 0 || hidOnlyMalformedHidIndex.Status == 0 ||
+            hidOnlyWrongHidRecipient.Status == 0)
+        {
+            Console.Error.WriteLine(
+                "FAIL: HID-only EP0 accepted an invalid audio, interface, alternate-setting, or HID request.");
+            return 1;
+        }
+        checks += 11;
+
         Console.WriteLine($"PASS: {checks} EP0 checks byte-exact; device configured, " +
-            $"audio-streaming alt setting activated; UAC mute/volume controls and range passed.");
+            $"composite UAC/HID and HID-only request validation passed.");
         return 0;
     }
 }

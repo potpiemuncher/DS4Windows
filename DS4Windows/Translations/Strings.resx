@@ -1060,6 +1060,9 @@ Disabled:
   <data name="ControllerRegOptWin.NativeModeStoppedStatus" xml:space="preserve">
     <value>Native Mode stopped.</value>
   </data>
+  <data name="ControllerRegOptWin.NativeModeCleanupPendingStatus" xml:space="preserve">
+    <value>Native Mode cleanup is pending; protections remain active. Use Stop Native Mode to retry.</value>
+  </data>
   <data name="ControllerRegOptWin.Buffering" xml:space="preserve">
     <value>Buffering</value>
   </data>

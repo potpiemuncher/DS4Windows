@@ -3,12 +3,13 @@
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net.Sockets;
 using VirtualDualSenseUsbip.Device;
 using VirtualDualSenseUsbip.Live;
 using VirtualDualSenseUsbip.Protocol;
 
 const string NativeModeProtocolCapability =
-    "DS4WINDOWS_NATIVE_USBIP_PROTOCOL=1";
+    "DS4WINDOWS_NATIVE_USBIP_PROTOCOL=2";
 
 if (args.Length == 1 &&
     args[0].Equals("capabilities", StringComparison.OrdinalIgnoreCase))
@@ -38,14 +39,33 @@ if (args.Length >= 1 && args[0].Equals("servertest", StringComparison.OrdinalIgn
     return;
 }
 
+if (args.Length >= 1 && args[0].Equals("lifecycletest", StringComparison.OrdinalIgnoreCase))
+{
+    await NativeModeContainmentSelfTest.RunAsync();
+    return;
+}
+
 if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCase))
 {
+    Console.SetOut(new BrokenPipeTolerantTextWriter(Console.Out));
+    Console.SetError(new BrokenPipeTolerantTextWriter(Console.Error));
+
     string? protocolVersion = GetOption(args, "--protocol-version");
-    if (!string.Equals(protocolVersion, "1", StringComparison.Ordinal))
+    if (!string.Equals(protocolVersion, "2", StringComparison.Ordinal))
     {
         throw new ArgumentException(
-            "--protocol-version 1 is required for a DS4Windows-managed server.");
+            "--protocol-version 2 is required for a DS4Windows-managed server.");
     }
+    string? controlStdin = GetOption(args, "--control-stdin");
+    if (!string.Equals(controlStdin, "required", StringComparison.Ordinal) ||
+        !Console.IsInputRedirected)
+    {
+        throw new ArgumentException(
+            "--control-stdin required with redirected standard input is required " +
+            "for a DS4Windows-managed server.");
+    }
+    Task<NativeModeControlLeaseResult> controlLease =
+        NativeModeControlLease.WaitAsync(Console.In);
 
     string fixtures = DefaultFixturesPath();
     string busId = GetOption(args, "--busid") ?? "1-1";
@@ -253,11 +273,18 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
         }
     };
 
+    var renderKeepalive = new NativeModeChildRenderKeepalive(
+        message => Console.WriteLine(message));
+    bool renderSessionBegun = false;
+    Task? serverTask = null;
+    Exception? terminalFailure = null;
+    var consoleStop = new TaskCompletionSource<bool>(
+        TaskCreationOptions.RunContinuationsAsynchronously);
     using var cancellation = new CancellationTokenSource();
     ConsoleCancelEventHandler cancelHandler = (_, eventArgs) =>
     {
         eventArgs.Cancel = true;
-        cancellation.Cancel();
+        consoleStop.TrySetResult(true);
     };
     Console.CancelKeyPress += cancelHandler;
 
@@ -297,6 +324,10 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
 
     try
     {
+        // Capture the endpoint baseline before the USB/IP listener is visible.
+        // This child-owned pin is redundant with the parent pin by design.
+        renderSessionBegun = true;
+        renderKeepalive.BeginSession();
         server.Start();
         Console.WriteLine($"Virtual DualSense ({configurationMode} configuration) is ready for usbip-win2.");
         if (speakerAudio)
@@ -307,16 +338,134 @@ if (args.Length >= 1 && args[0].Equals("serve", StringComparison.OrdinalIgnoreCa
         }
         Console.WriteLine($"Attach from an elevated terminal:");
         Console.WriteLine($"  usbip attach -r 127.0.0.1 -b {busId} --serial {suggestedSerial} --once");
-        await server.RunAsync(cancellation.Token);
+        serverTask = server.RunAsync(cancellation.Token);
+        Task<Exception> renderFailure = renderKeepalive.WaitForFailureAsync();
+        Task completed = await Task.WhenAny(
+            serverTask,
+            controlLease,
+            renderFailure,
+            consoleStop.Task);
+
+        if (ReferenceEquals(completed, consoleStop.Task))
+        {
+            Console.WriteLine("NativeControlLeaseEnded: console stop requested.");
+        }
+        else if (ReferenceEquals(completed, controlLease))
+        {
+            NativeModeControlLeaseResult result = await controlLease;
+            Console.WriteLine(result.Signal switch
+            {
+                NativeModeControlSignal.StopRequested =>
+                    "NativeControlLeaseEnded: stop requested.",
+                NativeModeControlSignal.ParentPipeClosed =>
+                    "NativeControlLeaseEnded: parent pipe closed.",
+                _ => "NativeControlLeaseEnded: protocol violation.",
+            });
+            if (result.Signal == NativeModeControlSignal.ProtocolViolation)
+            {
+                terminalFailure = new InvalidOperationException(
+                    result.Detail ?? "The Native Mode control lease failed.");
+            }
+        }
+        else if (ReferenceEquals(completed, renderFailure))
+        {
+            terminalFailure = await renderFailure;
+        }
+        else
+        {
+            try
+            {
+                await serverTask;
+            }
+            catch (Exception ex) when (
+                ex is OperationCanceledException or SocketException)
+            {
+                if (!cancellation.IsCancellationRequested)
+                    terminalFailure = ex;
+            }
+            catch (Exception ex)
+            {
+                terminalFailure = ex;
+            }
+
+            if (terminalFailure == null &&
+                !cancellation.IsCancellationRequested)
+            {
+                terminalFailure = new InvalidOperationException(
+                    "The USB/IP server stopped without a control-lease signal.");
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        terminalFailure ??= ex;
     }
     finally
     {
         Console.CancelKeyPress -= cancelHandler;
+        // Refuse a second attach before evaluating the shutdown barrier. This
+        // closes only the listening socket; an active USB/IP session remains
+        // alive until cancellation below, under the healthy render lease.
+        server.StopAccepting();
+        if (renderSessionBegun)
+        {
+            // If attach raced stop/EOF, keep discovery and any active USB/IP
+            // session alive until this process owns a healthy render pin or
+            // the exact parent is already absent. Probe failure deliberately
+            // blocks here.
+            await renderKeepalive.WaitForShutdownSafetyAsync(
+                () => server.RequiresHealthyRenderLeaseForShutdown,
+                CancellationToken.None);
+            renderKeepalive.BeginTeardown();
+        }
+        // Cancellation now propagates through every active request pump.
+        // Awaiting serverTask proves the session and its socket have quiesced
+        // while the render pin is still held.
+        cancellation.Cancel();
+        if (serverTask != null)
+        {
+            try
+            {
+                await serverTask;
+                Console.WriteLine(
+                    "NativeUsbIpSessionClosed: listener stopped, requests " +
+                    "quiesced, and the active socket closed.");
+            }
+            catch (OperationCanceledException)
+            {
+                Console.WriteLine(
+                    "NativeUsbIpSessionClosed: listener stopped, requests " +
+                    "quiesced, and the active socket closed.");
+            }
+            catch (SocketException) when (cancellation.IsCancellationRequested)
+            {
+                Console.WriteLine(
+                    "NativeUsbIpSessionClosed: listener stopped, requests " +
+                    "quiesced, and the active socket closed.");
+            }
+            catch (Exception ex)
+            {
+                terminalFailure ??= ex;
+            }
+        }
         if (audioStats != null)
         {
-            cancellation.Cancel();
             await audioStats;
         }
+        if (renderSessionBegun)
+        {
+            // No timeout in production. An inconclusive PnP/audio probe means
+            // this helper intentionally remains alive retaining the pin.
+            await renderKeepalive.RetainUntilRemovedAndReleaseAsync(
+                CancellationToken.None);
+        }
+    }
+
+    if (terminalFailure != null)
+    {
+        throw new InvalidOperationException(
+            "Native Mode helper containment completed after a failure.",
+            terminalFailure);
     }
     return;
 }
@@ -326,8 +475,9 @@ Console.WriteLine("  capabilities          print the DS4Windows helper protocol 
 Console.WriteLine("  selftest              USB/IP protocol golden vectors + fragmentation");
 Console.WriteLine("  devicetest [fixtures] replay captured EP0 enumeration byte-exact");
 Console.WriteLine("  servertest [fixtures] exercise the live server over loopback TCP");
+Console.WriteLine("  lifecycletest         control-lease and render-retention checks");
 Console.WriteLine("  serve [--port 3240] [--busid 1-1]");
-Console.WriteLine("        --protocol-version 1");
+Console.WriteLine("        --protocol-version 2 --control-stdin required");
 Console.WriteLine("        --input bluetooth --configuration composite");
 Console.WriteLine("        --device-path PATH --device-vid VID --device-pid PID");
 Console.WriteLine("        [--speaker-audio on|off] [--speaker-volume 0..100]");

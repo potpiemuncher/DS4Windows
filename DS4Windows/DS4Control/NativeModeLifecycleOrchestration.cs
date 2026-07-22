@@ -76,6 +76,34 @@ namespace DS4Windows
             if (failure != null && isCurrentSession())
                 await markFaulted(failure).ConfigureAwait(false);
         }
+
+        /// <summary>
+        /// Runs recovery only after an already-dispatched command reaches a
+        /// terminal state. Its eventual success, cancellation, or failure is
+        /// deliberately observed rather than propagated: all three permit the
+        /// owner to begin ordered teardown, while a still-pending UAC launch
+        /// does not.
+        /// </summary>
+        public static async Task RunAfterCommandTerminationAsync(
+            Task commandCompletion, Func<Task> recover)
+        {
+            if (commandCompletion == null)
+                throw new ArgumentNullException(nameof(commandCompletion));
+            if (recover == null)
+                throw new ArgumentNullException(nameof(recover));
+
+            try
+            {
+                await commandCompletion.ConfigureAwait(false);
+            }
+            catch
+            {
+                // The command is terminal; its outcome is reported by the
+                // original startup failure. Recovery still has to run.
+            }
+
+            await recover().ConfigureAwait(false);
+        }
     }
 
     internal sealed class NativeModeTeardownAttempt

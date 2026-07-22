@@ -43,23 +43,48 @@ namespace DS4Windows
     public sealed class NativeModeAttachResult
     {
         private NativeModeAttachResult(bool success,
-            NativeModeAttachFailureKind failureKind, string reason)
+            NativeModeAttachFailureKind failureKind, string reason,
+            Task pendingCommandCompletion = null)
         {
             Success = success;
             FailureKind = failureKind;
             Reason = reason;
+            PendingCommandCompletion = pendingCommandCompletion;
         }
 
         public bool Success { get; }
         public NativeModeAttachFailureKind FailureKind { get; }
         public string Reason { get; }
 
+        /// <summary>
+        /// When non-null, an elevated command was already handed to Windows
+        /// but had not reached a terminal state when this result was returned.
+        /// Native Mode must retain its helper and teardown protections until
+        /// this task completes, because consent can still be granted late.
+        /// </summary>
+        internal Task PendingCommandCompletion { get; }
+
         public static NativeModeAttachResult Succeeded(string reason) =>
             new NativeModeAttachResult(true, NativeModeAttachFailureKind.None, reason);
 
         public static NativeModeAttachResult Failed(
-            NativeModeAttachFailureKind kind, string reason) =>
-            new NativeModeAttachResult(false, kind, reason);
+            NativeModeAttachFailureKind kind, string reason,
+            Task pendingCommandCompletion = null) =>
+            new NativeModeAttachResult(false, kind, reason,
+                pendingCommandCompletion);
+    }
+
+    internal sealed class NativeModeCommandExecution
+    {
+        public NativeModeCommandExecution(NativeModeCommandResult result,
+            Task pendingCompletion = null)
+        {
+            Result = result ?? throw new ArgumentNullException(nameof(result));
+            PendingCompletion = pendingCompletion;
+        }
+
+        public NativeModeCommandResult Result { get; }
+        public Task PendingCompletion { get; }
     }
 
     internal sealed class NativeModeCommandResult
@@ -89,25 +114,61 @@ namespace DS4Windows
             IReadOnlyList<string> arguments, bool elevate,
             CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                using Process process = CreateProcess(executable, arguments, elevate);
-                if (!process.Start())
+                // ShellExecute can remain inside the UAC broker until the user
+                // answers the prompt. Dispatch both process creation and Start
+                // explicitly so this call can never block a captured UI context.
+                Process process = await Task.Run(
+                    () => CreateAndStartProcess(executable, arguments, elevate),
+                    CancellationToken.None).ConfigureAwait(false);
+                if (process == null)
                 {
                     return new NativeModeCommandResult(-1, string.Empty,
                         $"Could not start {Path.GetFileName(executable)}.");
                 }
 
-                Task<string> outputTask = elevate
-                    ? Task.FromResult(string.Empty)
-                    : process.StandardOutput.ReadToEndAsync();
-                Task<string> errorTask = elevate
-                    ? Task.FromResult(string.Empty)
-                    : process.StandardError.ReadToEndAsync();
-                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-                return new NativeModeCommandResult(process.ExitCode,
-                    await outputTask.ConfigureAwait(false),
-                    await errorTask.ConfigureAwait(false));
+                using (process)
+                {
+                    try
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        Task<string> outputTask = elevate
+                            ? Task.FromResult(string.Empty)
+                            : process.StandardOutput.ReadToEndAsync();
+                        Task<string> errorTask = elevate
+                            ? Task.FromResult(string.Empty)
+                            : process.StandardError.ReadToEndAsync();
+                        await process.WaitForExitAsync(cancellationToken)
+                            .ConfigureAwait(false);
+                        return new NativeModeCommandResult(process.ExitCode,
+                            await outputTask.ConfigureAwait(false),
+                            await errorTask.ConfigureAwait(false));
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // This is the short-lived usbip/schtasks command client,
+                        // never the attached Native Mode helper process.
+                        TryTerminate(process);
+                        // Do not complete this runner until the elevated
+                        // client is definitely gone. A failed termination can
+                        // otherwise leave a late usbip attach racing cleanup.
+                        await WaitForConfirmedExitAsync(process)
+                            .ConfigureAwait(false);
+                        throw;
+                    }
+                    catch
+                    {
+                        // No error after Process.Start is allowed to make the
+                        // command look terminal while its process might live.
+                        TryTerminate(process);
+                        await WaitForConfirmedExitAsync(process)
+                            .ConfigureAwait(false);
+                        throw;
+                    }
+                }
             }
             catch (Win32Exception ex)
             {
@@ -116,6 +177,62 @@ namespace DS4Windows
                     : ex.Message;
                 return new NativeModeCommandResult(ex.NativeErrorCode,
                     string.Empty, reason);
+            }
+        }
+
+        private static Process CreateAndStartProcess(string executable,
+            IReadOnlyList<string> arguments, bool elevate)
+        {
+            Process process = CreateProcess(executable, arguments, elevate);
+            try
+            {
+                if (process.Start())
+                    return process;
+                process.Dispose();
+                return null;
+            }
+            catch
+            {
+                process.Dispose();
+                throw;
+            }
+        }
+
+        private static void TryTerminate(Process process)
+        {
+            try
+            {
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException ||
+                ex is Win32Exception || ex is NotSupportedException)
+            {
+                // The command may have exited between the probe and Kill, or
+                // an elevated process handle may not grant termination rights.
+            }
+        }
+
+        private static async Task WaitForConfirmedExitAsync(Process process)
+        {
+            while (true)
+            {
+                try
+                {
+                    if (process.HasExited)
+                        return;
+
+                    await process.WaitForExitAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is InvalidOperationException ||
+                    ex is Win32Exception || ex is NotSupportedException)
+                {
+                    // Losing query or wait rights is not proof of exit. Keep
+                    // the completion barrier pending and retry fail-closed.
+                    await Task.Delay(TimeSpan.FromMilliseconds(250))
+                        .ConfigureAwait(false);
+                }
             }
         }
 
@@ -145,6 +262,7 @@ namespace DS4Windows
             @"DS4Windows\NativeDualSenseAttach";
         private static readonly TimeSpan DefaultArrivalTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan ArrivalPollInterval = TimeSpan.FromMilliseconds(100);
+        private static readonly TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
 
         private readonly Func<string, bool> fileExists;
         private readonly Func<IReadOnlyList<string>> trustedProgramFilesRoots;
@@ -154,6 +272,7 @@ namespace DS4Windows
         private readonly Func<bool> virtualDevicePresent;
         private readonly Func<TimeSpan, CancellationToken, Task> delay;
         private readonly string taskSchedulerExecutable;
+        private readonly TimeSpan commandTimeout;
 
         public NativeModeElevationBroker() : this(File.Exists,
             GetTrustedProgramFilesRoots, IsLegacyAttachTaskPresent,
@@ -170,7 +289,7 @@ namespace DS4Windows
             INativeModeCommandRunner commandRunner,
             Func<bool> virtualDevicePresent,
             Func<TimeSpan, CancellationToken, Task> delay,
-            string taskSchedulerExecutable)
+            string taskSchedulerExecutable, TimeSpan? commandTimeout = null)
         {
             this.fileExists = fileExists ?? throw new ArgumentNullException(nameof(fileExists));
             this.trustedProgramFilesRoots = trustedProgramFilesRoots ??
@@ -186,6 +305,9 @@ namespace DS4Windows
             this.delay = delay ?? throw new ArgumentNullException(nameof(delay));
             this.taskSchedulerExecutable = taskSchedulerExecutable ??
                 throw new ArgumentNullException(nameof(taskSchedulerExecutable));
+            this.commandTimeout = commandTimeout ?? DefaultCommandTimeout;
+            if (this.commandTimeout <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(commandTimeout));
         }
 
         public bool IsUsbipInstalled(string usbipPath) =>
@@ -234,14 +356,17 @@ namespace DS4Windows
             IReadOnlyList<string> arguments = BuildDirectAttachArguments();
             bool elevate = !isAdministrator();
 
-            NativeModeCommandResult commandResult = await commandRunner.RunAsync(
+            NativeModeCommandExecution command = await RunCommandAsync(
                 executable, arguments, elevate, cancellationToken)
                 .ConfigureAwait(false);
+            NativeModeCommandResult commandResult = command.Result;
             if (commandResult.ExitCode != 0)
             {
                 return NativeModeAttachResult.Failed(
                     NativeModeAttachFailureKind.CommandFailed,
-                    CommandFailure("USB/IP attach could not be started", commandResult));
+                    CommandFailure("USB/IP attach could not be started",
+                        commandResult),
+                    command.PendingCompletion);
             }
 
             bool arrived;
@@ -317,17 +442,20 @@ namespace DS4Windows
                     "No legacy elevated Native Mode attach task is installed.");
             }
 
-            NativeModeCommandResult deleteResult =
-                await commandRunner.RunAsync(taskSchedulerExecutable,
+            NativeModeCommandExecution deleteCommand =
+                await RunCommandAsync(taskSchedulerExecutable,
                     BuildLegacyTaskDeleteArguments(), elevate: true,
                     cancellationToken).ConfigureAwait(false);
+            NativeModeCommandResult deleteResult = deleteCommand.Result;
             if (deleteResult.ExitCode != 0)
             {
-                return LegacyTaskCleanupFailure(
+                return NativeModeAttachResult.Failed(
+                    NativeModeAttachFailureKind.LegacyTaskCleanupFailed,
                     CommandFailure(
                         "The legacy elevated Native Mode attach task must be " +
                         "removed before Native Mode can start",
-                        deleteResult));
+                        deleteResult),
+                    deleteCommand.PendingCompletion);
             }
 
             try
@@ -350,6 +478,70 @@ namespace DS4Windows
 
             return NativeModeAttachResult.Succeeded(
                 "The legacy elevated Native Mode attach task was removed.");
+        }
+
+        private async Task<NativeModeCommandExecution> RunCommandAsync(
+            string executable, IReadOnlyList<string> arguments, bool elevate,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken);
+            timeout.CancelAfter(commandTimeout);
+
+            Task<NativeModeCommandResult> commandTask = commandRunner.RunAsync(
+                executable, arguments, elevate, timeout.Token);
+            try
+            {
+                NativeModeCommandResult result = await commandTask.WaitAsync(
+                    commandTimeout, cancellationToken).ConfigureAwait(false);
+                return new NativeModeCommandExecution(result);
+            }
+            catch (TimeoutException)
+            {
+                timeout.Cancel();
+                ObserveAbandonedCommand(commandTask);
+                return new NativeModeCommandExecution(
+                    CommandTimedOutResult(), commandTask);
+            }
+            catch (OperationCanceledException)
+            {
+                timeout.Cancel();
+                ObserveAbandonedCommand(commandTask);
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return new NativeModeCommandExecution(
+                        CommandCanceledResult(), commandTask);
+                }
+                return new NativeModeCommandExecution(
+                    CommandTimedOutResult(), commandTask);
+            }
+        }
+
+        private static NativeModeCommandResult CommandCanceledResult() =>
+            new NativeModeCommandResult(-1, string.Empty,
+                "The elevated action was canceled; cleanup is waiting for " +
+                "Windows to confirm that the command has stopped.");
+
+        private NativeModeCommandResult CommandTimedOutResult()
+        {
+            string duration = commandTimeout.TotalSeconds >= 1
+                ? $"{commandTimeout.TotalSeconds:0.#} seconds"
+                : $"{commandTimeout.TotalMilliseconds:0} milliseconds";
+            return new NativeModeCommandResult(-1, string.Empty,
+                $"The elevated action did not finish within {duration}.");
+        }
+
+        private static void ObserveAbandonedCommand(
+            Task<NativeModeCommandResult> commandTask)
+        {
+            _ = commandTask.ContinueWith(task =>
+                {
+                    _ = task.Exception;
+                }, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted |
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
 
         private static IReadOnlyList<string> GetTrustedProgramFilesRoots() =>

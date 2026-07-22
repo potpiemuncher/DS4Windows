@@ -74,7 +74,9 @@ namespace DS4Windows
     {
         private const string ServerExecutableName = "VirtualDualSenseUsbip.exe";
         internal const string ExpectedServerCapability =
-            "DS4WINDOWS_NATIVE_USBIP_PROTOCOL=1";
+            "DS4WINDOWS_NATIVE_USBIP_PROTOCOL=2";
+        private static readonly TimeSpan GracefulShutdownTimeout =
+            TimeSpan.FromSeconds(15);
         private static readonly TimeSpan DeviceRemovalTimeout = TimeSpan.FromSeconds(5);
         private static readonly TimeSpan DeviceRemovalPollInterval = TimeSpan.FromMilliseconds(200);
 
@@ -85,6 +87,8 @@ namespace DS4Windows
         private Task standardOutputTask = Task.CompletedTask;
         private Task standardErrorTask = Task.CompletedTask;
         private Task exitMonitorTask = Task.CompletedTask;
+        private readonly NativeModeRenderReadiness renderKeepaliveReadiness =
+            new NativeModeRenderReadiness();
         private volatile bool stopping;
         private NativeModeState state = NativeModeState.Stopped;
         private string stateDetail = "Native mode server stopped.";
@@ -125,6 +129,27 @@ namespace DS4Windows
                 handler => StateChanged += handler,
                 handler => StateChanged -= handler,
                 timeout, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task WaitForRenderKeepaliveAsync(TimeSpan timeout,
+            CancellationToken cancellationToken = default)
+        {
+            if (timeout <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(timeout));
+
+            Task readyTask = renderKeepaliveReadiness.GetCurrentTask();
+
+            try
+            {
+                await readyTask.WaitAsync(timeout, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                throw new TimeoutException(
+                    "The helper-owned virtual DualSense render keepalive did not " +
+                    $"become ready within {timeout.TotalSeconds:0.#} seconds.");
+            }
         }
 
         public static string LocateServerExecutable()
@@ -186,16 +211,29 @@ namespace DS4Windows
                     latestStats = new NativeModeStatsSnapshot(
                         null, null, null, DateTimeOffset.MinValue);
                 }
+                long sessionGeneration =
+                    renderKeepaliveReadiness.BeginSession();
 
-                string executablePath = LocateServerExecutable();
-                await ValidateServerExecutableAsync(executablePath,
-                    cancellationToken).ConfigureAwait(false);
+                string executablePath;
+                try
+                {
+                    executablePath = LocateServerExecutable();
+                    await ValidateServerExecutableAsync(executablePath,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    renderKeepaliveReadiness.TrySetFailure(
+                        sessionGeneration, ex);
+                    throw;
+                }
                 var startInfo = new ProcessStartInfo(executablePath)
                 {
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
+                    RedirectStandardInput = true,
                 };
                 foreach (string argument in arguments)
                     startInfo.ArgumentList.Add(argument);
@@ -220,9 +258,11 @@ namespace DS4Windows
                 }
 
                 serverProcess = process;
-                standardOutputTask = PumpLinesAsync(process.StandardOutput, false);
-                standardErrorTask = PumpLinesAsync(process.StandardError, true);
-                exitMonitorTask = MonitorExitAsync(process);
+                standardOutputTask = PumpLinesAsync(process.StandardOutput, false,
+                    sessionGeneration);
+                standardErrorTask = PumpLinesAsync(process.StandardError, true,
+                    sessionGeneration);
+                exitMonitorTask = MonitorExitAsync(process, sessionGeneration);
             }
             finally
             {
@@ -329,15 +369,17 @@ namespace DS4Windows
 
                 if (process != null)
                 {
-                    try
-                    {
-                        if (!process.HasExited)
-                            process.Kill(entireProcessTree: true);
-                    }
-                    catch (InvalidOperationException)
-                    {
-                        // The process exited between HasExited and Kill.
-                    }
+                    await NativeModeProcessShutdown.RequestAsync(
+                        () => process.HasExited,
+                        async () =>
+                        {
+                            await process.StandardInput.WriteLineAsync("stop")
+                                .ConfigureAwait(false);
+                            await process.StandardInput.FlushAsync()
+                                .ConfigureAwait(false);
+                        },
+                        () => process.WaitForExitAsync(CancellationToken.None),
+                        GracefulShutdownTimeout).ConfigureAwait(false);
 
                     await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
                     await Task.WhenAll(standardOutputTask, standardErrorTask,
@@ -368,58 +410,85 @@ namespace DS4Windows
             lifecycleGate.Dispose();
         }
 
-        private async Task PumpLinesAsync(StreamReader reader, bool warning)
+        private async Task PumpLinesAsync(StreamReader reader, bool warning,
+            long sessionGeneration)
         {
             string line;
             while ((line = await reader.ReadLineAsync().ConfigureAwait(false)) != null)
             {
-                if (ProcessLogLine(line, warning))
+                if (ProcessLogLine(line, warning, sessionGeneration))
                     AppLogger.LogToGui($"[native] {line}", warning);
             }
         }
 
         internal bool ProcessLogLine(string line, bool warning)
         {
+            return ProcessLogLine(line, warning,
+                renderKeepaliveReadiness.CurrentGeneration);
+        }
+
+        internal bool ProcessLogLine(string line, bool warning,
+            long sessionGeneration)
+        {
+            if (!renderKeepaliveReadiness.IsCurrent(sessionGeneration))
+                return false;
+
             NativeModeLogKind kind = NativeModeLogClassifier.Classify(line);
-            HandleLogLine(line, kind);
+            if (!HandleLogLine(line, kind, sessionGeneration))
+                return false;
             return NativeModeLogPolicy.ShouldForwardToGui(kind, warning);
         }
 
-        private void HandleLogLine(string line, NativeModeLogKind kind)
+        private bool HandleLogLine(string line, NativeModeLogKind kind,
+            long sessionGeneration)
         {
-            switch (kind)
+            return renderKeepaliveReadiness.TryRunForCurrent(
+                sessionGeneration, () =>
             {
-                case NativeModeLogKind.ServerListening:
-                    SetState(NativeModeState.Serving, line);
-                    break;
-                case NativeModeLogKind.PadOpenFailure:
-                    SetState(NativeModeState.Faulted, line);
-                    break;
-                case NativeModeLogKind.PadLost:
-                    SetState(NativeModeState.PadLost,
-                        "The physical pad was lost; press PS and start native mode again.");
-                    break;
-                case NativeModeLogKind.FatalUsbIpSession:
-                    if (!stopping &&
-                        (State == NativeModeState.Serving ||
-                         State == NativeModeState.Attached))
-                    {
+                switch (kind)
+                {
+                    case NativeModeLogKind.ServerListening:
+                        SetState(NativeModeState.Serving, line);
+                        break;
+                    case NativeModeLogKind.RenderKeepaliveReady:
+                        renderKeepaliveReadiness.TrySetReady(sessionGeneration);
+                        break;
+                    case NativeModeLogKind.RenderKeepaliveFailure:
+                        renderKeepaliveReadiness.TrySetFailure(sessionGeneration,
+                            new InvalidOperationException(line));
+                        if (!stopping)
+                            SetState(NativeModeState.Faulted, line);
+                        break;
+                    case NativeModeLogKind.PadOpenFailure:
                         SetState(NativeModeState.Faulted, line);
-                    }
-                    break;
-                case NativeModeLogKind.IsochronousOutStats:
-                    UpdateStats(isochronousOut: line);
-                    break;
-                case NativeModeLogKind.AudioStats:
-                    UpdateStats(audio: line);
-                    break;
-                case NativeModeLogKind.SpeakerRebuffer:
-                    UpdateStats(speakerRebuffer: line);
-                    break;
-            }
+                        break;
+                    case NativeModeLogKind.PadLost:
+                        SetState(NativeModeState.PadLost,
+                            "The physical pad was lost; press PS and start native mode again.");
+                        break;
+                    case NativeModeLogKind.FatalUsbIpSession:
+                        if (!stopping &&
+                            (State == NativeModeState.Serving ||
+                             State == NativeModeState.Attached))
+                        {
+                            SetState(NativeModeState.Faulted, line);
+                        }
+                        break;
+                    case NativeModeLogKind.IsochronousOutStats:
+                        UpdateStats(isochronousOut: line);
+                        break;
+                    case NativeModeLogKind.AudioStats:
+                        UpdateStats(audio: line);
+                        break;
+                    case NativeModeLogKind.SpeakerRebuffer:
+                        UpdateStats(speakerRebuffer: line);
+                        break;
+                }
+            });
         }
 
-        private async Task MonitorExitAsync(Process process)
+        private async Task MonitorExitAsync(Process process,
+            long sessionGeneration)
         {
             try
             {
@@ -428,14 +497,21 @@ namespace DS4Windows
             }
             catch (Exception ex)
             {
-                if (!stopping)
+                if (!stopping &&
+                    renderKeepaliveReadiness.IsCurrent(sessionGeneration) &&
+                    ReferenceEquals(serverProcess, process))
                     SetState(NativeModeState.Faulted, ex.Message);
                 return;
             }
 
-            if (!stopping && ReferenceEquals(serverProcess, process) &&
+            if (!stopping &&
+                renderKeepaliveReadiness.IsCurrent(sessionGeneration) &&
+                ReferenceEquals(serverProcess, process) &&
                 State != NativeModeState.PadLost && State != NativeModeState.Faulted)
             {
+                renderKeepaliveReadiness.TrySetFailure(sessionGeneration,
+                    new InvalidOperationException(
+                        $"Native mode server exited unexpectedly with code {process.ExitCode}."));
                 SetState(NativeModeState.Faulted,
                     $"Native mode server exited unexpectedly with code {process.ExitCode}.");
             }
@@ -460,6 +536,8 @@ namespace DS4Windows
 
         private void SetState(NativeModeState newState, string detail)
         {
+            renderKeepaliveReadiness.CompleteForTerminalState(newState, detail);
+
             EventHandler<NativeModeStateChangedEventArgs> handler;
             lock (stateGate)
             {
@@ -496,6 +574,191 @@ namespace DS4Windows
         {
             lock (stateGate)
                 return (state, stateDetail);
+        }
+    }
+
+    /// <summary>
+    /// Tracks helper render-pin readiness for exactly one Native Mode process
+    /// generation. Delayed output from an earlier helper cannot satisfy or fault
+    /// a later session's waiter.
+    /// </summary>
+    internal sealed class NativeModeRenderReadiness
+    {
+        private readonly object gate = new object();
+        private long generation;
+        private TaskCompletionSource<bool> completion =
+            NewCompletion();
+
+        public long CurrentGeneration
+        {
+            get
+            {
+                lock (gate)
+                    return generation;
+            }
+        }
+
+        public long BeginSession()
+        {
+            TaskCompletionSource<bool> previous;
+            long current;
+            lock (gate)
+            {
+                previous = completion;
+                current = checked(++generation);
+                completion = NewCompletion();
+            }
+
+            // A superseded waiter must never drift into the next session.
+            previous.TrySetCanceled();
+            return current;
+        }
+
+        public Task GetCurrentTask()
+        {
+            lock (gate)
+                return completion.Task;
+        }
+
+        public bool IsCurrent(long candidateGeneration)
+        {
+            lock (gate)
+                return candidateGeneration == generation;
+        }
+
+        public bool TryRunForCurrent(long candidateGeneration, Action action)
+        {
+            if (action == null)
+                throw new ArgumentNullException(nameof(action));
+
+            lock (gate)
+            {
+                if (candidateGeneration != generation)
+                    return false;
+
+                action();
+                return true;
+            }
+        }
+
+        public bool TrySetReady(long candidateGeneration)
+        {
+            TaskCompletionSource<bool> current;
+            lock (gate)
+            {
+                if (candidateGeneration != generation)
+                    return false;
+                current = completion;
+            }
+
+            return current.TrySetResult(true);
+        }
+
+        public bool TrySetFailure(long candidateGeneration, Exception failure)
+        {
+            if (failure == null)
+                throw new ArgumentNullException(nameof(failure));
+
+            TaskCompletionSource<bool> current;
+            lock (gate)
+            {
+                if (candidateGeneration != generation)
+                    return false;
+                current = completion;
+            }
+
+            return current.TrySetException(failure);
+        }
+
+        public void CompleteForTerminalState(NativeModeState terminalState,
+            string detail)
+        {
+            TaskCompletionSource<bool> current;
+            lock (gate)
+                current = completion;
+
+            switch (terminalState)
+            {
+                case NativeModeState.Stopped:
+                    current.TrySetCanceled();
+                    break;
+                case NativeModeState.PadLost:
+                case NativeModeState.SetupRequired:
+                case NativeModeState.Faulted:
+                    current.TrySetException(new InvalidOperationException(
+                        string.IsNullOrWhiteSpace(detail)
+                            ? $"Native mode entered {terminalState} before the " +
+                              "helper render keepalive became ready."
+                            : detail));
+                    break;
+            }
+        }
+
+        private static TaskCompletionSource<bool> NewCompletion()
+        {
+            var source = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            _ = source.Task.ContinueWith(
+                task =>
+                {
+                    _ = task.Exception;
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously |
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
+            return source;
+        }
+    }
+
+    internal static class NativeModeProcessShutdown
+    {
+        public static async Task RequestAsync(Func<bool> hasExited,
+            Func<Task> sendStop, Func<Task> waitForExit, TimeSpan timeout)
+        {
+            if (hasExited == null)
+                throw new ArgumentNullException(nameof(hasExited));
+            if (sendStop == null)
+                throw new ArgumentNullException(nameof(sendStop));
+            if (waitForExit == null)
+                throw new ArgumentNullException(nameof(waitForExit));
+            if (timeout <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(timeout));
+
+            if (hasExited())
+                return;
+
+            try
+            {
+                await sendStop().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (
+                ex is IOException || ex is InvalidOperationException)
+            {
+                if (!hasExited())
+                {
+                    throw new IOException(
+                        "Could not request an ordered Native Mode helper shutdown. " +
+                        "The helper was left running so its render-pin protection " +
+                        "remains active.", ex);
+                }
+                return;
+            }
+
+            if (hasExited())
+                return;
+
+            try
+            {
+                await waitForExit().WaitAsync(timeout).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                throw new TimeoutException(
+                    "The Native Mode helper did not confirm ordered shutdown. " +
+                    "It was left running so the virtual render pin is not closed " +
+                    "while the device may still be attached.");
+            }
         }
     }
 
