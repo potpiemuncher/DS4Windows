@@ -448,4 +448,26 @@
 		<Copy SourceFiles="@(NativeDualSensePublishFiles)"
 			DestinationFiles="@(NativeDualSensePublishFiles->'$(TargetDir)native\%(RecursiveDir)%(Filename)%(Extension)')" />
 	</Target>
+
+	<!--
+		CopyNativeDualSenseServer only populates the build output directory. Release
+		packaging uses 'dotnet publish' (see .github/workflows/release.yml), whose
+		output is built from publish item groups, so the helper has to be added to
+		ResolvedFileToPublish as well. Without this, a published package omits
+		native\VirtualDualSenseUsbip.exe and Native Mode fails at runtime when the
+		server executable cannot be located.
+	-->
+	<Target Name="AddNativeDualSenseServerToPublish"
+			BeforeTargets="ComputeFilesToPublish"
+			DependsOnTargets="PublishNativeDualSenseServer"
+			Condition="'$(Configuration)' == 'Release'">
+		<ItemGroup>
+			<NativeDualSensePublishFiles Include="$(NativeDualSensePublishDir)**\*"
+				Exclude="$(NativeDualSensePublishDir)**\*.pdb;$(NativeDualSensePublishDir)**\*.xml" />
+			<ResolvedFileToPublish Include="@(NativeDualSensePublishFiles)">
+				<RelativePath>native\%(RecursiveDir)%(Filename)%(Extension)</RelativePath>
+				<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+			</ResolvedFileToPublish>
+		</ItemGroup>
+	</Target>
 </Project>
