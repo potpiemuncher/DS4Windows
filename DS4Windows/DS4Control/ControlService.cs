@@ -100,8 +100,10 @@ namespace DS4Windows
         public ControlServiceDeviceOptions DeviceOptions { get => deviceOptions; }
 
         private readonly NativeModeManager nativeModeManager = new NativeModeManager();
+        private readonly NativeModeDriverGate nativeModeDriverGate =
+            NativeModeDriverGate.Default;
         private readonly NativeModeElevationBroker nativeModeElevationBroker =
-            new NativeModeElevationBroker();
+            new NativeModeElevationBroker(NativeModeDriverGate.Default);
         private readonly NativeModeAudioDefaultGuard nativeModeAudioDefaultGuard =
             new NativeModeAudioDefaultGuard();
         private readonly NativeModeRenderKeepalive nativeModeRenderKeepalive =
@@ -2146,6 +2148,24 @@ namespace DS4Windows
                 {
                     throw new InvalidOperationException(
                         "Native mode requires a Bluetooth DualSense controller.");
+                }
+
+                // Driver validation gate (doc/dev/native_mode_driver_policy.md
+                // §4): the usbip-win2 packages and usbip.exe client must match a
+                // supported release BEFORE the physical controller is released
+                // or elevation is requested. Fails closed with a specific,
+                // non-sensitive diagnostic and leaves the controller untouched.
+                NativeModeDriverValidationResult driverValidation =
+                    nativeModeDriverGate.Validate(Global.UsbipExePath);
+                if (!driverValidation.Passed)
+                {
+                    nativeModeManager.MarkSetupRequired(driverValidation.Diagnostic);
+                    AppLogger.LogToGui(
+                        "Native mode driver validation failed (" +
+                        driverValidation.FailedComponent + "/" +
+                        driverValidation.Reason + "): " +
+                        driverValidation.Diagnostic, true);
+                    throw new InvalidOperationException(driverValidation.Diagnostic);
                 }
 
                 string macAddress = device.getMacAddress();

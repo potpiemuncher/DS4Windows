@@ -38,6 +38,7 @@ namespace DS4Windows
         LegacyTaskCleanupFailed,
         CommandFailed,
         DeviceArrivalTimeout,
+        DriverValidationFailed,
     }
 
     public sealed class NativeModeAttachResult
@@ -273,13 +274,25 @@ namespace DS4Windows
         private readonly Func<TimeSpan, CancellationToken, Task> delay;
         private readonly string taskSchedulerExecutable;
         private readonly TimeSpan commandTimeout;
+        private readonly NativeModeDriverGate driverGate;
 
-        public NativeModeElevationBroker() : this(File.Exists,
-            GetTrustedProgramFilesRoots, IsLegacyAttachTaskPresent,
-            Global.IsAdministrator, new NativeModeProcessRunner(),
-            NativeModeDevicePresence.IsVirtualDualSensePresent,
-            Task.Delay, Path.Combine(Environment.GetFolderPath(
-                Environment.SpecialFolder.System), "schtasks.exe"))
+        public NativeModeElevationBroker() : this((NativeModeDriverGate)null)
+        {
+        }
+
+        /// <summary>
+        /// Production constructor. The driver gate re-validates the usbip-win2
+        /// packages before this broker requests elevation, so a direct broker
+        /// caller cannot elevate on an unvalidated driver set (policy §4).
+        /// </summary>
+        public NativeModeElevationBroker(NativeModeDriverGate driverGate)
+            : this(File.Exists,
+                GetTrustedProgramFilesRoots, IsLegacyAttachTaskPresent,
+                Global.IsAdministrator, new NativeModeProcessRunner(),
+                NativeModeDevicePresence.IsVirtualDualSensePresent,
+                Task.Delay, Path.Combine(Environment.GetFolderPath(
+                    Environment.SpecialFolder.System), "schtasks.exe"),
+                commandTimeout: null, driverGate: driverGate)
         {
         }
 
@@ -289,8 +302,10 @@ namespace DS4Windows
             INativeModeCommandRunner commandRunner,
             Func<bool> virtualDevicePresent,
             Func<TimeSpan, CancellationToken, Task> delay,
-            string taskSchedulerExecutable, TimeSpan? commandTimeout = null)
+            string taskSchedulerExecutable, TimeSpan? commandTimeout = null,
+            NativeModeDriverGate driverGate = null)
         {
+            this.driverGate = driverGate;
             this.fileExists = fileExists ?? throw new ArgumentNullException(nameof(fileExists));
             this.trustedProgramFilesRoots = trustedProgramFilesRoots ??
                 throw new ArgumentNullException(nameof(trustedProgramFilesRoots));
@@ -342,6 +357,14 @@ namespace DS4Windows
         public async Task<NativeModeAttachResult> RunAttachAsync(string usbipPath,
             CancellationToken cancellationToken = default)
         {
+            // Fail closed before any elevation: neither the legacy task cleanup
+            // (which elevates) nor the attach may proceed on an unvalidated
+            // usbip-win2 driver set.
+            NativeModeAttachResult driverValidation =
+                driverGate?.ValidateBeforeElevation(usbipPath);
+            if (driverValidation != null)
+                return driverValidation;
+
             NativeModeAttachResult cleanup =
                 await EnsureLegacyAttachTaskRemovedAsync(cancellationToken)
                     .ConfigureAwait(false);
