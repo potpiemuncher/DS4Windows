@@ -1,10 +1,19 @@
 # Native Mode driver risk, validation, and lifecycle policy
 
-Status: **policy proposal, not implemented.** This document addresses work
-toward production gates 1 and 3 in
-[the Native Mode design note](native_dualsense_mode.md). It does not declare any
-usbip-win2 release safe or authorize DS4Windows to install, repair, or remove a
-kernel driver.
+Status: **partially implemented.** The §4 validation model (package enumeration,
+signature/trust verification, and the supported-release manifest) is now
+implemented and fail-closed; see §4.2 and the driver validation gate section of
+[the Native Mode design note](native_dualsense_mode.md). The §5 install/repair
+and §6 uninstall policies remain proposals. This document addresses work toward
+production gates 1 and 3. It does not declare any usbip-win2 release safe or
+authorize DS4Windows to install, repair, or remove a kernel driver.
+
+The upstream report for gate 1 has been filed as usbip-win2 issue 181, which
+also cross-references usbip-win2 issue 180 — the same pool-corruption signature
+on the same driver builds with a non-audio, vendor-class WinUSB trigger. That
+supports §1's statement that the observed trigger was ISO audio but the
+underlying transfer engine is not audio-exclusive. Gate 1 closes only on a
+signed fixed release or an accepted alternative driver strategy.
 
 usbip-win2 is an external BSD-2-Clause dependency. DS4Windows does not bundle
 it. The controlled tests used the upstream 0.9.7.8 installer while Secure Boot
@@ -131,9 +140,24 @@ text.
   chosen publisher/hash policy.
 - Record only non-sensitive component/version results in normal logs.
 
-The current NativeModeElevationBroker validates the usbip.exe path, filename,
-canonical Program Files location, and existence. It does not implement the
-package, signature, or release-manifest checks above.
+**Implementation status.** All of the above is implemented. `NativeModeDriverManifest`
+holds the single versioned release/tier/signer structure, `NativeModeDriverValidator`
+performs the fail-closed matching, `SetupApiDriverPackageInspector` enumerates both
+packages through SetupAPI / Configuration Manager without parsing localized text, and
+`WinTrustAuthenticodeVerifier` verifies catalog and Authenticode trust through the
+Windows trust APIs, deriving the required publisher from the verified chain's
+certificate rather than a signer substring. The gate runs before the controller is
+released and again before elevation; `NativeModeElevationBroker` keeps its existing
+path, filename, canonical Program Files, and existence checks underneath it.
+
+Two caveats. Release 0.9.7.8 is admitted only as an `ExperimentalBaseline` tier entry
+so current testers are not blocked; per §4.3 that is not a supported production
+minimum, and it does not assert the release is safe. And while the decision logic is
+covered by offline tests, the enumeration and trust paths themselves cannot execute
+without the driver installed — run the `validatedriver` diagnostic command on a real
+installation to confirm them before distributing any build that depends on this gate.
+A mistake in those paths would fail closed against a valid install rather than admit
+an invalid one, but it would still block Native Mode.
 
 ### 4.3 Tier policy
 
@@ -180,7 +204,9 @@ detach another application's device.
 
 ## 7. Tests required
 
-Offline tests should cover:
+These offline tests are implemented in `DS4WindowsTests\NativeModeDriverValidatorTests.cs`,
+using fake inspector and verifier implementations so no driver install is required.
+Offline tests cover:
 
 - correct and incorrect hardware IDs, including changing ROOT instance numbers;
 - missing, mixed-version, and wrong-provider package pairs;
@@ -198,13 +224,19 @@ must not combine a first run with Driver Verifier or unrelated stress tools.
 ## 8. Open decisions
 
 1. Upstream approval and the first signed release accepted for composite audio.
-2. The exact manifest fields and whether file hashes supplement publisher and
-   catalog validation.
-3. The authoritative SetupAPI/Configuration Manager implementation for both
-   packages.
+   Reported as usbip-win2 issue 181; awaiting maintainer response.
+2. ~~The exact manifest fields~~ — implemented: original INF name, provider,
+   Windows DriverVer per package, usbip.exe file name and product version,
+   accepted architectures, tier, and signer policy. Still open: whether file
+   hashes should supplement publisher and catalog validation.
+3. ~~The authoritative SetupAPI/Configuration Manager implementation~~ —
+   implemented for both packages, but its OS-touching paths still need
+   confirmation on a real installation via `validatedriver`.
 4. Whether the HID-only scaffold merits a separate future experimental proposal
    after the common driver risk is reviewed.
 5. Maintainer acceptance of the external, never-bundled dependency policy.
+6. Install, repair, and uninstall policy (§5, §6) implementation and acceptance.
 
-Until those decisions are implemented and tested, driver gates 1 and 3 remain
-open.
+Until the remaining decisions are implemented and tested, driver gates 1 and 3
+remain open. Gate 3's validation half is implemented; its install/repair/uninstall
+half is not.

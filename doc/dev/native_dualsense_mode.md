@@ -55,11 +55,19 @@ Those mitigations reduce the reproduced risk; they do not repair or prove the
 kernel driver. This draft remains blocked for production use until:
 
 - a signed usbip-win2 release fixes the underlying lifetime race, or maintainers
-  explicitly accept a different driver strategy;
+  explicitly accept a different driver strategy. The source-level analysis, WDF
+  IFR evidence, and an uncompiled proof-of-concept patch have been reported
+  upstream as usbip-win2 issue 181. That report cross-references usbip-win2
+  issue 180, which shows the same pool-corruption signature on the same driver
+  builds with a vendor-class WinUSB trigger and no audio at all — evidence that
+  the defect is in common UDE transfer machinery rather than the audio path.
+  Filing a report does not close this gate; only a signed fixed release or an
+  accepted alternative driver strategy does;
 - redundant parent/helper containment passes approved live process-failure
   drills and startup reconciliation can recover an incomplete prior session;
-- installer, driver-version/signature validation, repair, and uninstall policy
-  are defined; and
+- driver package version and signature validation is implemented (see the
+  validation gate below) **and** install, repair, and uninstall policy is
+  implemented and accepted; and
 - the captured Sony descriptor assets receive maintainer/provenance review.
 
 Implementation and review work toward these gates:
@@ -75,12 +83,44 @@ No automated test or successful hardware session can eliminate a kernel-driver
 use-after-free risk. Native Mode must remain clearly experimental until these
 gates close.
 
-The attach broker currently accepts only a canonical executable named
-`usbip.exe` below a Windows Program Files root. The tested executable has a
-valid Authenticode signature, but the broker does not verify that signature or
-associate the executable with both installed driver packages. A future
-supported-release manifest and driver-store trust check therefore remain a
-production blocker rather than being approximated by a path check.
+### Driver validation gate
+
+Path checking alone is no longer the only driver-side guard. A fail-closed
+validation gate now runs **before** the physical controller is released and again
+before elevation is requested, and Native Mode refuses to start unless every
+component matches one supported-release manifest entry:
+
+- the emulated UDE host controller is located by the stable hardware ID
+  `ROOT\USBIP_WIN2\UDE` and expected provider, never by a machine-specific
+  instance path, and must report present, started, and problem-free;
+- the companion `usbip2_filter.inf` extension package is validated as a separate
+  component, and both packages must match the *same* release entry, so a mixed
+  or partially upgraded pair is refused;
+- each package's catalog and `usbip.exe` are verified with the Windows trust
+  APIs under normal chain policy. Test-signed, developer-signed, expired,
+  revoked, and untrusted packages are refused, and the required publisher is
+  determined from the verified chain's certificate rather than a substring match
+  on a signer string;
+- `usbip.exe` must additionally match the manifest file name and product version
+  on top of the existing canonical Program Files path requirement.
+
+All tier, version, and signer policy lives in one versioned manifest structure
+covered by offline tests, so a future maintainer-accepted fixed release is added
+as an additional `Production`-tier entry without touching validator, broker, or
+UI code. Release 0.9.7.8 is present only as an `ExperimentalBaseline` entry: it
+is allowed to run behind the experimental warning and the per-Start
+confirmation, because it is the tested baseline, while every unknown, older,
+newer, mismatched, or untrusted package set is refused with a specific
+non-sensitive diagnostic.
+
+Two limits are deliberate. First, allowing 0.9.7.8 does not assert that release
+is safe — the kernel lifetime defect above is unrepaired, which is why the tier
+is experimental and gate 1 stays open. Second, the manifest-matching and
+fail-closed decision logic is unit-tested offline, but the OS-touching
+enumeration and trust paths cannot be exercised without the driver installed;
+the `validatedriver` diagnostic command exists to confirm those paths on a real
+installation, and it should be run before any build relying on this gate is
+distributed. Install, repair, and uninstall policy remains open.
 
 ## Security model
 
