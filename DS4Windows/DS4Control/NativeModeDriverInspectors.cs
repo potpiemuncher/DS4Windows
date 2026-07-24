@@ -473,9 +473,6 @@ namespace DS4Windows
     /// </summary>
     public sealed class WinTrustAuthenticodeVerifier : IAuthenticodeVerifier
     {
-        private const string MicrosoftHardwareCompatibilityPublisherCommonName =
-            "Microsoft Windows Hardware Compatibility Publisher";
-
         private static readonly Guid WinTrustActionGenericVerifyV2 =
             new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
 
@@ -543,16 +540,17 @@ namespace DS4Windows
                 Guid action = WinTrustActionGenericVerifyV2;
                 int result = WinVerifyTrust(IntPtr.Zero, ref action, dataPtr);
 
-                bool publisherOk = false;
-                if (result == 0)
-                {
-                    // Re-read the state handle that WinVerifyTrust populated.
-                    data = Marshal.PtrToStructure<WINTRUST_DATA>(dataPtr);
-                    publisherOk = IsMicrosoftHardwareCompatibilityPublisher(
-                        data.hWVTStateData);
-                }
+                // Re-read the state handle that WinVerifyTrust populated. The
+                // signing certificate's common name is read whenever a chain is
+                // available, including on failure, so diagnostics can report the
+                // certificate that was actually found. Only a verified chain
+                // (hr == 0) may satisfy the publisher policy.
+                data = Marshal.PtrToStructure<WINTRUST_DATA>(dataPtr);
+                string signerCommonName = ReadSignerCommonName(data.hWVTStateData);
+                bool publisherOk = result == 0 &&
+                    IsHardwareCompatibilityPublisher(signerCommonName);
 
-                return MapResult((uint)result, publisherOk);
+                return MapResult((uint)result, publisherOk, signerCommonName);
             }
             catch (Exception ex)
             {
@@ -576,7 +574,8 @@ namespace DS4Windows
             }
         }
 
-        private static NativeModeSignatureTrust MapResult(uint hr, bool publisherOk)
+        private static NativeModeSignatureTrust MapResult(uint hr, bool publisherOk,
+            string signerCommonName)
         {
             switch (hr)
             {
@@ -586,6 +585,7 @@ namespace DS4Windows
                         Trusted = true,
                         IsMicrosoftHardwareCompatibilityPublisher = publisherOk,
                         Diagnostic = "trusted",
+                        ObservedSignerCommonName = signerCommonName,
                     };
                 case CertERevoked:
                     return new NativeModeSignatureTrust
@@ -593,6 +593,7 @@ namespace DS4Windows
                         Trusted = false,
                         Revoked = true,
                         Diagnostic = "certificate revoked",
+                        ObservedSignerCommonName = signerCommonName,
                     };
                 case CertEExpired:
                     return new NativeModeSignatureTrust
@@ -600,6 +601,7 @@ namespace DS4Windows
                         Trusted = false,
                         Expired = true,
                         Diagnostic = "certificate expired",
+                        ObservedSignerCommonName = signerCommonName,
                     };
                 case CertEUntrustedTestRoot:
                     return new NativeModeSignatureTrust
@@ -607,6 +609,7 @@ namespace DS4Windows
                         Trusted = false,
                         TestSigned = true,
                         Diagnostic = "test-signed (untrusted test root)",
+                        ObservedSignerCommonName = signerCommonName,
                     };
                 case CertEUntrustedRoot:
                     return new NativeModeSignatureTrust
@@ -614,53 +617,63 @@ namespace DS4Windows
                         Trusted = false,
                         DeveloperSigned = true,
                         Diagnostic = "untrusted root (developer/test signature)",
+                        ObservedSignerCommonName = signerCommonName,
                     };
                 case TrustENoSignature:
-                    return NativeModeSignatureTrust.Untrusted("no valid signature");
+                    return NativeModeSignatureTrust.Untrusted("no valid signature",
+                        signerCommonName);
                 case TrustEExplicitDistrust:
-                    return NativeModeSignatureTrust.Untrusted("explicitly distrusted");
+                    return NativeModeSignatureTrust.Untrusted("explicitly distrusted",
+                        signerCommonName);
                 default:
                     return NativeModeSignatureTrust.Untrusted(
-                        $"WinVerifyTrust hr=0x{hr:X8}");
+                        $"WinVerifyTrust hr=0x{hr:X8}", signerCommonName);
             }
         }
 
-        private static bool IsMicrosoftHardwareCompatibilityPublisher(
-            IntPtr stateData)
+        private static bool IsHardwareCompatibilityPublisher(string commonName) =>
+            string.Equals(commonName,
+                NativeModeDriverManifest
+                    .MicrosoftHardwareCompatibilityPublisherCommonName,
+                StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Reads the common name of the signing certificate on the chain
+        /// WinVerifyTrust built, or null when no certificate is available.
+        /// </summary>
+        private static string ReadSignerCommonName(IntPtr stateData)
         {
             if (stateData == IntPtr.Zero)
-                return false;
+                return null;
 
             IntPtr provData = WTHelperProvDataFromStateData(stateData);
             if (provData == IntPtr.Zero)
-                return false;
+                return null;
 
             IntPtr signer = WTHelperGetProvSignerFromChain(provData, 0, false, 0);
             if (signer == IntPtr.Zero)
-                return false;
+                return null;
 
             IntPtr providerCert = WTHelperGetProvCertFromChain(signer, 0);
             if (providerCert == IntPtr.Zero)
-                return false;
+                return null;
 
             CRYPT_PROVIDER_CERT cert =
                 Marshal.PtrToStructure<CRYPT_PROVIDER_CERT>(providerCert);
             if (cert.pCert == IntPtr.Zero)
-                return false;
+                return null;
 
             try
             {
                 using var certificate = new X509Certificate2(cert.pCert);
                 string commonName = certificate.GetNameInfo(
                     X509NameType.SimpleName, false);
-                return string.Equals(commonName,
-                    MicrosoftHardwareCompatibilityPublisherCommonName,
-                    StringComparison.OrdinalIgnoreCase);
+                return string.IsNullOrWhiteSpace(commonName) ? null : commonName;
             }
             catch (Exception ex) when (ex is CryptographicException ||
                 ex is ArgumentException)
             {
-                return false;
+                return null;
             }
         }
 

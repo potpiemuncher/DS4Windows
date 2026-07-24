@@ -122,8 +122,24 @@ namespace DS4Windows
         /// <summary>Short, non-sensitive diagnostic (e.g. an error mnemonic).</summary>
         public string Diagnostic { get; init; }
 
-        public static NativeModeSignatureTrust Untrusted(string diagnostic) =>
-            new NativeModeSignatureTrust { Trusted = false, Diagnostic = diagnostic };
+        /// <summary>
+        /// Common name of the signing certificate found on the chain, when one
+        /// could be read. Diagnostic only: it is never part of the pass/fail
+        /// decision, which uses
+        /// <see cref="IsMicrosoftHardwareCompatibilityPublisher"/>. Reported so
+        /// a wrong expected common name is visible instead of silently failing
+        /// closed against a good install.
+        /// </summary>
+        public string ObservedSignerCommonName { get; init; }
+
+        public static NativeModeSignatureTrust Untrusted(string diagnostic,
+            string observedSignerCommonName = null) =>
+            new NativeModeSignatureTrust
+            {
+                Trusted = false,
+                Diagnostic = diagnostic,
+                ObservedSignerCommonName = observedSignerCommonName,
+            };
     }
 
     /// <summary>
@@ -222,6 +238,62 @@ namespace DS4Windows
     }
 
     /// <summary>
+    /// Every observation a validation pass consumed, paired with the
+    /// authoritative <see cref="NativeModeDriverValidationResult"/>. Purely
+    /// diagnostic: nothing here participates in the fail-closed decision, which
+    /// is still produced by <see cref="NativeModeDriverValidator.Validate"/>.
+    /// Exists so a tester can see observed-vs-expected values on real hardware
+    /// instead of only a pass/fail verdict. Non-sensitive by construction: no
+    /// instance paths, serials, addresses, or user paths.
+    /// </summary>
+    public sealed class NativeModeDriverValidationReport
+    {
+        /// <summary>The authoritative fail-closed outcome.</summary>
+        public NativeModeDriverValidationResult Result { get; init; }
+
+        /// <summary>Release the observations are described against.</summary>
+        public NativeModeDriverRelease ExpectedRelease { get; init; }
+
+        public NativeModeDriverPackageInfo HostController { get; init; }
+
+        public NativeModeDriverPackageInfo FilterExtension { get; init; }
+
+        public NativeModeUsbipClientInfo UsbipClient { get; init; }
+
+        public NativeModeSignatureTrust HostControllerTrust { get; init; }
+
+        public NativeModeSignatureTrust FilterExtensionTrust { get; init; }
+
+        public NativeModeSignatureTrust UsbipClientTrust { get; init; }
+
+        /// <summary>
+        /// Message from an inspection that threw while enumerating driver
+        /// packages; null when enumeration completed.
+        /// </summary>
+        public string PackageInspectionError { get; init; }
+
+        /// <summary>
+        /// Message from an inspection that threw while reading the userspace
+        /// client; null when the read completed.
+        /// </summary>
+        public string UsbipClientInspectionError { get; init; }
+
+        /// <summary>
+        /// True when a driver-store target could be resolved for the host
+        /// controller. False means SetupGetInfDriverStoreLocation (or the INF
+        /// read) produced nothing, which makes the reported INF name and
+        /// architecture unreliable. The path itself is never surfaced.
+        /// </summary>
+        public bool HostControllerStoreTargetResolved { get; init; }
+
+        /// <summary>
+        /// True when a driver-store target could be resolved for the filter
+        /// extension package.
+        /// </summary>
+        public bool FilterExtensionStoreTargetResolved { get; init; }
+    }
+
+    /// <summary>
     /// Pure manifest-matching and fail-closed decision logic. All OS access is
     /// delegated to <see cref="IDriverPackageInspector"/> and
     /// <see cref="IAuthenticodeVerifier"/> so this class is fully unit-testable.
@@ -298,6 +370,96 @@ namespace DS4Windows
 
             return NativeModeDriverValidationResult.Pass(matched.ReleaseLabel,
                 matched.Tier);
+        }
+
+        /// <summary>
+        /// Read-only diagnostic pass. Gathers the same observations
+        /// <see cref="Validate"/> consumes and pairs them with the authoritative
+        /// <see cref="Validate"/> outcome, so a report can show observed versus
+        /// expected values for every component even when validation passes.
+        /// Additive only: the fail-closed decision is unchanged, and every
+        /// observation is gathered defensively so a throwing inspector still
+        /// yields a report.
+        /// </summary>
+        public NativeModeDriverValidationReport Inspect(string usbipExecutablePath)
+        {
+            NativeModeDriverPackageInfo host = null;
+            NativeModeDriverPackageInfo filter = null;
+            string packageError = null;
+            try
+            {
+                host = inspector.InspectHostController(
+                    NativeModeDriverManifest.UdeHostControllerHardwareId);
+                filter = inspector.InspectFilterExtension(
+                    manifest.ReferenceRelease.FilterExtension.InfName);
+            }
+            catch (Exception ex)
+            {
+                packageError = ex.Message;
+            }
+
+            NativeModeUsbipClientInfo client = null;
+            string clientError = null;
+            try
+            {
+                client = inspector.InspectUsbipClient(usbipExecutablePath);
+            }
+            catch (Exception ex)
+            {
+                clientError = ex.Message;
+            }
+
+            return new NativeModeDriverValidationReport
+            {
+                Result = Validate(usbipExecutablePath),
+                ExpectedRelease = manifest.ReferenceRelease,
+                HostController = host,
+                FilterExtension = filter,
+                UsbipClient = client,
+                HostControllerTrust = InspectPackageTrust(host),
+                FilterExtensionTrust = InspectPackageTrust(filter),
+                UsbipClientTrust = InspectFileTrust(usbipExecutablePath, client),
+                PackageInspectionError = packageError,
+                UsbipClientInspectionError = clientError,
+                HostControllerStoreTargetResolved =
+                    !string.IsNullOrWhiteSpace(host?.TrustEvaluationPath),
+                FilterExtensionStoreTargetResolved =
+                    !string.IsNullOrWhiteSpace(filter?.TrustEvaluationPath),
+            };
+        }
+
+        private NativeModeSignatureTrust InspectPackageTrust(
+            NativeModeDriverPackageInfo package)
+        {
+            if (package == null || !package.Found)
+                return null;
+
+            try
+            {
+                return verifier.VerifyDriverPackage(package);
+            }
+            catch (Exception ex)
+            {
+                return NativeModeSignatureTrust.Untrusted(
+                    "trust verification threw: " + ex.Message);
+            }
+        }
+
+        private NativeModeSignatureTrust InspectFileTrust(string filePath,
+            NativeModeUsbipClientInfo client)
+        {
+            if (client == null || !client.Found)
+                return null;
+
+            try
+            {
+                return verifier.VerifyFile(filePath);
+            }
+            catch (Exception ex)
+            {
+                return NativeModeSignatureTrust.Untrusted(
+                    "trust verification threw: " + ex.Message);
+            }
         }
 
         private NativeModeDriverRelease FindMatchingRelease(
@@ -646,6 +808,14 @@ namespace DS4Windows
         /// </summary>
         public NativeModeDriverValidationResult Validate(string usbipExecutablePath) =>
             validator.Validate(usbipExecutablePath);
+
+        /// <summary>
+        /// Read-only diagnostic pass used by the <c>-validatedriver</c> command.
+        /// Nothing is released, elevated, attached, or modified; the gate only
+        /// reads device, driver, and file state.
+        /// </summary>
+        public NativeModeDriverValidationReport Inspect(string usbipExecutablePath) =>
+            validator.Inspect(usbipExecutablePath);
 
         /// <summary>
         /// Elevation-path guard. Returns null when validation passes; otherwise

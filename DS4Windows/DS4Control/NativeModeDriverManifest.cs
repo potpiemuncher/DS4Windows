@@ -225,6 +225,16 @@ namespace DS4Windows
         /// </summary>
         public const string UdeHostControllerHardwareId = @"ROOT\USBIP_WIN2\UDE";
 
+        /// <summary>
+        /// Common name the attestation-signing certificate carries when
+        /// <see cref="NativeModeDriverSignerPolicy.MicrosoftHardwareCompatibilityPublisher"/>
+        /// is satisfied. Single source of truth for the trust verifier and for
+        /// diagnostics; the decision itself is still made from the verified
+        /// chain, never from a substring match.
+        /// </summary>
+        public const string MicrosoftHardwareCompatibilityPublisherCommonName =
+            "Microsoft Windows Hardware Compatibility Publisher";
+
         private NativeModeDriverManifest(IEnumerable<NativeModeDriverRelease> releases)
         {
             Releases = (releases ?? throw new ArgumentNullException(nameof(releases)))
